@@ -3,7 +3,7 @@ name: Desktop Build
 on:
   push:
     branches: [main]
-    paths: ["desktop/**", "tools/**"]
+    paths: ["desktop/**", "tools/**", ".github/workflows/desktop-build.yml"]
   workflow_dispatch:
 
 jobs:
