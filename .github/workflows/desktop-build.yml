@@ -45,7 +45,16 @@ jobs:
 
       - name: Build app
         working-directory: desktop
-        run: pnpm tauri build --target ${{ matrix.target }}
+        run: |
+          set -o pipefail
+          pnpm tauri build --target ${{ matrix.target }} 2>&1 | tee build.log
+
+      - name: Emit error summary
+        if: failure()
+        working-directory: desktop
+        shell: bash
+        run: |
+          (grep -iE "error\[|error:|failed to" build.log | tail -30; echo "---- tail ----"; tail -8 build.log) | sed 's/::/: :/g' | while IFS= read -r line; do echo "::error::$line"; done
 
       - name: Upload macOS dmg
         if: runner.os == 'macOS'
