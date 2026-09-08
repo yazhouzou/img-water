@@ -66,6 +66,12 @@ LaMa 模型通常缓存于：
 ./tools/remove_doubao_watermark.py run 1.png 2.png
 ```
 
+处理项目根目录以外的图片文件夹（不改变会话默认行为）：
+
+```bash
+./tools/remove_doubao_watermark.py --root /path/to/images run
+```
+
 `run` 会自动完成备份、遮罩、LaMa 修复、候选复查图生成、覆盖、落盘复查图生成和清理。它主要用于用户自助调用或明确要求“一键快速处理”的场景；默认成功后会删除 `original-watermark-backup/` 和 `/tmp/doubao-watermark-work`。如果需要人工查看复查图，可临时保留本轮产物：
 
 ```bash
@@ -97,6 +103,16 @@ LaMa 模型通常缓存于：
 ```bash
 .img-inpaint-venv/bin/iopaint run --model lama --device mps --image /tmp/doubao-watermark-work/source --mask /tmp/doubao-watermark-work/masks --output /tmp/doubao-watermark-work/lama
 ```
+
+## 桌面端
+
+项目提供 Tauri 桌面应用（`desktop/`），供 macOS / Windows 用户自助使用，复用同一流水线脚本：
+
+- 开发调试：`cd desktop && pnpm install && pnpm tauri dev`
+- 构建：`cd desktop && pnpm tauri build`
+- 脚本已支持 `--root <文件夹>`，桌面端用它在用户选择的任意文件夹上执行处理；CLI 不传 `--root` 时默认仍是项目根目录，会话流程不受影响
+- Windows 安装包无法在 macOS 上交叉编译，用 `.github/workflows/desktop-build.yml` 在 CI 构建
+- 当前里程碑：安装包不捆绑 `.img-inpaint-venv/`（体积大），目标机器需先运行 `./tools/ensure-inpaint-env.sh`；后续可引入环境捆绑或 ONNX 内核方案
 
 ## 提效规则
 

@@ -1,5 +1,9 @@
 *.png
+!desktop/src-tauri/icons/**/*.png
 .img-inpaint-venv/
 original-watermark-backup/
 __pycache__/
 *.pyc
+desktop/node_modules/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/

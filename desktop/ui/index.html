@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>豆包水印清理助手</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">去</span>
+      <div>
+        <h1>豆包水印清理助手</h1>
+        <p class="subtitle">批量去除图片右下角“豆包AI生成”水印</p>
+      </div>
+    </div>
+    <div id="env-badge" class="badge">检查环境中…</div>
+  </header>
+
+  <main class="layout">
+    <section class="panel files-panel">
+      <div class="panel-head">
+        <h2>图片文件</h2>
+        <div class="actions">
+          <button id="btn-pick" class="btn">选择文件夹</button>
+          <button id="btn-refresh" class="btn ghost" disabled>刷新</button>
+        </div>
+      </div>
+      <div id="folder-path" class="folder-path">未选择文件夹</div>
+      <div class="list-actions">
+        <button id="btn-select-all" class="btn small ghost" disabled>全选</button>
+        <button id="btn-select-none" class="btn small ghost" disabled>清空</button>
+        <span id="file-count" class="muted">0 张</span>
+      </div>
+      <div id="file-list" class="file-list">
+        <div class="placeholder">先选择包含 PNG 的文件夹</div>
+      </div>
+      <div class="run-area">
+        <label class="checkbox">
+          <input type="checkbox" id="keep-work" />
+          处理后保留备份与复查图（便于人工检查）
+        </label>
+        <button id="btn-run" class="btn primary" disabled>开始处理</button>
+        <button id="btn-cleanup" class="btn danger ghost" disabled>清理本轮产物</button>
+      </div>
+    </section>
+
+    <section class="panel right-panel">
+      <div class="panel-head">
+        <h2>运行状态</h2>
+      </div>
+      <div class="review-grid">
+        <figure class="review-box">
+          <figcaption>修复候选复查图</figcaption>
+          <div id="review-candidate" class="review-img"><div class="placeholder">尚未生成</div></div>
+        </figure>
+        <figure class="review-box">
+          <figcaption>落盘最终复查图</figcaption>
+          <div id="review-final" class="review-img"><div class="placeholder">尚未生成</div></div>
+        </figure>
+      </div>
+      <div class="panel-head">
+        <h2>日志</h2>
+        <button id="btn-clear-log" class="btn small ghost">清空</button>
+      </div>
+      <pre id="log" class="log"></pre>
+    </section>
+  </main>
+
+  <script src="main.js"></script>
+</body>
+</html>

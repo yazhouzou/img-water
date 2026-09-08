@@ -26,16 +26,21 @@ SOURCE = WORK / 'source'
 MASKS = WORK / 'masks'
 LAMA = WORK / 'lama'
 REVIEW = WORK / 'review'
-BACKUP = ROOT / 'original-watermark-backup'
+DEFAULT_ROOT = ROOT
 IOPAINT = VENV / 'bin' / 'iopaint'
+
+
+def backup_dir(root):
+    return Path(root) / 'original-watermark-backup'
 
 
 def numeric_key(path):
     return (0, int(path.stem)) if path.stem.isdigit() else (1, path.stem)
 
 
-def target_names(files):
-    paths = [ROOT / item for item in files] if files else sorted(ROOT.glob('*.png'), key=numeric_key)
+def target_names(files, root):
+    root = Path(root)
+    paths = [root / item for item in files] if files else sorted(root.glob('*.png'), key=numeric_key)
     names = []
     for path in paths:
         if path.suffix.lower() != '.png':
@@ -44,7 +49,10 @@ def target_names(files):
             raise SystemExit(f'missing file: {path.name}')
         names.append(path.name)
     if not names:
-        raise SystemExit('no root png files found')
+        raise SystemExit(
+            f'no png files found in: {root}\n'
+            "hint: pass a folder with --root, e.g. ./tools/remove_doubao_watermark.py --root /path/to/images run"
+        )
     return names
 
 
@@ -109,18 +117,19 @@ def review_box(name, width, height):
     )
 
 
-def ensure_work_dirs():
-    for path in (SOURCE, MASKS, LAMA, REVIEW, BACKUP):
+def ensure_work_dirs(root):
+    for path in (SOURCE, MASKS, LAMA, REVIEW, backup_dir(root)):
         path.mkdir(parents=True, exist_ok=True)
 
 
-def prepare(names, custom_box, emit=True):
+def prepare(names, custom_box, root, emit=True):
     if WORK.exists():
         rmtree(WORK)
-    ensure_work_dirs()
+    ensure_work_dirs(root)
+    backup_root = backup_dir(root)
     for name in names:
-        current = ROOT / name
-        backup = BACKUP / name
+        current = Path(root) / name
+        backup = backup_root / name
         if not backup.exists():
             copyfile(current, backup)
         copyfile(backup, SOURCE / name)
@@ -136,7 +145,6 @@ def prepare(names, custom_box, emit=True):
     if emit:
         print(output)
     return output
-
 
 def review(input_dir, output_name, names):
     REVIEW.mkdir(parents=True, exist_ok=True)
@@ -199,71 +207,79 @@ def review_lama(names, emit=True):
     return output
 
 
-def overwrite_review(names, emit=True):
+def overwrite_review(names, root, emit=True):
     for name in names:
-        copyfile(LAMA / name, ROOT / name)
+        copyfile(LAMA / name, Path(root) / name)
     output = REVIEW / 'overwritten-corner-review.png'
-    review(ROOT, output.name, names)
+    review(root, output.name, names)
     if emit:
         print(output)
     return output
 
 
-def cleanup(names):
+def cleanup(names, root):
+    backup = backup_dir(root)
     for name in names:
-        backup = BACKUP / name
-        if backup.exists():
-            backup.unlink()
-    if BACKUP.exists() and not any(BACKUP.iterdir()):
-        BACKUP.rmdir()
+        backup_file = backup / name
+        if backup_file.exists():
+            backup_file.unlink()
+    if backup.exists() and not any(backup.iterdir()):
+        backup.rmdir()
     if WORK.exists():
         rmtree(WORK)
 
 
-def run_all(names, custom_box, keep_work):
-    prepare(names, custom_box, emit=False)
+def run_all(names, custom_box, keep_work, root):
+    prepare(names, custom_box, root, emit=False)
     inpaint()
     candidate_review = review_lama(names, emit=False)
-    final_review = overwrite_review(names, emit=False)
+    final_review = overwrite_review(names, root, emit=False)
     print(f'processed {len(names)} file(s): {", ".join(names)}')
     print(f'candidate review: {candidate_review}')
     print(f'final review: {final_review}')
     if keep_work:
         print(f'kept workdir: {WORK}')
     else:
-        cleanup(names)
-        print('cleaned: original-watermark-backup and /tmp/doubao-watermark-work')
+        cleanup(names, root)
+        print(f'cleaned: {backup_dir(root)} and {WORK}')
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Remove Doubao or custom text watermark from root PNG images.')
+    parser = argparse.ArgumentParser(description='Remove Doubao or custom text watermark from PNG images.')
     parser.add_argument(
         '--mask-box',
         type=parse_box,
         help='custom watermark box as x1,y1,x2,y2; negative values are relative to right/bottom, e.g. -330,-118,-8,-8',
     )
     parser.add_argument(
+        '--root',
+        help='target folder containing png files; defaults to this project root',
+    )
+    parser.add_argument(
         '--keep-work',
         action='store_true',
-        help='keep original-watermark-backup and /tmp/doubao-watermark-work after the run command for manual review',
+        help='keep original-watermark-backup and the workdir after the run command for manual review',
     )
     parser.add_argument('command', choices=['run', 'prepare', 'inpaint', 'review-lama', 'overwrite-review', 'cleanup'])
     parser.add_argument('files', nargs='*')
     args = parser.parse_args()
-    names = target_names(args.files)
+    root = Path(args.root).resolve() if args.root else DEFAULT_ROOT
+    if not root.exists():
+        raise SystemExit(f'root folder not found: {root}')
+    names = target_names(args.files, root)
 
     if args.command == 'run':
-        run_all(names, args.mask_box, args.keep_work)
+        run_all(names, args.mask_box, args.keep_work, root)
     elif args.command == 'prepare':
-        prepare(names, args.mask_box)
+        prepare(names, args.mask_box, root)
     elif args.command == 'inpaint':
         inpaint()
     elif args.command == 'review-lama':
         review_lama(names)
     elif args.command == 'overwrite-review':
-        overwrite_review(names)
+        overwrite_review(names, root)
     elif args.command == 'cleanup':
-        cleanup(names)
+        cleanup(names, root)
 
 
 if __name__ == '__main__':
