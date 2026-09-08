@@ -63,17 +63,7 @@ jobs:
         if: failure()
         working-directory: desktop
         run: |
-          python3 - <<'EOF'
-          lines = open('build.log', errors='ignore').read().splitlines()
-          def emit(title, text):
-              text = text.replace('::', ': :')[-3800:]
-              msg = '%0A'.join(text.splitlines())
-              print(f"::error title={title}::{msg}")
-          errs = [l for l in lines if 'error' in l.lower() or 'warning: unused' in l.lower()][:80]
-          if errs:
-              emit('error-lines', '\n'.join(errs))
-          emit('log-tail', '\n'.join(lines[-150:]))
-          EOF
+          (grep -iE "error\[|error:|failed to" build.log | tail -40; echo "---- tail ----"; tail -10 build.log) | sed 's/::/: :/g' | while IFS= read -r line; do echo "::error::$line"; done
 
       - uses: actions/upload-artifact@v4
         with:
