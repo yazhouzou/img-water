@@ -11,6 +11,7 @@ tauri-build = { version = "2", features = [] }
 [lib]
 name = "doubao_clean"
 path = "src/lib.rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
 name = "clean-cli"
