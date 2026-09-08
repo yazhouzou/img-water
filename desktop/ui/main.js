@@ -1,9 +1,10 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
-const { open } = window.__TAURI__.dialog;
+const { open, ask } = window.__TAURI__.dialog;
 
 const els = {
   envBadge: document.getElementById('env-badge'),
+  btnSetup: document.getElementById('btn-setup'),
   btnPick: document.getElementById('btn-pick'),
   btnRefresh: document.getElementById('btn-refresh'),
   btnSelectAll: document.getElementById('btn-select-all'),
@@ -28,6 +29,7 @@ function setRunning(value) {
   els.btnRun.disabled = value || !targetRoot;
   els.btnPick.disabled = value;
   els.btnCleanup.disabled = value || !targetRoot;
+  els.btnSetup.disabled = value;
 }
 
 function logLine(text) {
@@ -59,6 +61,7 @@ async function refreshEnv() {
     const status = await invoke('env_status');
     els.envBadge.textContent = status.ready ? '修复环境就绪' : '修复环境未就绪';
     els.envBadge.className = 'badge ' + (status.ready ? 'ok' : 'bad');
+    els.btnSetup.hidden = status.ready;
     if (!status.ready) logLine('[环境] ' + status.hint);
     return status.ready;
   } catch (err) {
@@ -157,6 +160,23 @@ async function init() {
   });
   els.btnClearLog.addEventListener('click', () => { els.log.textContent = ''; });
 
+  els.btnSetup.addEventListener('click', async () => {
+    if (running) return;
+    const ok = await ask(
+      '将在线下载约 2-4GB 依赖（PyTorch 等，走国内 PyPI 镜像）和 200MB LaMa 模型，预计 5-15 分钟，是否继续？',
+      { title: '初始化修复环境', kind: 'info' }
+    );
+    if (!ok) return;
+    setRunning(true);
+    logLine('[环境] 开始初始化修复环境（日志见下方）…');
+    try {
+      await invoke('setup_env');
+    } catch (err) {
+      logLine('[错误] ' + String(err));
+      setRunning(false);
+    }
+  });
+
   els.btnRun.addEventListener('click', async () => {
     const files = selectedFiles();
     if (files.length === 0 || running) return;
@@ -188,7 +208,7 @@ async function init() {
   });
 
   if (!ready) {
-    logLine('[提示] 请先在项目根目录运行 ./tools/ensure-inpaint-env.sh 初始化修复环境');
+    logLine('[提示] 点击右上角“一键初始化修复环境”，或在项目根目录运行 ./tools/ensure-inpaint-env.sh');
   }
 }
 

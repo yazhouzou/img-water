@@ -112,7 +112,10 @@ LaMa 模型通常缓存于：
 - 构建：`cd desktop && pnpm tauri build`
 - 脚本已支持 `--root <文件夹>`，桌面端用它在用户选择的任意文件夹上执行处理；CLI 不传 `--root` 时默认仍是项目根目录，会话流程不受影响
 - Windows 安装包无法在 macOS 上交叉编译，用 `.github/workflows/desktop-build.yml` 在 CI 构建
-- 当前里程碑：安装包不捆绑 `.img-inpaint-venv/`（体积大），目标机器需先运行 `./tools/ensure-inpaint-env.sh`；后续可引入环境捆绑或 ONNX 内核方案
+- 当前里程碑：安装包不捆绑 `.img-inpaint-venv/`（体积大），目标机器用应用内“一键初始化修复环境”按钮或初始化脚本在线拉取依赖
+- 一键初始化：Rust 端 `setup_env` 命令执行 `tools/ensure-inpaint-env.sh`（macOS/Linux）或 `tools/ensure-inpaint-env.ps1`（Windows），pip 默认走阿里云 PyPI 镜像（`PIP_INDEX_URL` 可覆盖），自动断点续传下载 LaMa 模型（`LAMA_MODEL_URL` 可覆盖），日志实时回传到界面
+- 不要建议在目标机器上执行 `pnpm tauri build` 作为安装方式：需要完整 Node/Rust/Xcode/VS 工具链，编译慢且易失败，且省不掉运行时的 Python/PyTorch/模型；小体积分发的正确形态是小安装包 + 首次运行在线初始化，长期方向是 ONNX 内核（免 Python）
+- macOS 构建必须用 `desktop/build.sh`（自动 unset `~/.zshrc` 里的旧 MacPorts 编译变量，否则构建失败）
 
 ## 提效规则
 

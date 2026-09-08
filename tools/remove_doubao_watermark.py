@@ -3,15 +3,23 @@ import argparse
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from shutil import copyfile, rmtree
 
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV = ROOT / '.img-inpaint-venv'
-VENV_PYTHON = VENV / 'bin' / 'python'
+IS_WINDOWS = os.name == 'nt'
+if IS_WINDOWS:
+    VENV_PYTHON = VENV / 'Scripts' / 'python.exe'
+else:
+    VENV_PYTHON = VENV / 'bin' / 'python'
 if VENV_PYTHON.exists() and Path(sys.prefix).resolve() != VENV.resolve():
-    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]])
+    argv = [str(VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]]
+    if IS_WINDOWS:
+        sys.exit(subprocess.call(argv))
+    os.execv(str(VENV_PYTHON), argv)
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -21,13 +29,21 @@ except ModuleNotFoundError as exc:
     raise
 
 
-WORK = Path(os.environ.get('DOUBAO_WATERMARK_WORKDIR', '/tmp/doubao-watermark-work'))
+if IS_WINDOWS:
+    DEFAULT_WORKDIR = Path(tempfile.gettempdir()) / 'doubao-watermark-work'
+else:
+    DEFAULT_WORKDIR = Path('/tmp/doubao-watermark-work')
+WORK = Path(os.environ.get('DOUBAO_WATERMARK_WORKDIR', str(DEFAULT_WORKDIR)))
 SOURCE = WORK / 'source'
 MASKS = WORK / 'masks'
 LAMA = WORK / 'lama'
 REVIEW = WORK / 'review'
 DEFAULT_ROOT = ROOT
-IOPAINT = VENV / 'bin' / 'iopaint'
+if IS_WINDOWS:
+    IOPAINT = VENV / 'Scripts' / 'iopaint.exe'
+else:
+    IOPAINT = VENV / 'bin' / 'iopaint'
+DEVICE = 'mps' if sys.platform == 'darwin' else 'cpu'
 
 
 def backup_dir(root):
@@ -179,7 +195,7 @@ def review(input_dir, output_name, names):
 
 def inpaint():
     if not IOPAINT.exists():
-        raise SystemExit('missing project env; run tools/ensure-inpaint-env.sh first')
+        raise SystemExit('missing project env; run tools/ensure-inpaint-env.sh (or .ps1 on Windows) first')
     subprocess.run(
         [
             str(IOPAINT),
@@ -187,7 +203,7 @@ def inpaint():
             '--model',
             'lama',
             '--device',
-            'mps',
+            DEVICE,
             '--image',
             str(SOURCE),
             '--mask',

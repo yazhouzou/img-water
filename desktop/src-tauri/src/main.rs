@@ -4,7 +4,7 @@ use base64::Engine as _;
 use serde::Serialize;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -81,9 +81,47 @@ fn env_status() -> EnvStatus {
         hint: if ready {
             String::new()
         } else {
-            "修复环境未就绪：请在项目根目录运行 ./tools/ensure-inpaint-env.sh".into()
+            "修复环境未就绪：点击“一键初始化修复环境”在线安装（PyPI 国内镜像 + LaMa 模型）".into()
         },
     }
+}
+
+fn setup_script_command() -> Command {
+    let root = project_root();
+    if cfg!(windows) {
+        let script = root.join("tools/ensure-inpaint-env.ps1");
+        let mut command = Command::new("powershell");
+        command
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script);
+        command
+    } else {
+        let script = root.join("tools/ensure-inpaint-env.sh");
+        let mut command = Command::new("bash");
+        command.arg(&script);
+        command
+    }
+}
+
+#[tauri::command]
+fn setup_env(app: AppHandle, storage: State<'_, AppStorage>) -> Result<(), String> {
+    if storage.running.swap(true, Ordering::SeqCst) {
+        return Err("已有任务在运行中，请等待完成".into());
+    }
+    let mut command = setup_script_command();
+    command
+        .env("PYTHONUNBUFFERED", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().map_err(|e| {
+        storage.running.store(false, Ordering::SeqCst);
+        format!("启动初始化脚本失败: {}", e)
+    })?;
+    spawn_and_wait(app, child);
+    Ok(())
 }
 
 #[tauri::command]
@@ -135,6 +173,36 @@ fn spawn_stream(app: AppHandle, stream: impl std::io::Read + Send + 'static) {
     });
 }
 
+fn spawn_and_wait(app: AppHandle, mut child: Child) {
+    if let Some(stdout) = child.stdout.take() {
+        spawn_stream(app.clone(), stdout);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_stream(app.clone(), stderr);
+    }
+    let app_handle = app.clone();
+    thread::spawn(move || {
+        let status = child.wait();
+        match status {
+            Ok(code) => {
+                let _ = app_handle.emit(
+                    EVENT_EXIT,
+                    serde_json::json!({ "code": code.code().unwrap_or(-1), "success": code.success() }),
+                );
+            }
+            Err(err) => {
+                let _ = app_handle.emit(
+                    EVENT_EXIT,
+                    serde_json::json!({ "code": -1, "success": false, "error": err.to_string() }),
+                );
+            }
+        }
+        if let Some(state) = app_handle.try_state::<AppStorage>() {
+            state.running.store(false, Ordering::SeqCst);
+        }
+    });
+}
+
 #[tauri::command]
 fn run_pipeline(
     app: AppHandle,
@@ -174,39 +242,12 @@ fn run_pipeline(
         command.arg(file);
     }
 
-    let mut child = command.spawn().map_err(|e| {
+    let child = command.spawn().map_err(|e| {
         storage.running.store(false, Ordering::SeqCst);
         format!("启动流水线失败: {}", e)
     })?;
 
-    if let Some(stdout) = child.stdout.take() {
-        spawn_stream(app.clone(), stdout);
-    }
-    if let Some(stderr) = child.stderr.take() {
-        spawn_stream(app.clone(), stderr);
-    }
-
-    let app_handle = app.clone();
-    thread::spawn(move || {
-        let status = child.wait();
-        match status {
-            Ok(code) => {
-                let _ = app_handle.emit(
-                    EVENT_EXIT,
-                    serde_json::json!({ "code": code.code().unwrap_or(-1), "success": code.success() }),
-                );
-            }
-            Err(err) => {
-                let _ = app_handle.emit(
-                    EVENT_EXIT,
-                    serde_json::json!({ "code": -1, "success": false, "error": err.to_string() }),
-                );
-            }
-        }
-        if let Some(state) = app_handle.try_state::<AppStorage>() {
-            state.running.store(false, Ordering::SeqCst);
-        }
-    });
+    spawn_and_wait(app, child);
 
     let mut last = storage.last_files.lock().map_err(|e| e.to_string())?;
     *last = files;
@@ -278,6 +319,7 @@ fn main() {
         .manage(AppStorage::default())
         .invoke_handler(tauri::generate_handler![
             env_status,
+            setup_env,
             list_pngs,
             run_pipeline,
             cleanup_pipeline,

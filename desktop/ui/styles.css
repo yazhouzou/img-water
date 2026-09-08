@@ -57,6 +57,9 @@ body {
 .badge.ok { background: #e8f7ee; color: var(--ok); }
 .badge.bad { background: #fdecec; color: var(--danger); }
 
+.env-area { display: flex; align-items: center; gap: 10px; }
+.btn.small { padding: 6px 14px; font-size: 13px; }
+
 .layout {
   flex: 1;
   display: grid;

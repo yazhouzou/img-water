@@ -13,8 +13,16 @@
 
 - Node.js 20+ 与 pnpm（用于 Tauri CLI）
 - Rust stable（macOS：`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`）
-- 项目内修复环境：在仓库根目录运行 `./tools/ensure-inpaint-env.sh`
-- LaMa 模型缓存：`~/.cache/torch/hub/checkpoints/big-lama.pt`（缺失时首次 `inpaint` 会自动下载）
+- 项目内修复环境：在仓库根目录运行 `./tools/ensure-inpaint-env.sh`（macOS/Linux）或 `tools/ensure-inpaint-env.ps1`（Windows），或直接在应用内点“一键初始化修复环境”
+- LaMa 模型缓存：`~/.cache/torch/hub/checkpoints/big-lama.pt`（初始化脚本会自动断点续传下载；缺失时首次 `inpaint` 也会自动下载）
+
+## 一键在线初始化（小体积分发）
+
+应用检测到 `.img-inpaint-venv` 缺失时，右上角会出现“一键初始化修复环境”按钮，后台执行 `tools/ensure-inpaint-env.sh` / `.ps1`：
+
+- pip 走阿里云 PyPI 镜像（可用环境变量 `PIP_INDEX_URL` 覆盖），下载 PyTorch 等约 2-4GB
+- 从 GitHub 下载 LaMa 模型约 200MB，支持断点续传（可用 `LAMA_MODEL_URL` 覆盖为镜像地址）
+- 全程日志实时显示在应用日志区，完成后环境徽章自动刷新
 
 ## 开发调试
 
@@ -41,10 +49,30 @@ cd desktop && env -u CFLAGS -u CXXFLAGS -u CCFLAGS -u LDFLAGS -u MACOSX_DEPLOYME
 ```
 
 macOS 产物：`src-tauri/target/release/bundle/dmg/*.dmg`
-Windows 产物（需在 Windows 机器或 CI 上构建）：`src-tauri/target/release/bundle/nsis/*.exe`
+
+## Windows 本地构建
+
+在一台 Windows 10/11 机器上（无法从 macOS 交叉编译）：
+
+1. 安装前置组件：
+   - Node.js 20+：https://nodejs.org/
+   - Rust stable：https://rustup.rs/
+   - Visual Studio Build Tools，勾选“使用 C++ 的桌面开发”工作负载：https://visualstudio.microsoft.com/visual-cpp-build-tools/
+2. 拉取仓库后执行：
+
+   ```powershell
+   git clone <仓库地址>
+   cd <仓库>\desktop
+   .\build.ps1
+   ```
+
+   `build.ps1` 会自动检查 node/cargo/pnpm/VS C++ 工作负载（pnpm 缺失时尝试 corepack 启用），然后 `pnpm install && pnpm tauri build`。Windows 下只出 NSIS 安装包（`tauri.windows.conf.json` 覆盖，避免 MSI 需在线下载 WiX 工具链导致失败）。
+3. 产物：`src-tauri\target\release\bundle\nsis\doubao-watermark-remover_0.1.0_x64-setup.exe`
+4. 分发时连同仓库一起给目标用户（小安装包 + 在线初始化运行时依赖）；目标机器运行应用后点“一键初始化修复环境”即可（需 Python 3.10+，脚本会自动创建 venv 并走国内 PyPI 镜像下载依赖和 LaMa 模型）
 
 ## 分发注意事项（当前里程碑）
 
 - 发布包内的 Rust 外壳已支持在安装目录附近查找 `tools/remove_doubao_watermark.py`
-- 修复环境 `.img-inpaint-venv/`（含 PyTorch）体积较大，当前版本不在安装包内捆绑；目标机器需执行 `./tools/ensure-inpaint-env.sh` 或后续引入捆绑方案
-- Windows 构建请使用 GitHub Actions（`.github/workflows/desktop-build.yml`），在 macOS 上无法交叉编译 Windows 安装包
+- 修复环境 `.img-inpaint-venv/`（含 PyTorch）体积较大，当前版本不在安装包内捆绑；目标机器用应用内“一键初始化修复环境”或初始化脚本在线拉取（走国内镜像）
+- 注意：在目标机器上执行 `pnpm tauri build` 不可行——需要完整 Node/Rust/Xcode/VS 工具链（数 GB、编译 10 分钟以上、易失败），且省不掉运行时的 Python/PyTorch/模型。小体积分发 = 小安装包 + 首次运行在线初始化运行时依赖；未来最优解是 ONNX 内核（免 Python，预计安装包 ~200MB）
+- Windows 构建采用本地构建方案：在一台 Windows 机器上执行 `desktop\build.ps1`，产物为 NSIS 安装包；备选方案是 GitHub Actions（`.github/workflows/desktop-build.yml`）或云效 Flow
