@@ -50,6 +50,21 @@ cd desktop && env -u CFLAGS -u CXXFLAGS -u CCFLAGS -u LDFLAGS -u MACOSX_DEPLOYME
 
 macOS 产物：`src-tauri/target/release/bundle/dmg/*.dmg`
 
+## 一键打包（推荐）
+
+统一入口 `tools/package-app.sh`，产物输出到项目根目录 `dist/`：
+
+```bash
+tools/package-app.sh mac        # 在 macOS 上构建 DMG
+tools/package-app.sh win        # 在 Windows 的 Git Bash 里本机构建 NSIS
+tools/package-app.sh win --remote user@host --win-repo 'C:/code/remove_watermark'
+                                # 在 macOS 上远程触发 Windows 机器构建（自动 git pull）并拉回安装包
+tools/package-app.sh both --remote user@host --win-repo 'C:/code/remove_watermark'
+                                # 一同打包：macOS 本机 + 远程 Windows
+```
+
+远程 Windows 机器需要：开启 OpenSSH 服务器（设置 → 可选功能 → OpenSSH 服务器）、克隆好仓库并装好构建前置（Node/Rust/VS Build Tools）。
+
 ## Windows 本地构建
 
 在一台 Windows 10/11 机器上（无法从 macOS 交叉编译）：

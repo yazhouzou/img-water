@@ -116,6 +116,7 @@ LaMa 模型通常缓存于：
 - 一键初始化：Rust 端 `setup_env` 命令执行 `tools/ensure-inpaint-env.sh`（macOS/Linux）或 `tools/ensure-inpaint-env.ps1`（Windows），pip 默认走阿里云 PyPI 镜像（`PIP_INDEX_URL` 可覆盖），自动断点续传下载 LaMa 模型（`LAMA_MODEL_URL` 可覆盖），日志实时回传到界面
 - 不要建议在目标机器上执行 `pnpm tauri build` 作为安装方式：需要完整 Node/Rust/Xcode/VS 工具链，编译慢且易失败，且省不掉运行时的 Python/PyTorch/模型；小体积分发的正确形态是小安装包 + 首次运行在线初始化，长期方向是 ONNX 内核（免 Python）
 - macOS 构建必须用 `desktop/build.sh`（自动 unset `~/.zshrc` 里的旧 MacPorts 编译变量，否则构建失败）
+- 一键打包入口 `tools/package-app.sh`：`mac`（本机 DMG）、`win`（Windows Git Bash 本机构建，或 macOS 上 `--remote user@host --win-repo C:/path` 经 SSH 触发远程 Windows 构建并拉回）、`both`（两者一同打包）；产物统一在项目根目录 `dist/`
 
 ## 提效规则
 
