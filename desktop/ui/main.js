@@ -162,15 +162,15 @@ async function init() {
 
   els.btnSetup.addEventListener('click', async () => {
     if (running) return;
-    const ok = await ask(
-      '将在线下载约 2-4GB 依赖（PyTorch 等，走国内 PyPI 镜像）和 200MB LaMa 模型，预计 5-15 分钟，是否继续？',
-      { title: '初始化修复环境', kind: 'info' }
-    );
+    const ok = await ask('将在线下载约 200MB 的修复模型（国内镜像，支持断点续传），无需 Python，是否继续？', {
+      title: '下载修复模型',
+      kind: 'info',
+    });
     if (!ok) return;
     setRunning(true);
-    logLine('[环境] 开始初始化修复环境（日志见下方）…');
+    logLine('[模型] 开始下载修复模型…');
     try {
-      await invoke('setup_env');
+      await invoke('setup_model');
     } catch (err) {
       logLine('[错误] ' + String(err));
       setRunning(false);

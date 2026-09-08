@@ -106,17 +106,15 @@ LaMa 模型通常缓存于：
 
 ## 桌面端
 
-项目提供 Tauri 桌面应用（`desktop/`），供 macOS / Windows 用户自助使用，复用同一流水线脚本：
+项目提供 Tauri 桌面应用（`desktop/`），内置 Rust + ONNX Runtime 修复内核（v0.2 起，无需 Python）：
 
-- 开发调试：`cd desktop && pnpm install && pnpm tauri dev`
-- 构建：`cd desktop && pnpm tauri build`
-- 脚本已支持 `--root <文件夹>`，桌面端用它在用户选择的任意文件夹上执行处理；CLI 不传 `--root` 时默认仍是项目根目录，会话流程不受影响
-- Windows 安装包无法在 macOS 上交叉编译，用 `.github/workflows/desktop-build.yml` 在 CI 构建
-- 当前里程碑：安装包不捆绑 `.img-inpaint-venv/`（体积大），目标机器用应用内“一键初始化修复环境”按钮或初始化脚本在线拉取依赖
-- 一键初始化：Rust 端 `setup_env` 命令执行 `tools/ensure-inpaint-env.sh`（macOS/Linux）或 `tools/ensure-inpaint-env.ps1`（Windows），pip 默认走阿里云 PyPI 镜像（`PIP_INDEX_URL` 可覆盖），自动断点续传下载 LaMa 模型（`LAMA_MODEL_URL` 可覆盖），日志实时回传到界面
-- 不要建议在目标机器上执行 `pnpm tauri build` 作为安装方式：需要完整 Node/Rust/Xcode/VS 工具链，编译慢且易失败，且省不掉运行时的 Python/PyTorch/模型；小体积分发的正确形态是小安装包 + 首次运行在线初始化，长期方向是 ONNX 内核（免 Python）
-- macOS 构建必须用 `desktop/build.sh`（自动 unset `~/.zshrc` 里的旧 MacPorts 编译变量，否则构建失败）
-- 一键打包入口 `tools/package-app.sh`：`mac`（本机 DMG）、`win`（Windows Git Bash 本机构建，或 macOS 上 `--remote user@host --win-repo C:/path` 经 SSH 触发远程 Windows 构建并拉回）、`both`（两者一同打包）；产物统一在项目根目录 `dist/`
+- 内核：`desktop/src-tauri/src/lama.rs` 用 `ort` 推理 LaMa ONNX 模型（`.models/lama_fp32.onnx`，约 200MB），固定 512×512 窗口推理后合成回原图；遮罩 bbox 超过约 496px 会报错（角标水印场景足够）
+- 流水线：`desktop/src-tauri/src/pipeline.rs` 是 `tools/remove_doubao_watermark.py` 的 Rust 移植（备份/遮罩/修复/复查/覆盖/清理），桌面端进程内调用；`run` 模式清理前会把两张复查拼图复制到系统临时目录 `doubao-watermark-review/` 再输出路径，避免复查图被清理后失效
+- CLI：`clean-cli`（`cargo build --bin clean-cli`），参数与 Python 脚本一致（`--root`/`--mask-box`/`--keep-work` + `run|prepare|inpaint|review-lama|overwrite-review|cleanup`）
+- 模型下载：应用内“一键下载修复模型”按钮，默认 hf-mirror（`LAMA_ONNX_URL` 可覆盖；`LAMA_ONNX_PATH` 可覆盖模型位置），进度实时回传界面
+- 开发调试：`cd desktop && pnpm install && pnpm tauri dev`；直接跑 `cargo build`/`cargo check` 必须先 `env -u CFLAGS -u CXXFLAGS -u CCFLAGS -u LDFLAGS -u MACOSX_DEPLOYMENT_TARGET`（`.zshrc` 旧 MacPorts 变量会破坏 `objc2-exception-helper` 编译），或统一用 `desktop/build.sh`
+- Windows 安装包无法在 macOS 上交叉编译；一键打包入口 `tools/package-app.sh`：`mac`（本机 DMG）、`win`（Windows Git Bash 本机构建，或 macOS 上 `--remote user@host --win-repo C:/path` 经 SSH 触发远程 Windows 构建并拉回）、`both`（两者一同打包）；产物统一在项目根目录 `dist/`
+- 旧 Python 流水线（`tools/remove_doubao_watermark.py` + `.img-inpaint-venv/`）保留作终端回退方案，不再被桌面端依赖
 
 ## 提效规则
 

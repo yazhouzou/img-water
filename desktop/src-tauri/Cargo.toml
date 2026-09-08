@@ -3,9 +3,18 @@ name = "doubao-watermark-remover"
 version = "0.1.0"
 description = "Remove Doubao AI watermark from PNG images"
 edition = "2021"
+default-run = "doubao-watermark-remover"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[lib]
+name = "doubao_clean"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clean-cli"
+path = "src/bin/clean_cli.rs"
 
 [dependencies]
 base64 = "0.22"
@@ -13,6 +22,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+ort = "2.0.0-rc.10"
+image = { version = "0.25", default-features = false, features = ["png"] }
+imageproc = "0.25"
+ab_glyph = "0.2"
+ureq = { version = "2", features = ["rustls"] }
 
 [profile.release]
 strip = true

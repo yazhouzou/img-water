@@ -1,6 +1,13 @@
 # 豆包水印清理助手（桌面端）
 
-基于 Tauri v2 的跨平台桌面应用，复用项目内 `tools/remove_doubao_watermark.py` 流水线，批量去除 PNG 右下角“豆包AI生成”水印。
+基于 Tauri v2 的跨平台桌面应用，内置 Rust + ONNX Runtime 修复内核（无需 Python），批量去除 PNG 右下角“豆包AI生成”水印。
+
+## 架构（ONNX 内核，v0.2 起）
+
+- Rust 端直接用 `ort`（ONNX Runtime）推理 LaMa 模型：遮罩 bbox → 512×512 窗口 → 推理 → 合成回原图
+- 首次使用只需下载约 200MB 的 `lama_fp32.onnx` 模型（hf-mirror，支持断点续传，`LAMA_ONNX_URL`/`LAMA_ONNX_PATH` 可覆盖），无 Python / PyTorch / iopaint
+- 流水线（备份 → 遮罩 → 修复 → 覆盖 → 复查 → 清理）完全在 Rust 进程内执行；CLI 兼容命令见 `clean-cli`（`cargo build --bin clean-cli`）
+- 终端用户仍可用旧 Python 流水线 `tools/remove_doubao_watermark.py`（保留作回退，需要 `tools/ensure-inpaint-env.sh`）
 
 ## 功能
 
@@ -16,13 +23,13 @@
 - 项目内修复环境：在仓库根目录运行 `./tools/ensure-inpaint-env.sh`（macOS/Linux）或 `tools/ensure-inpaint-env.ps1`（Windows），或直接在应用内点“一键初始化修复环境”
 - LaMa 模型缓存：`~/.cache/torch/hub/checkpoints/big-lama.pt`（初始化脚本会自动断点续传下载；缺失时首次 `inpaint` 也会自动下载）
 
-## 一键在线初始化（小体积分发）
+## 一键在线下载模型（小体积分发）
 
-应用检测到 `.img-inpaint-venv` 缺失时，右上角会出现“一键初始化修复环境”按钮，后台执行 `tools/ensure-inpaint-env.sh` / `.ps1`：
+应用检测到 `.models/lama_fp32.onnx` 缺失时，右上角会出现“一键下载修复模型”按钮：
 
-- pip 走阿里云 PyPI 镜像（可用环境变量 `PIP_INDEX_URL` 覆盖），下载 PyTorch 等约 2-4GB
-- 从 GitHub 下载 LaMa 模型约 200MB，支持断点续传（可用 `LAMA_MODEL_URL` 覆盖为镜像地址）
-- 全程日志实时显示在应用日志区，完成后环境徽章自动刷新
+- 默认从 hf-mirror 下载约 200MB（`LAMA_ONNX_URL` 可覆盖）
+- 进度实时显示在日志区，完成后环境徽章自动刷新
+- 模型存放位置可用 `LAMA_ONNX_PATH` 覆盖；默认在项目根目录 `.models/`
 
 ## 开发调试
 
