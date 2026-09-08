@@ -1,6 +1,9 @@
+pub mod app;
 pub mod fetch;
 pub mod lama;
 pub mod pipeline;
+
+pub use app::run_tauri_app;
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
