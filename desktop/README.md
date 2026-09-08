@@ -23,6 +23,16 @@
 - 项目内修复环境：在仓库根目录运行 `./tools/ensure-inpaint-env.sh`（macOS/Linux）或 `tools/ensure-inpaint-env.ps1`（Windows），或直接在应用内点“一键初始化修复环境”
 - LaMa 模型缓存：`~/.cache/torch/hub/checkpoints/big-lama.pt`（初始化脚本会自动断点续传下载；缺失时首次 `inpaint` 也会自动下载）
 
+## Android / 移动端（代码就绪，待真机验证）
+
+Rust 内核与流水线可直接交叉编译到 Android（Tauri v2 mobile），移动端适配已就绪：
+
+- 路径重定向：模型放应用数据目录 `app_data_dir/models/`，工作目录放 `app_cache_dir/`（`MODEL_DIR_OVERRIDE`/`WORKDIR_OVERRIDE`，桌面行为不变）
+- 文件访问：移动端“选择图片”（可多选）→ 拷入 `app_data_dir/imports/<时间戳>/` → 复用同一流水线 → 结果回写到该目录
+- UI：移动端单列布局，“选文件夹”自动切换为“选择图片”
+
+待办：Android 构建需要 SDK/NDK（本机未安装，按要求不装），后续走 CI 构建 APK 并真机验证（模型 200MB 下载、512 窗口推理内存/速度需真机确认）。
+
 ## 一键在线下载模型（小体积分发）
 
 应用检测到 `.models/lama_fp32.onnx` 缺失时，右上角会出现“一键下载修复模型”按钮：

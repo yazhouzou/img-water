@@ -214,6 +214,51 @@ fn cleanup_pipeline(storage: State<'_, AppStorage>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn import_files(app: AppHandle, paths: Vec<String>) -> Result<ImportResult, String> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("imports");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis();
+    let dir = base.join(format!("import-{}", stamp));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let mut names: Vec<String> = Vec::new();
+    for (index, raw) in paths.iter().enumerate() {
+        let source = PathBuf::from(raw);
+        if !source.is_file() {
+            return Err(format!("文件不存在: {}", raw));
+        }
+        let mut name = source
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("image-{}.png", index));
+        if !name.to_lowercase().ends_with(".png") {
+            name.push_str(".png");
+        }
+        while names.iter().any(|existing| existing == &name) {
+            let stem = name.trim_end_matches(".png").to_string();
+            name = format!("{}-{}.png", stem, index);
+        }
+        std::fs::copy(&source, dir.join(&name)).map_err(|e| format!("拷贝 {} 失败: {}", name, e))?;
+        names.push(name);
+    }
+    if names.is_empty() {
+        return Err("未选择图片".into());
+    }
+    Ok(ImportResult { dir: dir.display().to_string(), names })
+}
+
+#[derive(Serialize)]
+struct ImportResult {
+    dir: String,
+    names: Vec<String>,
+}
+
+#[tauri::command]
 fn read_image_base64(path: String) -> Result<String, String> {
     let file = PathBuf::from(&path);
     if !file.is_file() {
@@ -238,10 +283,26 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppStorage::default())
+        .setup(|app| {
+            if cfg!(target_os = "android") || cfg!(target_os = "ios") {
+                let data_dir = app
+                    .path()
+                    .app_data_dir()
+                    .expect("no app data dir");
+                let cache_dir = app
+                    .path()
+                    .app_cache_dir()
+                    .expect("no app cache dir");
+                let _ = doubao_clean::MODEL_DIR_OVERRIDE.set(data_dir.join("models"));
+                let _ = doubao_clean::WORKDIR_OVERRIDE.set(cache_dir);
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             env_status,
             setup_model,
             list_pngs,
+            import_files,
             run_pipeline,
             cleanup_pipeline,
             read_image_base64

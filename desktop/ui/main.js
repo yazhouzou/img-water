@@ -23,6 +23,7 @@ const els = {
 
 let targetRoot = null;
 let running = false;
+const isMobile = /android|iphone|ipad|ipod/i.test(navigator.userAgent);
 
 function setRunning(value) {
   running = value;
@@ -139,7 +140,34 @@ async function init() {
   listen('pipeline-log', (event) => logLine(event.payload));
   listen('pipeline-exit', (event) => handleExit(event.payload));
 
+  if (isMobile) {
+    els.btnPick.textContent = '选择图片';
+    els.keepWork.parentElement.style.display = 'none';
+    document.body.classList.add('mobile');
+  }
+
   els.btnPick.addEventListener('click', async () => {
+    if (isMobile) {
+      const picked = await open({
+        multiple: true,
+        filters: [{ name: 'PNG', extensions: ['png'] }],
+        title: '选择要处理的图片',
+      });
+      if (!picked) return;
+      const paths = Array.isArray(picked) ? picked : [picked];
+      if (paths.length === 0) return;
+      try {
+        const imported = await invoke('import_files', { paths });
+        targetRoot = imported.dir;
+        els.btnRefresh.disabled = false;
+        els.btnCleanup.disabled = running;
+        resetReviews();
+        await refreshFiles();
+      } catch (err) {
+        logLine('[错误] ' + String(err));
+      }
+      return;
+    }
     const picked = await open({ directory: true, multiple: false, title: '选择包含 PNG 的文件夹' });
     if (!picked) return;
     targetRoot = picked;

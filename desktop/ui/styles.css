@@ -60,6 +60,15 @@ body {
 .env-area { display: flex; align-items: center; gap: 10px; }
 .btn.small { padding: 6px 14px; font-size: 13px; }
 
+body.mobile .run-area { flex-direction: column; align-items: stretch; gap: 10px; }
+
+@media (max-width: 720px) {
+  .topbar { flex-wrap: wrap; gap: 8px; }
+  .layout { grid-template-columns: 1fr; padding: 10px 12px 16px; }
+  .brand h1 { font-size: 15px; }
+  .subtitle { font-size: 11px; }
+}
+
 .layout {
   flex: 1;
   display: grid;

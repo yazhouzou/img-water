@@ -327,7 +327,10 @@ pub fn cleanup_preserved() -> Result<(), String> {
 }
 
 fn preserved_review_dir() -> PathBuf {
-    std::env::temp_dir().join("doubao-watermark-review")
+    crate::workdir()
+        .parent()
+        .map(|parent| parent.join("doubao-watermark-review"))
+        .unwrap_or_else(|| std::env::temp_dir().join("doubao-watermark-review"))
 }
 
 fn preserve_reviews(candidate: &Path, final_: &Path) -> Result<(PathBuf, PathBuf), String> {

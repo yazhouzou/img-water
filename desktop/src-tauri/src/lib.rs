@@ -3,6 +3,10 @@ pub mod lama;
 pub mod pipeline;
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+pub static MODEL_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+pub static WORKDIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn project_root() -> PathBuf {
     if !cfg!(debug_assertions) {
@@ -33,6 +37,9 @@ pub fn model_dir() -> PathBuf {
     if let Ok(path) = std::env::var("LAMA_ONNX_DIR") {
         return PathBuf::from(path);
     }
+    if let Some(dir) = MODEL_DIR_OVERRIDE.get() {
+        return dir.clone();
+    }
     project_root().join(".models")
 }
 
@@ -46,6 +53,9 @@ pub fn model_path() -> PathBuf {
 pub fn workdir() -> PathBuf {
     if let Ok(path) = std::env::var("DOUBAO_WATERMARK_WORKDIR") {
         return PathBuf::from(path);
+    }
+    if let Some(dir) = WORKDIR_OVERRIDE.get() {
+        return dir.join("doubao-watermark-work");
     }
     if cfg!(windows) {
         std::env::temp_dir().join("doubao-watermark-work")
