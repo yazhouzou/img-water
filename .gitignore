@@ -7,3 +7,4 @@ __pycache__/
 desktop/node_modules/
 desktop/src-tauri/target/
 desktop/src-tauri/gen/
+dist/
