@@ -1,0 +1,5 @@
+*.png
+.img-inpaint-venv/
+original-watermark-backup/
+__pycache__/
+*.pyc
