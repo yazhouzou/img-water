@@ -55,7 +55,25 @@ jobs:
         working-directory: desktop
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/26.3.11579264
-        run: pnpm tauri android build --apk --debug --target aarch64
+        run: |
+          set -o pipefail
+          pnpm tauri android build --apk --debug --target aarch64 2>&1 | tee build.log
+
+      - name: Emit error summary
+        if: failure()
+        working-directory: desktop
+        run: |
+          python3 - <<'EOF'
+          lines = open('build.log', errors='ignore').read().splitlines()
+          def emit(title, text):
+              text = text.replace('::', ': :')[-3800:]
+              msg = '%0A'.join(text.splitlines())
+              print(f"::error title={title}::{msg}")
+          errs = [l for l in lines if 'error' in l.lower() or 'warning: unused' in l.lower()][:80]
+          if errs:
+              emit('error-lines', '\n'.join(errs))
+          emit('log-tail', '\n'.join(lines[-150:]))
+          EOF
 
       - uses: actions/upload-artifact@v4
         with:
