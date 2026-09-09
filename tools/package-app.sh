@@ -11,6 +11,8 @@
 #   tools/package-app.sh both --remote user@host --win-repo 'C:/code/remove_watermark'
 #       一同打包：macOS 本机构建 + 远程 Windows 构建
 #
+#   tools/package-app.sh ci
+#       推送到 GitHub，由 Actions 自动构建 Windows/macOS/Android 三平台产物（无需任何本机环境）
 # Windows 机器需要: 开启 OpenSSH 服务器（设置 -> 可选功能）、克隆好仓库、装好
 # Node/Rust/VS Build Tools（详见 desktop/README.md）
 set -euo pipefail
@@ -59,7 +61,7 @@ build_win_local() {
 }
 
 build_win_remote() {
-  [[ -n "$REMOTE" ]] || die "macOS 上构建 Windows 包需要 --remote user@host（或在 Windows 的 Git Bash 里运行本脚本）"
+  [[ -n "$REMOTE" ]] || die "macOS 上无法直接编译 Windows 包（MSVC 不支持交叉编译）。可选：① tools/package-app.sh ci —— 推送 GitHub 由 CI 自动出 Windows 安装包；② 加 --remote user@host --win-repo 'C:/path' 用自己的 Windows 机器构建"
   [[ -n "$WIN_REPO" ]] || die "需要 --win-repo 'C:/path/to/repo' 指定 Windows 机器上的仓库路径"
   local repo="${WIN_REPO//\\//}"
   echo "[ssh] 远程构建: $REMOTE ($repo)"
@@ -102,6 +104,14 @@ case "$cmd" in
     if is_windows_shell; then die "Windows 上无法构建 macOS 包；请在 macOS 上执行 both"; fi
     build_mac
     build_win_remote
+    ;;
+  ci)
+    if git push github main 2>&1 | grep -q "Everything up-to-date"; then
+      echo "[OK] 仓库无新提交，直接下载最近一次构建的产物即可"
+    else
+      echo "[OK] 已推送，GitHub Actions 正在构建 Windows/macOS/Android 三平台产物（约 15-20 分钟）"
+    fi
+    echo "下载地址: https://github.com/yazhouzou/img-water/actions"
     ;;
   *) usage 1 ;;
 esac

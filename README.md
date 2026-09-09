@@ -10,7 +10,8 @@
 | **Windows 安装包**（远程） | 本机 (macOS) | `tools/package-app.sh win --remote user@host --win-repo 'C:/path/to/repo'` | `dist/*_x64-setup.exe` |
 | **Windows 安装包**（本机） | Windows 机器 Git Bash | `tools/package-app.sh win` | `dist/*_x64-setup.exe` |
 | **mac + win 一同打包** | 本机 (macOS) | `tools/package-app.sh both --remote user@host --win-repo 'C:/path/to/repo'` | `dist/` 下两件 |
-| **Android APK** | 无需本机环境 | `git push github main`（推送即自动构建） | GitHub Actions artifacts |
+| **Windows 安装包**（无 Windows 机器，推荐） | 本机 (macOS) | `tools/package-app.sh ci` | GitHub Actions artifacts |
+| **Android APK** | 无需本机环境 | `git push github main`（或 `tools/package-app.sh ci`） | GitHub Actions artifacts |
 
 - 所有本地打包产物统一输出到项目根目录 **`dist/`**
 - `--remote` 需要 Windows 机器开启 OpenSSH 服务器并克隆好仓库（详见 `desktop/README.md`）
