@@ -118,6 +118,7 @@ LaMa 模型通常缓存于：
 - Android：代码层适配已就绪（路径重定向到应用目录、`import_files` 多选导入、移动端单列 UI）；CI 已可出 APK（debug 签名，70MB），真机验证待用户安装确认
 - CI：GitHub Actions 已生效（仓库 `github.com/yazhouzou/img-water`，remote 名 `github`；origin 仍是 Codeup，双远端都推）。产物在 Actions 页 artifacts 下载：Windows NSIS 15MB、macOS arm64 DMG 21MB、Android APK 70MB；模型不入库，应用内下载
 - CI 注意：x86_64 macOS 已从矩阵移除（ort-sys rc.13 无该平台预编译库）；构建步骤必须 `shell: bash`（Windows runner 默认 pwsh 不支持 bash 语法）；Windows 产物路径含 `target/<triple>/`
+- 本机交叉预检不可行：`cargo check --target aarch64-linux-android / x86_64-pc-windows-msvc` 已实测失败，ring/objc2 的 C 依赖需要 NDK clang 或 MSVC 编译器（用户明确不在本机装 SDK/NDK）；推送前本地预检仅限 macOS `cargo check` + `node --check ui/*.js`，不要重试交叉预检
 - 本机访问 GitHub：`github.com:443` 常被阻断，SSH 走 `ssh.github.com:443`（已写入 `~/.ssh/config` 的 `Host github.com`）；`api.github.com` 可直连，匿名 API 可查询 CI 状态/产物（日志需登录）
 - 发版：产物以 GitHub Release 分发（`https://github.com/yazhouzou/img-water/releases/latest`，免登录永久地址），README 顶部下载表无需随版本改动；流程见 README「发新版本」章节；v0.1.0 已发布（APK 276MB / exe 15MB / dmg 21MB），用户提供的 token 已建议撤销
 
@@ -134,6 +135,8 @@ LaMa 模型通常缓存于：
 9. `iopaint list` 可能输出 INFO 或 FutureWarning，这不是失败；`tools/ensure-inpaint-env.sh` 会把这些噪声写入日志，终端只保留成功或真正失败提示。
 10. 每轮仍会有 LaMa 模型加载耗时，提效重点是把同一批图片合并到一次 `inpaint` 命令中，不要逐张运行。
 11. 图片复查只读取拼图，不逐张读取完整原图，减少图片解析和回传耗时。
+12. 涉及 CI 构建的会话默认异步等待：推送成功后在回复中标注“CI 后台验证中”即可，不原地轮询阻塞会话；下次会话开头先用 `api.github.com` 匿名 API 查上一轮结果再继续。仅当用户明确要求“等 CI 结果”时才轮询，间隔 ≥90s。
+13. 减少CI 白跑：涉及 Rust/JS 修改时，推送前必须先跑 macOS `cargo check`（清 MacPorts 变量）和 `node --check ui/*.js`，避免平台无关的低级错误消耗一轮 CI。
 
 ## 遮罩规则
 
