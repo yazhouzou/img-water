@@ -46,11 +46,20 @@ jobs:
 
       - name: Init Android project
         working-directory: desktop
+        shell: bash
         run: |
+          set -o pipefail
           if [ ! -d src-tauri/gen/android ]; then
-            pnpm tauri android init
+            pnpm tauri android init 2>&1 | tee init.log
           fi
-          pnpm tauri icon icon-source.png
+          pnpm tauri icon icon-source.png 2>&1 | tee icon.log
+
+      - name: Init error summary
+        if: failure()
+        working-directory: desktop
+        shell: bash
+        run: |
+          (cat icon.log 2>/dev/null; cat init.log 2>/dev/null) | tail -20 | sed 's/::/: :/g' | while IFS= read -r line; do echo "::error::$line"; done
 
       - name: Build debug APK
         working-directory: desktop
