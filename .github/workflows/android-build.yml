@@ -97,6 +97,7 @@ jobs:
       - name: Attach to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           exec > >(tee attach.log) 2>&1
           ls -R dist
