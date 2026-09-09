@@ -33,8 +33,11 @@ pub fn project_root() -> PathBuf {
 }
 
 pub const MODEL_FILENAME: &str = "lama_fp32.onnx";
-pub const MODEL_URL_DEFAULT: &str =
-    "https://hf-mirror.com/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx";
+/// 按顺序尝试的模型下载源：国内镜像优先，失败后回退官方源。
+pub const MODEL_URLS: &[&str] = &[
+    "https://hf-mirror.com/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx",
+    "https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx",
+];
 
 pub fn model_dir() -> PathBuf {
     if let Ok(path) = std::env::var("LAMA_ONNX_DIR") {

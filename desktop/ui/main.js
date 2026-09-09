@@ -1,6 +1,6 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
-const { open, ask } = window.__TAURI__.dialog;
+const { open } = window.__TAURI__.dialog;
 
 const els = {
   envBadge: document.getElementById('env-badge'),
@@ -19,10 +19,14 @@ const els = {
   log: document.getElementById('log'),
   reviewCandidate: document.getElementById('review-candidate'),
   reviewFinal: document.getElementById('review-final'),
+  modelProgress: document.getElementById('model-progress'),
+  modelProgressBar: document.getElementById('model-progress-bar'),
+  modelProgressText: document.getElementById('model-progress-text'),
 };
 
 let targetRoot = null;
 let running = false;
+let taskKind = null;
 const isMobile = /android|iphone|ipad|ipod/i.test(navigator.userAgent);
 
 function setRunning(value) {
@@ -123,8 +127,43 @@ function resetReviews() {
   els.reviewFinal.innerHTML = '<div class="placeholder">处理中…</div>';
 }
 
+function setModelProgress(done, total) {
+  els.modelProgress.hidden = false;
+  const mb = 1048576;
+  const percent = total > 0 ? Math.floor((done * 100) / total) : 0;
+  els.modelProgressBar.style.width = percent + '%';
+  els.modelProgressText.textContent = total > 0
+    ? `${(done / mb).toFixed(1)} / ${(total / mb).toFixed(1)} MB（${percent}%）`
+    : `${(done / mb).toFixed(1)} MB`;
+}
+
+function startModelDownload(auto) {
+  if (running) return;
+  setRunning(true);
+  taskKind = 'model';
+  logLine(auto ? '[模型] 未检测到修复模型，开始自动下载（约 200MB，多连接加速）…' : '[模型] 开始下载修复模型…');
+  invoke('setup_model').catch((err) => {
+    logLine('[错误] ' + String(err));
+    taskKind = null;
+    els.modelProgress.hidden = true;
+    setRunning(false);
+  });
+}
+
 function handleExit(payload) {
+  const kind = taskKind;
+  taskKind = null;
+  els.modelProgress.hidden = true;
   setRunning(false);
+  if (kind === 'model') {
+    if (payload.success) {
+      logLine('[模型] 修复模型下载完成，已就绪');
+    } else {
+      logLine('[模型] 下载失败：' + (payload.error || '') + '，可点击右上角按钮重试');
+    }
+    refreshEnv();
+    return;
+  }
   logLine(payload.success ? '[完成] 流水线执行成功' : `[失败] 退出码 ${payload.code}`);
   const logText = els.log.textContent;
   const candidateMatch = logText.match(/candidate review: (.+)/);
@@ -139,6 +178,7 @@ async function init() {
 
   listen('pipeline-log', (event) => logLine(event.payload));
   listen('pipeline-exit', (event) => handleExit(event.payload));
+  listen('model-progress', (event) => setModelProgress(event.payload.done, event.payload.total));
 
   if (isMobile) {
     els.btnPick.textContent = '选择图片';
@@ -188,21 +228,8 @@ async function init() {
   });
   els.btnClearLog.addEventListener('click', () => { els.log.textContent = ''; });
 
-  els.btnSetup.addEventListener('click', async () => {
-    if (running) return;
-    const ok = await ask('将在线下载约 200MB 的修复模型（国内镜像，支持断点续传），无需 Python，是否继续？', {
-      title: '下载修复模型',
-      kind: 'info',
-    });
-    if (!ok) return;
-    setRunning(true);
-    logLine('[模型] 开始下载修复模型…');
-    try {
-      await invoke('setup_model');
-    } catch (err) {
-      logLine('[错误] ' + String(err));
-      setRunning(false);
-    }
+  els.btnSetup.addEventListener('click', () => {
+    if (!running) startModelDownload(false);
   });
 
   els.btnRun.addEventListener('click', async () => {
@@ -236,7 +263,7 @@ async function init() {
   });
 
   if (!ready) {
-    logLine('[提示] 点击右上角“一键初始化修复环境”，或在项目根目录运行 ./tools/ensure-inpaint-env.sh');
+    startModelDownload(true);
   }
 }
 

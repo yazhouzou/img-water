@@ -1,6 +1,6 @@
 
 use base64::Engine as _;
-use crate::{fetch, pipeline, MODEL_URL_DEFAULT};
+use crate::{fetch, pipeline, MODEL_URLS};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 const EVENT_LOG: &str = "pipeline-log";
 const EVENT_EXIT: &str = "pipeline-exit";
+const EVENT_MODEL_PROGRESS: &str = "model-progress";
 
 #[derive(Default)]
 struct AppStorage {
@@ -56,21 +57,39 @@ fn setup_model(app: AppHandle, storage: State<'_, AppStorage>) -> Result<(), Str
         finish(&app, serde_json::json!({ "code": 0, "success": true }));
         return Ok(());
     }
-    let url = std::env::var("LAMA_ONNX_URL").unwrap_or_else(|_| MODEL_URL_DEFAULT.to_string());
+    let urls: Vec<String> = match std::env::var("LAMA_ONNX_URL") {
+        Ok(url) => vec![url],
+        Err(_) => MODEL_URLS.iter().map(|s| s.to_string()).collect(),
+    };
     let app_handle = app.clone();
     thread::spawn(move || {
         let log = |line: &str| {
             let _ = app_handle.emit(EVENT_LOG, line);
         };
-        log(&format!("[模型] 开始下载 {}", url));
+        log(&format!("[模型] 开始下载（{} 个下载源，多连接分段）", urls.len()));
         let app_progress = app_handle.clone();
-        let result = fetch::download_model(&dest, &url, &|done, total| {
+        // 每 10% 记一条日志，避免刷屏
+        let last_milestone = std::sync::atomic::AtomicU64::new(0);
+        let result = fetch::download_model(&dest, &urls, &|done, total| {
+            let _ = app_progress.emit(
+                EVENT_MODEL_PROGRESS,
+                serde_json::json!({ "done": done, "total": total }),
+            );
             if total > 0 {
                 let percent = done * 100 / total;
-                let _ = app_progress.emit(
-                    EVENT_LOG,
-                    format!("[模型] {:.1} / {:.1} MB ({}%)", done as f64 / 1048576.0, total as f64 / 1048576.0, percent),
-                );
+                let milestone = percent / 10;
+                if milestone > last_milestone.load(Ordering::Relaxed) {
+                    last_milestone.store(milestone, Ordering::Relaxed);
+                    let _ = app_progress.emit(
+                        EVENT_LOG,
+                        format!(
+                            "[模型] {:.1} / {:.1} MB ({}%)",
+                            done as f64 / 1048576.0,
+                            total as f64 / 1048576.0,
+                            percent
+                        ),
+                    );
+                }
             }
         });
         match result {
