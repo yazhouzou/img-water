@@ -120,7 +120,7 @@ LaMa 模型通常缓存于：
 - CI 注意：x86_64 macOS 已从矩阵移除（ort-sys rc.13 无该平台预编译库）；构建步骤必须 `shell: bash`（Windows runner 默认 pwsh 不支持 bash 语法）；Windows 产物路径含 `target/<triple>/`
 - 本机交叉预检不可行：`cargo check --target aarch64-linux-android / x86_64-pc-windows-msvc` 已实测失败，ring/objc2 的 C 依赖需要 NDK clang 或 MSVC 编译器（用户明确不在本机装 SDK/NDK）；推送前本地预检仅限 macOS `cargo check` + `node --check ui/*.js`，不要重试交叉预检
 - 本机访问 GitHub：`github.com:443` 常被阻断，SSH 走 `ssh.github.com:443`（已写入 `~/.ssh/config` 的 `Host github.com`）；`api.github.com` 可直连，匿名 API 可查询 CI 状态/产物（日志需登录）
-- 发版：产物以 GitHub Release 分发（`https://github.com/yazhouzou/img-water/releases/latest`，免登录永久地址），README 顶部下载表无需随版本改动；流程见 README「发新版本」章节；v0.1.0 已发布（APK 276MB / exe 15MB / dmg 21MB），用户提供的 token 已建议撤销
+- 发版：已全自动化——改 `tauri.conf.json` version 提交推送后，`git tag v*` 推到 `github` 即触发 CI 构建，专用 `release` job 自动把三平台产物附加到 GitHub Release（免登录，`releases/latest` 永久地址），流程见 README「发新版本」章节。踩坑记录：matrix 内并发 softprops 附加同一 Release 会竞态失败（须用独立 release job）；release job 无 checkout，gh 命令必须设 `GH_REPO`；APK artifact 解压带嵌套目录，需拍平后用 `find dist -type f` 上传；删除 tag 会把已发布 Release 转为 draft，release job 启动时会自动清理同 tag draft。v0.2.0 已发布（APK 277MB / exe 15MB / dmg 21MB，含新图标）；v0.1.0 为旧图标版
 
 ## 提效规则
 
