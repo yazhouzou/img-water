@@ -282,6 +282,17 @@ body {
 .log-box[open] summary span::before { content: '▾ '; }
 .log-box summary .btn { pointer-events: auto; }
 
+/* 结果横幅 */
+.result-banner {
+  border-radius: 12px;
+  padding: 12px 14px;
+  font-size: 14px;
+  font-weight: 500;
+  margin-bottom: 12px;
+}
+.result-banner.ok { background: #e8f7ee; color: var(--ok); }
+.result-banner.err { background: #fdecec; color: var(--danger); }
+
 .log {
   flex: 1;
   margin: 0;
@@ -298,11 +309,186 @@ body {
   min-height: 120px;
 }
 
-/* ===== 移动端（Android/iOS WebView）===== */
+/* ===== 移动端（Android/iOS WebView）：状态驱动单任务流 ===== */
+/* 状态语义：state-empty 引导选图 / state-picked 列表+操作栏 / state-running 处理中 / state-done 结果 */
 body.mobile {
   overflow: auto;
   height: 100vh;
   -webkit-text-size-adjust: 100%;
+}
+
+/* 顶栏：精简为一行品牌信息，badge 就绪时隐藏（JS 控制 hidden） */
+body.mobile .topbar { padding: 14px 16px 12px; }
+body.mobile .logo { width: 36px; height: 36px; font-size: 18px; border-radius: 10px; }
+body.mobile .brand h1 { font-size: 16px; }
+body.mobile .subtitle { font-size: 11.5px; }
+body.mobile .env-area { width: 100%; justify-content: flex-start; }
+body.mobile .model-progress { min-width: 110px; flex: 1; }
+body.mobile .badge { font-size: 12px; padding: 6px 12px; }
+
+body.mobile .layout {
+  grid-template-columns: 1fr;
+  gap: 12px;
+  padding: 12px 14px 24px;
+}
+body.mobile .panel { padding: 16px 14px; border-radius: 16px; box-shadow: none; }
+body.mobile .panel-head h2 { font-size: 15px; }
+
+/* import 模式下路径条无意义，始终隐藏 */
+body.mobile .folder-path { display: none; }
+
+/* ---- state-empty：只展示一张居中引导卡 ---- */
+body.mobile.state-empty .files-panel .panel-head,
+body.mobile.state-empty .list-actions,
+body.mobile.state-empty .run-area,
+body.mobile.state-empty .right-panel { display: none; }
+body.mobile.state-empty .files-panel { padding: 8px 14px 24px; }
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 36px 20px;
+  text-align: center;
+}
+.empty-icon {
+  width: 72px;
+  height: 72px;
+  padding: 14px;
+  color: var(--primary);
+  background: var(--primary-soft);
+  border-radius: 24px;
+  margin-bottom: 10px;
+}
+.empty-icon svg { width: 100%; height: 100%; }
+.empty-title { margin: 0; font-size: 16px; font-weight: 600; color: var(--text); }
+.empty-sub { margin: 0 0 18px; font-size: 13px; color: var(--muted); max-width: 260px; line-height: 1.5; }
+
+/* ---- state-picked：列表 + 底部操作栏，结果面板隐藏 ---- */
+body.mobile.state-picked .right-panel { display: none; }
+
+/* ---- state-running / state-done：显示结果面板 ---- */
+
+/* 面板头：标题独占一行，按钮在下一行铺满 */
+body.mobile .files-panel .panel-head {
+  flex-wrap: wrap;
+  row-gap: 10px;
+}
+body.mobile .files-panel .panel-head h2 { flex-basis: 100%; font-size: 15px; }
+body.mobile .panel-head .actions { width: 100%; gap: 10px; }
+body.mobile .panel-head .actions .btn { flex: 1; }
+body.mobile #btn-pick {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+  font-weight: 600;
+}
+body.mobile #btn-pick:hover:not(:disabled) { background: var(--primary-dark); color: #fff; }
+body.mobile #btn-refresh { background: #f2f4f8; border-color: transparent; color: var(--muted); }
+
+/* 大触控目标 */
+body.mobile .btn {
+  min-height: 46px;
+  padding: 11px 18px;
+  font-size: 15px;
+  border-radius: 12px;
+}
+body.mobile .btn.small { min-height: 34px; padding: 5px 12px; font-size: 13px; border-radius: 999px; }
+
+/* 全选/清空：轻量胶囊 + 计数右对齐 */
+body.mobile .list-actions { gap: 8px; margin-bottom: 10px; }
+body.mobile .list-actions .btn.small { background: #f2f4f8; border: none; color: var(--text); }
+body.mobile .list-actions .btn.small:disabled { opacity: 0.4; }
+body.mobile .list-actions .muted { margin-left: auto; font-size: 13px; }
+
+body.mobile .file-item {
+  padding: 13px 12px;
+  font-size: 15px;
+  gap: 12px;
+  border-radius: 12px;
+  margin-bottom: 6px;
+  background: #f7f8fb;
+  border: 1px solid #eef0f5;
+}
+body.mobile .file-item:has(input:checked) {
+  background: var(--primary-soft);
+  border-color: #cdd4ff;
+}
+body.mobile .file-item input[type="checkbox"] {
+  width: 22px;
+  height: 22px;
+  accent-color: var(--primary);
+  flex-shrink: 0;
+}
+body.mobile .file-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+body.mobile .file-list {
+  flex: none;
+  border: none;
+  background: transparent;
+  padding: 2px;
+}
+body.mobile .placeholder { font-size: 14px; padding: 24px 14px; }
+
+/* 底部操作栏：粘性、实底、只留一个主按钮；清理按钮仅完成后出现 */
+body.mobile .run-area {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  margin: 12px -14px calc(-16px);
+  padding: 10px 14px calc(12px + env(safe-area-inset-bottom));
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -8px 20px rgba(16, 24, 40, 0.06);
+}
+body.mobile #btn-run {
+  margin-left: 0;
+  width: 100%;
+  min-height: 52px;
+  font-size: 16px;
+  font-weight: 600;
+  border-radius: 14px;
+}
+body.mobile #btn-run:disabled { box-shadow: none; }
+body.mobile #btn-cleanup {
+  min-height: 36px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 4px;
+}
+body.mobile:not(.state-done) #btn-cleanup { display: none; }
+body.mobile .checkbox { font-size: 13px; padding: 4px 0; }
+
+/* 结果卡片 */
+body.mobile .review-grid { grid-template-columns: 1fr; gap: 10px; }
+body.mobile .review-box { border-radius: 14px; }
+body.mobile .review-box figcaption { font-size: 13px; padding: 10px 12px; }
+body.mobile .review-img { min-height: 180px; }
+
+body.mobile .log-box summary { font-size: 14px; padding: 10px 2px; }
+body.mobile .log {
+  min-height: 100px;
+  max-height: 220px;
+  font-size: 12px;
+  padding: 10px;
+  border-radius: 10px;
+}
+
+@media (max-width: 720px) {
+  .topbar { flex-wrap: wrap; gap: 8px; }
+  .layout { grid-template-columns: 1fr; padding: 10px 12px 16px; }
+  .brand h1 { font-size: 15px; }
+  .subtitle { font-size: 11px; }
+  .review-grid { grid-template-columns: 1fr; }
 }
 body.mobile .topbar {
   padding: 14px 16px 10px;

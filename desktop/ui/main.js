@@ -23,20 +23,28 @@ const els = {
   modelProgressBar: document.getElementById('model-progress-bar'),
   modelProgressText: document.getElementById('model-progress-text'),
   logBox: document.getElementById('log-box'),
+  resultBanner: document.getElementById('result-banner'),
 };
 
 let targetRoot = null;
 let running = false;
 let taskKind = null;
+let lastRunCount = 0;
 const mobileParam = new URLSearchParams(location.search).get('mobile');
 const isMobile =
   mobileParam === '1' ? true :
   mobileParam === '0' ? false :
   /android|iphone|ipad|ipod/i.test(navigator.userAgent);
 
+function setState(state) {
+  document.body.classList.remove('state-empty', 'state-picked', 'state-running', 'state-done');
+  document.body.classList.add('state-' + state);
+}
+
 function setRunning(value) {
   running = value;
   els.btnRun.disabled = value || !targetRoot;
+  els.btnRun.textContent = value ? '处理中…' : '开始处理';
   els.btnPick.disabled = value;
   els.btnCleanup.disabled = value || !targetRoot;
   els.btnSetup.disabled = value;
@@ -71,12 +79,14 @@ async function refreshEnv() {
     const status = await invoke('env_status');
     els.envBadge.textContent = status.ready ? '修复环境就绪' : '修复环境未就绪';
     els.envBadge.className = 'badge ' + (status.ready ? 'ok' : 'bad');
+    els.envBadge.hidden = isMobile && status.ready;
     els.btnSetup.hidden = status.ready;
     if (!status.ready) logLine('[环境] ' + status.hint);
     return status.ready;
   } catch (err) {
     els.envBadge.textContent = '环境检查失败';
     els.envBadge.className = 'badge bad';
+    els.envBadge.hidden = false;
     logLine('[环境] ' + String(err));
     return false;
   }
@@ -114,6 +124,7 @@ function renderEmptyState(message) {
 
 function renderFiles(names) {
   els.fileList.innerHTML = '';
+  setState(names.length > 0 ? 'picked' : 'empty');
   els.fileCount.textContent = `${names.length} 张`;
   els.btnSelectAll.disabled = names.length === 0;
   els.btnSelectNone.disabled = names.length === 0;
@@ -151,6 +162,7 @@ function updateRunButton() {
 }
 
 function resetReviews() {
+  els.resultBanner.hidden = true;
   els.reviewCandidate.innerHTML = '<div class="placeholder"><span class="spinner"></span>正在处理，请稍候…</div>';
   els.reviewFinal.innerHTML = '<div class="placeholder"><span class="spinner"></span>正在处理，请稍候…</div>';
 }
@@ -194,6 +206,12 @@ function handleExit(payload) {
   }
   logLine(payload.success ? '[完成] 流水线执行成功' : `[失败] 退出码 ${payload.code}`);
   if (!payload.success) els.logBox.open = true;
+  els.resultBanner.hidden = false;
+  els.resultBanner.className = 'result-banner ' + (payload.success ? 'ok' : 'err');
+  els.resultBanner.textContent = payload.success
+    ? `处理完成，${lastRunCount} 张图片已覆盖保存`
+    : `处理失败：${payload.error || '退出码 ' + payload.code}`;
+  setState('done');
   const logText = els.log.textContent;
   const candidateMatch = logText.match(/candidate review: (.+)/);
   const finalMatch = logText.match(/final review: (.+)/);
@@ -276,7 +294,9 @@ async function init() {
   els.btnRun.addEventListener('click', async () => {
     const files = selectedFiles();
     if (files.length === 0 || running) return;
+    lastRunCount = files.length;
     setRunning(true);
+    setState('running');
     resetReviews();
     logLine(`[开始] 处理 ${files.length} 张图片…`);
     try {
@@ -306,6 +326,7 @@ async function init() {
   if (!ready) {
     startModelDownload(true);
   }
+  setState('empty');
   renderEmptyState();
 }
 
