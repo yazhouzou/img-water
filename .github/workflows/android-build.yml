@@ -65,6 +65,11 @@ jobs:
         run: |
           (cat icon.log 2>/dev/null; cat init.log 2>/dev/null) | tail -20 | sed 's/::/: :/g' | while IFS= read -r line; do echo "::error::$line"; done
 
+      - name: Restore stable debug keystore
+        run: |
+          mkdir -p ~/.android
+          cp tools/android-signing/debug.keystore ~/.android/debug.keystore
+
       - name: Build debug APK
         working-directory: desktop
         env:
