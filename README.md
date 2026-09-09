@@ -2,6 +2,18 @@
 
 批量去除 PNG 图片右下角“豆包AI生成”水印。Rust + ONNX Runtime 内核（无需 Python），支持 macOS / Windows / Android。
 
+## 下载安装（免登录，永久有效）
+
+**最新版**：https://github.com/yazhouzou/img-water/releases/latest
+
+| 平台 | 文件 | 大小 |
+|---|---|---|
+| Android（arm64） | `doubao-watermark-remover-*-android.apk` | ~276MB |
+| Windows x64 | `doubao-watermark-remover-*-windows-x64-setup.exe` | ~15MB |
+| macOS Apple Silicon | `doubao-watermark-remover-*-macos-aarch64.dmg` | ~21MB |
+
+首次启动点击“一键下载修复模型”（约 200MB，国内镜像），之后离线可用。
+
 ## 打包命令速查
 
 | 目标 | 在哪执行 | 命令 | 产物 |
@@ -16,6 +28,15 @@
 - 所有本地打包产物统一输出到项目根目录 **`dist/`**
 - `--remote` 需要 Windows 机器开启 OpenSSH 服务器并克隆好仓库（详见 `desktop/README.md`）
 - Android APK：推送后打开 https://github.com/yazhouzou/img-water/actions → 最新 run → **Artifacts** 下载（APK 70MB / Windows exe 15MB / macOS dmg 21MB）
+
+## 发新版本
+
+1. 改 `desktop/src-tauri/tauri.conf.json` 的 `version`（如 `0.1.0` → `0.2.0`），提交推送
+2. 等 CI 构建完成，从 Actions artifacts 下载三个产物
+3. 发布 Release（两种方式）：
+   - 网页：Releases → Draft a new release → 新建 tag（如 `v0.2.0`）→ 拖入产物 → Publish
+   - API：需要 fine-grained token（Contents 读写），用 `POST /repos/yazhouzou/img-water/releases` + `uploads.github.com` 上传，发布后立即撤销 token
+4. `releases/latest` 会自动指向最新版，README 下载地址无需改动
 
 ## 日常使用
 

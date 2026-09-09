@@ -119,6 +119,7 @@ LaMa 模型通常缓存于：
 - CI：GitHub Actions 已生效（仓库 `github.com/yazhouzou/img-water`，remote 名 `github`；origin 仍是 Codeup，双远端都推）。产物在 Actions 页 artifacts 下载：Windows NSIS 15MB、macOS arm64 DMG 21MB、Android APK 70MB；模型不入库，应用内下载
 - CI 注意：x86_64 macOS 已从矩阵移除（ort-sys rc.13 无该平台预编译库）；构建步骤必须 `shell: bash`（Windows runner 默认 pwsh 不支持 bash 语法）；Windows 产物路径含 `target/<triple>/`
 - 本机访问 GitHub：`github.com:443` 常被阻断，SSH 走 `ssh.github.com:443`（已写入 `~/.ssh/config` 的 `Host github.com`）；`api.github.com` 可直连，匿名 API 可查询 CI 状态/产物（日志需登录）
+- 发版：产物以 GitHub Release 分发（`https://github.com/yazhouzou/img-water/releases/latest`，免登录永久地址），README 顶部下载表无需随版本改动；流程见 README「发新版本」章节；v0.1.0 已发布（APK 276MB / exe 15MB / dmg 21MB），用户提供的 token 已建议撤销
 
 ## 提效规则
 
