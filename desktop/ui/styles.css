@@ -365,9 +365,14 @@ body.mobile .file-item {
   padding: 13px 12px;
   font-size: 15px;
   gap: 12px;
-  border-radius: 10px;
-  margin-bottom: 4px;
+  border-radius: 12px;
+  margin-bottom: 6px;
+  background: #f7f8fb;
   border: 1px solid #eef0f5;
+}
+body.mobile .file-item:has(input:checked) {
+  background: var(--primary-soft);
+  border-color: #cdd4ff;
 }
 body.mobile .file-item input[type="checkbox"] {
   width: 22px;
@@ -381,10 +386,10 @@ body.mobile .file-item span {
   white-space: nowrap;
 }
 body.mobile .file-list {
-  max-height: 40vh;
   flex: none;
-  padding: 6px;
-  border-radius: 12px;
+  border: none;
+  background: transparent;
+  padding: 2px;
 }
 body.mobile .placeholder { font-size: 14px; padding: 24px 14px; }
 body.mobile .empty-state { padding: 40px 16px; }
@@ -392,7 +397,7 @@ body.mobile .empty-title { font-size: 16px; }
 body.mobile .empty-sub { font-size: 13px; }
 body.mobile .empty-state .btn { min-width: 180px; }
 
-/* 操作区：粘性底部，主按钮全宽突出，清理弱化为文字按钮 */
+/* 操作区：粘性底栏（实底+描边+投影，视觉上是一条工具栏而非悬浮按钮） */
 body.mobile .run-area {
   position: sticky;
   bottom: 0;
@@ -401,8 +406,10 @@ body.mobile .run-area {
   align-items: stretch;
   gap: 8px;
   margin: 12px -14px calc(-16px);
-  padding: 12px 14px calc(14px + env(safe-area-inset-bottom));
-  background: linear-gradient(to top, var(--bg) 82%, rgba(244, 245, 249, 0));
+  padding: 10px 14px calc(12px + env(safe-area-inset-bottom));
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -8px 20px rgba(16, 24, 40, 0.06);
 }
 body.mobile #btn-run {
   margin-left: 0;
