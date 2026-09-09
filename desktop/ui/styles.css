@@ -72,6 +72,7 @@ body {
   gap: 8px;
   min-width: 180px;
 }
+.model-progress[hidden] { display: none; }
 .model-progress-track {
   flex: 1;
   height: 8px;
@@ -118,7 +119,7 @@ body {
   justify-content: space-between;
   margin-bottom: 10px;
 }
-.panel-head h2 { margin: 0; font-size: 14px; }
+.panel-head h2 { margin: 0; font-size: 14px; white-space: nowrap; flex-shrink: 0; }
 .actions { display: flex; gap: 8px; }
 
 .btn {
@@ -179,7 +180,41 @@ body {
   cursor: pointer;
 }
 .file-item:hover { background: #f2f5f9; }
+.file-item:has(input:checked) { background: var(--primary-soft); }
 .placeholder { color: var(--muted); font-size: 13px; padding: 14px; text-align: center; }
+
+/* 空状态引导 */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 36px 20px;
+  text-align: center;
+}
+.empty-icon {
+  width: 52px;
+  height: 52px;
+  color: #b9c0d4;
+  margin-bottom: 6px;
+}
+.empty-icon svg { width: 100%; height: 100%; }
+.empty-title { margin: 0; font-size: 15px; font-weight: 600; color: var(--text); }
+.empty-sub { margin: 0 0 14px; font-size: 12.5px; color: var(--muted); max-width: 240px; }
+
+/* 加载 spinner */
+.spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  margin-right: 8px;
+  vertical-align: -2px;
+  border: 2px solid #c7cdf0;
+  border-top-color: var(--primary);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .run-area {
   margin-top: 12px;
@@ -208,12 +243,44 @@ body {
 .review-box figcaption {
   font-size: 12px;
   color: var(--muted);
-  padding: 6px 10px;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--border);
   background: #fff;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #c9cede;
+}
+.dot-candidate { background: #f59e0b; }
+.dot-final { background: var(--ok); }
 .review-img { min-height: 150px; display: grid; place-items: center; padding: 6px; }
 .review-img img { max-width: 100%; border-radius: 4px; }
+
+.log-box { margin-top: 10px; }
+.log-box summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  color: var(--muted);
+  padding: 8px 2px;
+  user-select: none;
+}
+.log-box summary::-webkit-details-marker { display: none; }
+.log-box summary:hover { color: var(--primary); }
+.log-box summary span::before {
+  content: '▸ ';
+  font-size: 11px;
+}
+.log-box[open] summary span::before { content: '▾ '; }
+.log-box summary .btn { pointer-events: auto; }
 
 .log {
   flex: 1;
@@ -238,22 +305,42 @@ body.mobile {
   -webkit-text-size-adjust: 100%;
 }
 body.mobile .topbar {
-  padding: 12px 14px;
+  padding: 14px 16px 10px;
   gap: 8px;
 }
-body.mobile .logo { width: 34px; height: 34px; font-size: 17px; border-radius: 9px; }
-body.mobile .brand h1 { font-size: 15px; }
-body.mobile .subtitle { font-size: 11px; }
+body.mobile .logo { width: 36px; height: 36px; font-size: 18px; border-radius: 10px; }
+body.mobile .brand h1 { font-size: 16px; }
+body.mobile .subtitle { font-size: 11.5px; }
 body.mobile .env-area { width: 100%; justify-content: space-between; }
-body.mobile .model-progress { min-width: 120px; }
+body.mobile .model-progress { min-width: 110px; flex: 1; }
+body.mobile .badge { font-size: 12px; padding: 6px 12px; }
 
 body.mobile .layout {
   grid-template-columns: 1fr;
   gap: 12px;
   padding: 12px 14px 24px;
 }
-body.mobile .panel { padding: 14px; border-radius: 14px; }
+body.mobile .panel { padding: 16px 14px; border-radius: 16px; }
 body.mobile .panel-head h2 { font-size: 15px; }
+
+/* 面板头：标题独占一行，按钮在下一行铺满，避免标题被挤压换行 */
+body.mobile .files-panel .panel-head {
+  flex-wrap: wrap;
+  row-gap: 10px;
+}
+body.mobile .files-panel .panel-head h2 { flex-basis: 100%; font-size: 15px; }
+body.mobile .panel-head .actions { width: 100%; gap: 10px; }
+body.mobile .panel-head .actions .btn { flex: 1; }
+/* 选择图片是移动端核心入口，做成主按钮 */
+body.mobile #btn-pick {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+  font-weight: 600;
+}
+body.mobile #btn-pick:hover:not(:disabled) { background: var(--primary-dark); color: #fff; }
+/* 刷新弱化为次要 */
+body.mobile #btn-refresh { background: #f2f4f8; border-color: transparent; color: var(--muted); }
 
 /* 大触控目标 */
 body.mobile .btn {
@@ -262,32 +349,60 @@ body.mobile .btn {
   font-size: 15px;
   border-radius: 12px;
 }
-body.mobile .btn.small { min-height: 40px; padding: 8px 14px; font-size: 13px; }
-body.mobile .panel-head .actions { width: 100%; }
-body.mobile .panel-head .actions .btn { flex: 1; }
+body.mobile .btn.small { min-height: 34px; padding: 5px 12px; font-size: 13px; border-radius: 999px; }
+
+/* 全选/清空：轻量胶囊 + 计数右对齐 */
+body.mobile .list-actions { gap: 8px; margin-bottom: 10px; }
+body.mobile .list-actions .btn.small {
+  background: #f2f4f8;
+  border: none;
+  color: var(--text);
+}
+body.mobile .list-actions .btn.small:disabled { opacity: 0.4; }
+body.mobile .list-actions .muted { margin-left: auto; font-size: 13px; }
 
 body.mobile .file-item {
-  padding: 12px 10px;
+  padding: 13px 12px;
   font-size: 15px;
   gap: 12px;
-  border-bottom: 1px solid #f1f3f7;
+  border-radius: 10px;
+  margin-bottom: 4px;
+  border: 1px solid #eef0f5;
 }
 body.mobile .file-item input[type="checkbox"] {
   width: 22px;
   height: 22px;
   accent-color: var(--primary);
+  flex-shrink: 0;
+}
+body.mobile .file-item span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 body.mobile .file-list {
-  max-height: 42vh;
+  max-height: 40vh;
   flex: none;
-  padding: 4px;
+  padding: 6px;
+  border-radius: 12px;
 }
 body.mobile .placeholder { font-size: 14px; padding: 24px 14px; }
+body.mobile .empty-state { padding: 40px 16px; }
+body.mobile .empty-title { font-size: 16px; }
+body.mobile .empty-sub { font-size: 13px; }
+body.mobile .empty-state .btn { min-width: 180px; }
 
+/* 操作区：粘性底部，主按钮全宽突出，清理弱化为文字按钮 */
 body.mobile .run-area {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
   flex-direction: column;
   align-items: stretch;
-  gap: 10px;
+  gap: 8px;
+  margin: 12px -14px calc(-16px);
+  padding: 12px 14px calc(14px + env(safe-area-inset-bottom));
+  background: linear-gradient(to top, var(--bg) 82%, rgba(244, 245, 249, 0));
 }
 body.mobile #btn-run {
   margin-left: 0;
@@ -295,18 +410,32 @@ body.mobile #btn-run {
   min-height: 52px;
   font-size: 16px;
   font-weight: 600;
+  border-radius: 14px;
+  box-shadow: 0 4px 14px rgba(79, 70, 229, 0.3);
+}
+body.mobile #btn-cleanup {
+  min-height: 36px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 4px;
 }
 body.mobile .checkbox { font-size: 13px; padding: 4px 0; }
 
-body.mobile .review-grid { grid-template-columns: 1fr; }
-body.mobile .review-box figcaption { font-size: 13px; padding: 9px 12px; }
-body.mobile .review-img { min-height: 200px; }
+/* 结果卡片 */
+body.mobile .review-grid { grid-template-columns: 1fr; gap: 10px; }
+body.mobile .review-box { border-radius: 12px; }
+body.mobile .review-box figcaption { font-size: 13px; padding: 10px 12px; }
+body.mobile .review-img { min-height: 180px; }
 
+body.mobile .log-box summary { font-size: 14px; padding: 10px 2px; }
 body.mobile .log {
-  min-height: 110px;
-  max-height: 240px;
+  min-height: 100px;
+  max-height: 220px;
   font-size: 12px;
   padding: 10px;
+  border-radius: 10px;
 }
 
 @media (max-width: 720px) {

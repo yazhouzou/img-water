@@ -22,6 +22,7 @@ const els = {
   modelProgress: document.getElementById('model-progress'),
   modelProgressBar: document.getElementById('model-progress-bar'),
   modelProgressText: document.getElementById('model-progress-text'),
+  logBox: document.getElementById('log-box'),
 };
 
 let targetRoot = null;
@@ -92,6 +93,25 @@ async function refreshFiles() {
   }
 }
 
+const PICK_ICON =
+  '<svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">' +
+  '<rect x="6" y="10" width="36" height="28" rx="4"/><circle cx="17" cy="20" r="3.5"/>' +
+  '<path d="M6 33l10-9 7 6 8-8 11 11"/></svg>';
+
+function renderEmptyState(message) {
+  if (isMobile) {
+    els.fileList.innerHTML =
+      '<div class="empty-state">' +
+      '<div class="empty-icon">' + PICK_ICON + '</div>' +
+      '<p class="empty-title">' + (message || '还没有选择图片') + '</p>' +
+      '<p class="empty-sub">支持批量选择 PNG，自动去除右下角“豆包AI生成”水印</p>' +
+      '<button class="btn primary" data-action="pick" type="button">选择图片</button>' +
+      '</div>';
+  } else {
+    els.fileList.innerHTML = '<div class="placeholder">' + (message || '先选择图片或文件夹') + '</div>';
+  }
+}
+
 function renderFiles(names) {
   els.fileList.innerHTML = '';
   els.fileCount.textContent = `${names.length} 张`;
@@ -99,7 +119,8 @@ function renderFiles(names) {
   els.btnSelectNone.disabled = names.length === 0;
   els.btnRun.disabled = running || names.length === 0;
   if (names.length === 0) {
-    els.fileList.innerHTML = '<div class="placeholder">该文件夹没有 PNG 图片</div>';
+    renderEmptyState(isMobile ? '没有找到 PNG 图片' : '该文件夹没有 PNG 图片');
+    updateRunButton();
     return;
   }
   for (const name of names) {
@@ -116,6 +137,7 @@ function renderFiles(names) {
     item.appendChild(label);
     els.fileList.appendChild(item);
   }
+  updateRunButton();
 }
 
 function selectedFiles() {
@@ -123,12 +145,14 @@ function selectedFiles() {
 }
 
 function updateRunButton() {
-  els.btnRun.disabled = running || !targetRoot || selectedFiles().length === 0;
+  const count = selectedFiles().length;
+  els.btnRun.textContent = count > 0 ? `开始处理（${count} 张）` : '开始处理';
+  els.btnRun.disabled = running || !targetRoot || count === 0;
 }
 
 function resetReviews() {
-  els.reviewCandidate.innerHTML = '<div class="placeholder">处理中…</div>';
-  els.reviewFinal.innerHTML = '<div class="placeholder">处理中…</div>';
+  els.reviewCandidate.innerHTML = '<div class="placeholder"><span class="spinner"></span>正在处理，请稍候…</div>';
+  els.reviewFinal.innerHTML = '<div class="placeholder"><span class="spinner"></span>正在处理，请稍候…</div>';
 }
 
 function setModelProgress(done, total) {
@@ -169,6 +193,7 @@ function handleExit(payload) {
     return;
   }
   logLine(payload.success ? '[完成] 流水线执行成功' : `[失败] 退出码 ${payload.code}`);
+  if (!payload.success) els.logBox.open = true;
   const logText = els.log.textContent;
   const candidateMatch = logText.match(/candidate review: (.+)/);
   const finalMatch = logText.match(/final review: (.+)/);
@@ -188,7 +213,20 @@ async function init() {
     els.btnPick.textContent = '选择图片';
     els.keepWork.parentElement.style.display = 'none';
     document.body.classList.add('mobile');
+  } else {
+    els.logBox.open = true;
   }
+
+  els.fileList.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-action="pick"]');
+    if (btn) els.btnPick.click();
+  });
+
+  els.btnClearLog.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    els.log.textContent = '';
+  });
 
   els.btnPick.addEventListener('click', async () => {
     if (isMobile) {
@@ -230,7 +268,6 @@ async function init() {
     els.fileList.querySelectorAll('input[type=checkbox]').forEach((el) => { el.checked = false; });
     updateRunButton();
   });
-  els.btnClearLog.addEventListener('click', () => { els.log.textContent = ''; });
 
   els.btnSetup.addEventListener('click', () => {
     if (!running) startModelDownload(false);
@@ -269,6 +306,7 @@ async function init() {
   if (!ready) {
     startModelDownload(true);
   }
+  renderEmptyState();
 }
 
 init();

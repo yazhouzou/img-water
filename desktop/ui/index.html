@@ -43,7 +43,7 @@
         <span id="file-count" class="muted">0 张</span>
       </div>
       <div id="file-list" class="file-list">
-        <div class="placeholder">先选择包含 PNG 的文件夹</div>
+        <div class="placeholder">先选择图片或文件夹</div>
       </div>
       <div class="run-area">
         <label class="checkbox">
@@ -57,23 +57,25 @@
 
     <section class="panel right-panel">
       <div class="panel-head">
-        <h2>运行状态</h2>
+        <h2>处理结果</h2>
       </div>
       <div class="review-grid">
         <figure class="review-box">
-          <figcaption>修复候选复查图</figcaption>
-          <div id="review-candidate" class="review-img"><div class="placeholder">尚未生成</div></div>
+          <figcaption><i class="dot dot-candidate"></i>修复候选预览</figcaption>
+          <div id="review-candidate" class="review-img"><div class="placeholder">处理完成后显示</div></div>
         </figure>
         <figure class="review-box">
-          <figcaption>落盘最终复查图</figcaption>
-          <div id="review-final" class="review-img"><div class="placeholder">尚未生成</div></div>
+          <figcaption><i class="dot dot-final"></i>最终结果预览</figcaption>
+          <div id="review-final" class="review-img"><div class="placeholder">处理完成后显示</div></div>
         </figure>
       </div>
-      <div class="panel-head">
-        <h2>日志</h2>
-        <button id="btn-clear-log" class="btn small ghost">清空</button>
-      </div>
-      <pre id="log" class="log"></pre>
+      <details id="log-box" class="log-box">
+        <summary>
+          <span>运行日志</span>
+          <button id="btn-clear-log" class="btn small ghost" type="button">清空</button>
+        </summary>
+        <pre id="log" class="log"></pre>
+      </details>
     </section>
   </main>
 
