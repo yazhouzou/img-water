@@ -31,10 +31,20 @@
 
 ## 发新版本
 
-1. 改 `desktop/src-tauri/tauri.conf.json` 的 `version`（如 `0.2.0` → `0.3.0`），提交并推送到两个远端
-2. 打 tag 并推送：`git tag v0.3.0 && git push github v0.3.0`（只推 `github` 即可，Codeup 不触发 Release）
-3. CI 自动构建三平台产物并直接附加到 GitHub Release（`softprops/action-gh-release`），无需登录下载 artifacts
-4. `releases/latest` 会自动指向最新版，README 下载地址无需改动
+一键脚本（推荐）：
+
+```bash
+./tools/release.sh 0.3.0
+```
+
+自动完成：本地预检 → 改 `tauri.conf.json` 版本号 → 提交并推送双远端 → 打 tag 触发 CI。约 10-15 分钟后产物自动出现在 [Releases](https://github.com/yazhouzou/img-water/releases/latest)，`releases/latest` 地址永久有效。
+
+手动方式（等效）：
+
+1. 改 `desktop/src-tauri/tauri.conf.json` 的 `version`，提交并推送到两个远端
+2. `git tag v0.3.0 && git push github v0.3.0`（只推 `github`，Codeup 不触发 Release）
+
+偶发失败处理：若 Release 缺少部分产物（构建均成功、仅附加步骤失败），到 Actions 对应 run 页面点 **Re-run failed jobs**，只重跑附加步骤约 1 分钟，无需重新构建。
 
 ## 日常使用
 
