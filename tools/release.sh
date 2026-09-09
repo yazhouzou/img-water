@@ -30,9 +30,9 @@ echo "[3/4] 推送 main 到双远端"
 git push github main
 git push origin main
 
-echo "[4/4] 推送 tag $TAG（触发 CI 构建并自动发布）"
+echo "[4/4] 推送 tag ${TAG}（触发 CI 构建并自动发布）"
 if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-  echo "  本地已存在 tag $TAG，跳过创建"
+  echo "  本地已存在 tag ${TAG}，跳过创建"
 else
   git tag "$TAG"
 fi
