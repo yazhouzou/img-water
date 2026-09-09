@@ -31,11 +31,9 @@
 
 ## 发新版本
 
-1. 改 `desktop/src-tauri/tauri.conf.json` 的 `version`（如 `0.1.0` → `0.2.0`），提交推送
-2. 等 CI 构建完成，从 Actions artifacts 下载三个产物
-3. 发布 Release（两种方式）：
-   - 网页：Releases → Draft a new release → 新建 tag（如 `v0.2.0`）→ 拖入产物 → Publish
-   - API：需要 fine-grained token（Contents 读写），用 `POST /repos/yazhouzou/img-water/releases` + `uploads.github.com` 上传，发布后立即撤销 token
+1. 改 `desktop/src-tauri/tauri.conf.json` 的 `version`（如 `0.2.0` → `0.3.0`），提交并推送到两个远端
+2. 打 tag 并推送：`git tag v0.3.0 && git push github v0.3.0`（只推 `github` 即可，Codeup 不触发 Release）
+3. CI 自动构建三平台产物并直接附加到 GitHub Release（`softprops/action-gh-release`），无需登录下载 artifacts
 4. `releases/latest` 会自动指向最新版，README 下载地址无需改动
 
 ## 日常使用

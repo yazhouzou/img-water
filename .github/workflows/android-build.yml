@@ -4,9 +4,13 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    tags: ['v*']
     paths:
       - 'desktop/**'
       - '.github/workflows/android-build.yml'
+
+permissions:
+  contents: write
 
 jobs:
   build-apk:
@@ -80,3 +84,10 @@ jobs:
           name: doubao-watermark-remover-apk
           path: desktop/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
+
+      - name: Attach APK to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: desktop/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          fail_on_unmatched_files: true
