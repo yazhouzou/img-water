@@ -2,7 +2,8 @@
   "permission": {
     "external_directory": {
       "/tmp/*": "allow",
-      "/Users/yazhouzou/.ssh/*": "allow"
+      "/Users/yazhouzou/.ssh/*": "allow",
+      "/Users/yazhouzou/ai/*": "allow"
     }
   }
 }
