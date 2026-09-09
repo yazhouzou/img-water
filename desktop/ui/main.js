@@ -27,7 +27,11 @@ const els = {
 let targetRoot = null;
 let running = false;
 let taskKind = null;
-const isMobile = /android|iphone|ipad|ipod/i.test(navigator.userAgent);
+const mobileParam = new URLSearchParams(location.search).get('mobile');
+const isMobile =
+  mobileParam === '1' ? true :
+  mobileParam === '0' ? false :
+  /android|iphone|ipad|ipod/i.test(navigator.userAgent);
 
 function setRunning(value) {
   running = value;

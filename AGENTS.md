@@ -116,6 +116,7 @@ LaMa 模型通常缓存于：
 - Windows 安装包无法在 macOS 上交叉编译；一键打包入口 `tools/package-app.sh`：`mac`（本机 DMG）、`win`（Windows Git Bash 本机构建，或 macOS 上 `--remote user@host --win-repo C:/path` 经 SSH 触发远程 Windows 构建并拉回）、`both`（两者一同打包）；产物统一在项目根目录 `dist/`
 - 旧 Python 流水线（`tools/remove_doubao_watermark.py` + `.img-inpaint-venv/`）保留作终端回退方案，不再被桌面端依赖
 - Android：代码层适配已就绪（路径重定向到应用目录、`import_files` 多选导入、移动端单列 UI）；CI 已可出 APK（debug 签名，70MB），真机验证待用户安装确认
+- UI 本地联调（零 SDK）：`./tools/ui-preview.sh` 起 http 服务并打开 `desktop/ui/index.html`；`ui/mock.js` 在浏览器环境 mock 全部 Tauri API（打包应用内自动失效），`?mobile=1/0` 强制移动/桌面视图、`?nomodel=1` 模拟未下载模型；改 ui 下 HTML/CSS/JS 后浏览器刷新即可，不依赖 CI
 - CI：GitHub Actions 已生效（仓库 `github.com/yazhouzou/img-water`，remote 名 `github`；origin 仍是 Codeup，双远端都推）。产物在 Actions 页 artifacts 下载：Windows NSIS 15MB、macOS arm64 DMG 21MB、Android APK 70MB；模型不入库，应用内下载
 - CI 注意：x86_64 macOS 已从矩阵移除（ort-sys rc.13 无该平台预编译库）；构建步骤必须 `shell: bash`（Windows runner 默认 pwsh 不支持 bash 语法）；Windows 产物路径含 `target/<triple>/`
 - 本机交叉预检不可行：`cargo check --target aarch64-linux-android / x86_64-pc-windows-msvc` 已实测失败，ring/objc2 的 C 依赖需要 NDK clang 或 MSVC 编译器（用户明确不在本机装 SDK/NDK）；推送前本地预检仅限 macOS `cargo check` + `node --check ui/*.js`，不要重试交叉预检
