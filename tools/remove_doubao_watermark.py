@@ -86,7 +86,28 @@ def mask_box(width, height):
 
 
 def detect_watermark_boxes(image):
-    """全图搜索“纯白文字”聚类，返回所有候选框 [(x1, y1, x2, y2), ...]；检测不到返回 []。"""
+    """两级检测，只信右下角：
+    1) 全图扫纯白文字（≥248），但仅保留落在右下角区域的候选——其它位置的纯白块
+       （灯罩、餐盘、白墙等画面主体）形态上与文字水印无法区分，擦掉会毁图；
+    2) 右下角自适应阈值兜底（识别半透明/灰白粗体水印），与第 1 级合并去重。
+    多位置水印请用 --mask-box 手动指定。"""
+    full = [box for box in _detect_full_white(image) if _is_corner_box(box, image)]
+    corner = _detect_corner_faded(image)
+    boxes = full + [b for b in corner if not any(_overlap(b, f) for f in full)]
+    return boxes
+
+
+def _is_corner_box(box, image):
+    _, _, x2, y2 = box
+    w, h = image.size
+    return x2 > w * 0.85 and y2 > h * 0.85
+
+
+def _overlap(a, b):
+    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
+
+
+def _detect_full_white(image):
     try:
         import cv2
         import numpy as np
@@ -128,6 +149,48 @@ def detect_watermark_boxes(image):
             min(h - 6, y2 + pad),
         ))
     return boxes
+
+
+def _detect_corner_faded(image):
+    """右下角自适应阈值兜底：识别半透明/灰白粗体水印（如豆包新样式，亮度 150~240 不等）。
+    仅扫右下角区域，阈值取背景中位数 +60，要求候选框贴近右下边缘，避免误擦画面元素。"""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return []
+    img = np.array(image.convert('RGB'))
+    h, w = img.shape[:2]
+    x0, y0 = int(w * 0.70), int(h * 0.88)
+    region = img[y0:, x0:]
+    if region.size == 0:
+        return []
+    gray = region.max(axis=2)
+    threshold = max(150, int(gray.mean()) + 60)
+    white = (gray >= threshold).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3))
+    merged = cv2.dilate(white, kernel, iterations=2)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(merged, 8)
+    boxes = []
+    for i in range(1, count):
+        x, y, cw, ch, area = (int(v) for v in stats[i])
+        gx1, gy1, gx2, gy2 = x0 + x, y0 + y, x0 + x + cw, y0 + y + ch
+        if area < 400 or cw < ch or cw / ch > 20:
+            continue
+        fill = area / float(cw * ch)
+        if fill < 0.15 or fill > 0.95:
+            continue
+        # 水印贴右下角：右缘距图右 <40px、底缘距图底 <40px
+        if gx2 < w - 40 or gy2 < h - 40:
+            continue
+        boxes.append((gx1, gy1, gx2, gy2))
+    if not boxes:
+        return []
+    pad = max(10, h // 150)
+    return [
+        (max(0, x1 - pad), max(0, y1 - pad), min(w - 6, x2 + pad), min(h - 6, y2 + pad))
+        for x1, y1, x2, y2 in boxes
+    ]
 
 
 def detect_watermark_box(image):

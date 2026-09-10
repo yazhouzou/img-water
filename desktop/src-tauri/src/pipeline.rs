@@ -76,10 +76,30 @@ pub fn resolve_box(width: u32, height: u32, raw: Option<MaskBox>) -> Result<(i64
     Ok((x1, y1, x2, y2))
 }
 
-/// 与 Python `detect_watermark_boxes` 对齐：全图搜索“纯白文字”聚类（白字+灰描边特征），
-/// 返回所有通过过滤的水印候选框（右下角评分加权）。
-/// cv2 依赖不可用，膨胀用可分离矩形核、连通域用 BFS，行为与 Python 版一致。
+/// 与 Python `detect_watermark_boxes` 对齐：两级检测，只信右下角。
+/// 1) 全图扫纯白文字（≥248），仅保留右下角候选（其它位置的纯白块如灯罩、餐盘
+///    形态上与文字水印无法区分，误擦会毁图）；
+/// 2) 右下角自适应阈值兜底（识别半透明/灰白粗体水印），与第 1 级合并去重。
 pub fn detect_watermark_boxes(image: &DynamicImage) -> Vec<(i64, i64, i64, i64)> {
+    let (w, h) = (image.width() as i64, image.height() as i64);
+    let mut full: Vec<(i64, i64, i64, i64)> = detect_full_white(image)
+        .into_iter()
+        .filter(|box_| box_.2 > (w as f64 * 0.85) as i64 && box_.3 > (h as f64 * 0.85) as i64)
+        .collect();
+    let corner = detect_corner_faded(image);
+    for box_ in corner {
+        if !full.iter().any(|f| boxes_overlap(&box_, f)) {
+            full.push(box_);
+        }
+    }
+    full
+}
+
+fn boxes_overlap(a: &(i64, i64, i64, i64), b: &(i64, i64, i64, i64)) -> bool {
+    !(a.2 <= b.0 || b.2 <= a.0 || a.3 <= b.1 || b.3 <= a.1)
+}
+
+fn detect_full_white(image: &DynamicImage) -> Vec<(i64, i64, i64, i64)> {
     let rgb = image.to_rgb8();
     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
     let rw = w;
@@ -170,6 +190,108 @@ pub fn detect_watermark_boxes(image: &DynamicImage) -> Vec<(i64, i64, i64, i64)>
                 (by1 as i64 - pad).max(0),
                 (bx2 as i64 + pad).min(iw - 6),
                 (by2 as i64 + pad).min(ih - 6),
+            )
+        })
+        .collect()
+}
+
+/// 右下角自适应阈值兜底：识别半透明/灰白粗体水印（豆包新样式，亮度 150~240 不等）。
+/// 仅扫右下角区域，阈值取背景中位数 +60，要求候选框贴近右下边缘，避免误擦画面元素。
+fn detect_corner_faded(image: &DynamicImage) -> Vec<(i64, i64, i64, i64)> {
+    let rgb = image.to_rgb8();
+    let (w, h) = (rgb.width() as i64, rgb.height() as i64);
+    let x0 = (w as f64 * 0.70) as usize;
+    let y0 = (h as f64 * 0.88) as usize;
+    let rw = w as usize - x0.min(w as usize);
+    let rh = h as usize - y0.min(h as usize);
+    if rw == 0 || rh == 0 {
+        return Vec::new();
+    }
+    let mut gray = vec![0u8; rw * rh];
+    let mut sum_sq = 0u64;
+    for y in 0..rh {
+        for x in 0..rw {
+            let p = rgb.get_pixel((x0 + x) as u32, (y0 + y) as u32);
+            let v = p.0[0].max(p.0[1]).max(p.0[2]);
+            gray[y * rw + x] = v;
+            sum_sq += v as u64;
+        }
+    }
+    // 用平均值近似背景水平（区域小，水印占比低，均值≈背景）
+    let mean = (sum_sq / (rw * rh) as u64) as i64;
+    let threshold = (mean + 60).clamp(150, 248);
+    let mut grid = vec![false; rw * rh];
+    for (i, v) in gray.iter().enumerate() {
+        grid[i] = *v as i64 >= threshold;
+    }
+    let dilated = dilate_rect_9x3_twice(&grid, rw, rh);
+    let mut visited = vec![false; rw * rh];
+    let mut boxes = Vec::new();
+    for sy in 0..rh {
+        for sx in 0..rw {
+            let idx = sy * rw + sx;
+            if !dilated[idx] || visited[idx] {
+                continue;
+            }
+            let mut stack = vec![idx];
+            visited[idx] = true;
+            let (mut minx, mut miny, mut maxx, mut maxy) = (sx, sy, sx, sy);
+            let mut area = 0usize;
+            while let Some(cur) = stack.pop() {
+                area += 1;
+                let cx = cur % rw;
+                let cy = cur / rw;
+                minx = minx.min(cx);
+                maxx = maxx.max(cx);
+                miny = miny.min(cy);
+                maxy = maxy.max(cy);
+                for dy in -1i64..=1 {
+                    for dx in -1i64..=1 {
+                        let nx = cx as i64 + dx;
+                        let ny = cy as i64 + dy;
+                        if nx < 0 || ny < 0 || nx >= rw as i64 || ny >= rh as i64 {
+                            continue;
+                        }
+                        let ni = ny as usize * rw + nx as usize;
+                        if dilated[ni] && !visited[ni] {
+                            visited[ni] = true;
+                            stack.push(ni);
+                        }
+                    }
+                }
+            }
+            let (cw, ch) = (maxx - minx + 1, maxy - miny + 1);
+            let (gx1, gy1, gx2, gy2) = (
+                (x0 + minx) as i64,
+                (y0 + miny) as i64,
+                (x0 + maxx + 1) as i64,
+                (y0 + maxy + 1) as i64,
+            );
+            if area < 400 || cw < ch || cw / ch > 20 {
+                continue;
+            }
+            let fill = area as f64 / (cw as f64 * ch as f64);
+            if !(0.15..=0.95).contains(&fill) {
+                continue;
+            }
+            if gx2 < w - 40 || gy2 < h - 40 {
+                continue;
+            }
+            boxes.push((gx1, gy1, gx2, gy2));
+        }
+    }
+    if boxes.is_empty() {
+        return Vec::new();
+    }
+    let pad = (h / 150).max(10) as i64;
+    boxes
+        .into_iter()
+        .map(|(x1, y1, x2, y2)| {
+            (
+                (x1 - pad).max(0),
+                (y1 - pad).max(0),
+                (x2 + pad).min(w - 6),
+                (y2 + pad).min(h - 6),
             )
         })
         .collect()
@@ -552,7 +674,7 @@ mod tests {
     }
 
     /// 生成合成水印图：非纯白背景 + 右下角白色文字水印
-    pub(super) fn make_watermark_image(path: &Path, width: u32, height: u32, text: &str) -> (i64, i64, i64, i64) {
+    fn make_watermark_image(path: &Path, width: u32, height: u32, text: &str) -> (i64, i64, i64, i64) {
         let mut img = RgbImage::from_pixel(width, height, Rgb([240, 240, 233]));
         // 一些背景纹理
         for y in (0..height).step_by(97) {
@@ -632,24 +754,39 @@ mod tests {
         let path = root.join("multi.png");
         let mut img = RgbImage::from_pixel(2048, 2048, Rgb([200, 205, 210]));
         let font = font();
-        // 三个位置的水印：左上、中部、右下
-        let spots = [(40i64, 40i64), (900, 1000), (1660, 1920)];
+        // 只信右下角策略：右下水印必须命中；中部画面白色元素（拟灯罩）不误擦
+        let spots = [(1730i64, 1970i64)];
         for &(x, y) in &spots {
             draw_text_mut(&mut img, Rgb([120, 120, 120]), x as i32 - 2, y as i32 - 2, 52.0, &font, "WATERMARK");
             draw_text_mut(&mut img, Rgb([255, 255, 255]), x as i32, y as i32, 52.0, &font, "WATERMARK");
         }
+        // 中部伪“画面主体”白块：实心矩形，形态近似灯罩
+        for y in 990..1080 {
+            for x in 880..1250 {
+                img.put_pixel(x, y, Rgb([255, 255, 255]));
+            }
+        }
         let path_ref = path.clone();
         save_png(DynamicImage::ImageRgb8(img), &path_ref).unwrap();
         let boxes = detect_watermark_boxes(&image::open(&path).unwrap());
-        assert!(boxes.len() >= 2, "should find multiple watermarks, got {:?}", boxes);
-        // 每个检测框不应互相重叠（分散水印）
-        for i in 0..boxes.len() {
-            for j in i + 1..boxes.len() {
-                let (a, b) = (boxes[i], boxes[j]);
-                let disjoint = a.2 <= b.0 || b.2 <= a.0 || a.3 <= b.1 || b.3 <= a.1;
-                assert!(disjoint, "boxes should be disjoint: {:?} vs {:?}", a, b);
-            }
-        }
+        assert_eq!(boxes.len(), 1, "should only detect corner watermark, got {:?}", boxes);
+        let (x1, y1, x2, y2) = boxes[0];
+        assert!(x1 <= 1730 && x2 >= 2000 && y1 <= 1970 && y2 >= 2015, "corner box should cover watermark: {:?}", boxes[0]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn detect_corner_faded_semitransparent() {
+        // 豆包新样式：粗体灰白半透明水印（亮度 ~210，不到纯白 248），贴右下边缘
+        let root = temp_root("detect-faded");
+        let path = root.join("faded.png");
+        let mut img = RgbImage::from_pixel(1728, 2304, Rgb([40, 45, 50]));
+        let font = font();
+        draw_text_mut(&mut img, Rgb([100, 100, 100]), 1503, 2232, 62.0, &font, "AI GEN");
+        draw_text_mut(&mut img, Rgb([210, 212, 215]), 1505, 2234, 62.0, &font, "AI GEN");
+        save_png(DynamicImage::ImageRgb8(img), &path).unwrap();
+        let boxes = detect_watermark_boxes(&image::open(&path).unwrap());
+        assert_eq!(boxes.len(), 1, "faded watermark should be detected, got {:?}", boxes);
         fs::remove_dir_all(&root).unwrap();
     }
 
