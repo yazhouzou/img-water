@@ -45,6 +45,34 @@ jobs:
         working-directory: desktop
         run: pnpm install --frozen-lockfile=false
 
+      - name: Run unit tests
+        working-directory: desktop/src-tauri
+        shell: bash
+        run: cargo test --quiet
+
+      - name: Restore LaMa model
+        id: lama-cache
+        uses: actions/cache@v4
+        with:
+          path: desktop/src-tauri/.models/lama_fp32.onnx
+          key: lama-onnx-fp32-v1
+
+      - name: Download LaMa model
+        if: steps.lama-cache.outputs.cache-hit != 'true'
+        working-directory: desktop/src-tauri
+        shell: bash
+        run: |
+          mkdir -p .models
+          curl -fL --retry 3 -o .models/lama_fp32.onnx \
+            https://hf-mirror.com/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx
+
+      - name: Run pipeline e2e with real model
+        working-directory: desktop/src-tauri
+        shell: bash
+        env:
+          LAMA_MODEL: .models/lama_fp32.onnx
+        run: cargo test --quiet -- --ignored
+
       - name: Build app
         working-directory: desktop
         shell: bash

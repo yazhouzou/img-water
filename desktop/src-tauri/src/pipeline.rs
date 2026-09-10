@@ -34,6 +34,9 @@ pub fn default_mask_box(width: u32, height: u32) -> (i64, i64, i64, i64) {
     if (width, height) == (2278, 1280) {
         return (width as i64 - 275, height as i64 - 92, width as i64 - 7, height as i64 - 8);
     }
+    if (width, height) == (2048, 2048) {
+        return (width as i64 - 380, height as i64 - 125, width as i64 - 8, height as i64 - 40);
+    }
     let scale = (width as f64 / 2848.0).min(height as f64 / 1600.0);
     let box_width = (330.0 * scale).max(220.0) as i64;
     let box_height = (118.0 * scale).max(78.0) as i64;
@@ -74,7 +77,8 @@ pub fn resolve_box(width: u32, height: u32, raw: Option<MaskBox>) -> Result<(i64
 }
 
 fn numeric_key(name: &str) -> (u8, u64, String) {
-    let stem = name.strip_suffix(".png").unwrap_or(name);
+    let lower = name.to_lowercase();
+    let stem = lower.strip_suffix(".png").unwrap_or(&lower);
     match stem.parse::<u64>() {
         Ok(number) => (0, number, String::new()),
         Err(_) => (1, 0, name.to_string()),
@@ -378,3 +382,184 @@ pub fn run(options: &PipelineOptions, model_path: &Path, log: Logger) -> Result<
 }
 
 pub const WINDOW_SIZE: u32 = WINDOW;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::Rgb;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dwm-test-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 生成合成水印图：非纯白背景 + 右下角白色文字水印
+    fn make_watermark_image(path: &Path, width: u32, height: u32, text: &str) -> (i64, i64, i64, i64) {
+        let mut img = RgbImage::from_pixel(width, height, Rgb([240, 240, 233]));
+        // 一些背景纹理
+        for y in (0..height).step_by(97) {
+            for x in 0..width {
+                img.put_pixel(x, y, Rgb([230, 232, 224]));
+            }
+        }
+        let scale = width as f32 / 2848.0;
+        let size = (62.0 * scale).max(24.0) as f32;
+        let font = font();
+        let glyph_width = size * 0.62 * text.chars().count() as f32;
+        let x1 = width as i64 - glyph_width as i64 - 12;
+        let y1 = height as i64 - size as i64 - 60;
+        draw_text_mut(
+            &mut img,
+            Rgb([150, 150, 150]),
+            x1 as i32 - 2,
+            y1 as i32 - 2,
+            size,
+            &font,
+            text,
+        );
+        draw_text_mut(&mut img, Rgb([255, 255, 255]), x1 as i32, y1 as i32, size, &font, text);
+        save_png(DynamicImage::ImageRgb8(img), path).unwrap();
+        (x1, y1, x1 + glyph_width as i64, y1 + size as i64)
+    }
+
+    fn count_white_pixels(path: &Path, box_: (i64, i64, i64, i64)) -> usize {
+        let img = image::open(path).unwrap().to_rgb8();
+        let mut count = 0usize;
+        for y in box_.1.max(0)..box_.3.min(img.height() as i64) {
+            for x in box_.0.max(0)..box_.2.min(img.width() as i64) {
+                let p = img.get_pixel(x as u32, y as u32);
+                if p.0.iter().all(|c| *c >= 250) {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn default_mask_box_known_sizes() {
+        assert_eq!(default_mask_box(2848, 1600), (2518, 1482, 2840, 1592));
+        assert_eq!(default_mask_box(2278, 1280), (2003, 1188, 2271, 1272));
+        assert_eq!(default_mask_box(2048, 2048), (1668, 1923, 2040, 2008));
+        let (x1, y1, x2, y2) = default_mask_box(1024, 768);
+        assert!(x1 < x2 && y1 < y2 && x2 <= 1024 - 8 && y2 <= 768 - 8);
+    }
+
+    #[test]
+    fn resolve_box_negative_and_invalid() {
+        let box_ = resolve_box(1000, 800, Some(MaskBox { x1: -110, y1: -60, x2: -10, y2: -10 })).unwrap();
+        assert_eq!(box_, (890, 740, 990, 790));
+        assert!(resolve_box(1000, 800, Some(MaskBox { x1: 50, y1: 50, x2: 40, y2: 60 })).is_err());
+    }
+
+    #[test]
+    fn target_names_sorted_and_filtered() {
+        let root = temp_root("names");
+        for name in ["2.png", "10.png", "1.png", "ignore.jpg", "3.PNG"] {
+            fs::write(root.join(name), b"x").unwrap();
+        }
+        fs::create_dir_all(root.join("sub")).unwrap();
+        let names = target_names(&root, &[]).unwrap();
+        assert_eq!(names, vec!["1.png", "2.png", "3.PNG", "10.png"]);
+        let picked = target_names(&root, &["3.PNG".to_string()]).unwrap();
+        assert_eq!(picked, vec!["3.PNG"]);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn pipeline_file_flow_without_model() {
+        let prev_work = std::env::var("DOUBAO_WATERMARK_WORKDIR").ok();
+        let root = temp_root("flow");
+        std::env::set_var(
+            "DOUBAO_WATERMARK_WORKDIR",
+            temp_root("flow-work"),
+        );
+        let (x1, y1, _x2, _y2) = make_watermark_image(&root.join("b.png"), 1024, 1024, "AI");
+        let _ = x1;
+        let _ = y1;
+        let options = PipelineOptions { root: root.clone(), files: vec!["b.png".to_string()], keep_work: false, mask_box: None };
+        let names = target_names(&root, &options.files).unwrap();
+        prepare(&options, &names).unwrap();
+
+        let backup = root.join("original-watermark-backup/b.png");
+        assert!(backup.exists(), "backup created");
+        let (source, masks, _lama, review) = work_dirs();
+        assert!(source.join("b.png").exists());
+        assert!(masks.join("b.png").exists());
+        assert!(review.join("source-corner-review.png").exists());
+
+        // 伪造推理输出（遮罩外的内容保持，遮罩内填背景色）
+        let img = image::open(&backup).unwrap().to_rgb8();
+        let mut fake = img.clone();
+        let (bx1, by1, bx2, by2) = resolve_box(1024, 1024, None).unwrap();
+        for y in by1..by2 {
+            for x in bx1..bx2 {
+                fake.put_pixel(x as u32, y as u32, Rgb([240, 240, 233]));
+            }
+        }
+        save_png(DynamicImage::ImageRgb8(fake), &_lama.join("b.png")).unwrap();
+
+        let candidate = review_lama(&names).unwrap();
+        assert!(candidate.exists());
+        let final_ = overwrite_review(&options, &names).unwrap();
+        assert!(final_.exists());
+        assert!(root.join("b.png").exists());
+
+        cleanup(&options, &names).unwrap();
+        assert!(!root.join("original-watermark-backup").exists(), "backup cleaned");
+        assert!(!crate::workdir().exists(), "workdir cleaned");
+
+        match prev_work {
+            Some(v) => std::env::set_var("DOUBAO_WATERMARK_WORKDIR", v),
+            None => std::env::remove_var("DOUBAO_WATERMARK_WORKDIR"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 完整 LaMa 推理 E2E（需要真实模型，CI 下载后运行：cargo test -- --ignored）
+    #[test]
+    #[ignore]
+    fn full_run_with_lama_e2e() {
+        let model = std::path::PathBuf::from(
+            std::env::var("LAMA_MODEL").unwrap_or_else(|_| ".models/lama_fp32.onnx".into()),
+        );
+        assert!(model.exists(), "model not found at {}; set LAMA_MODEL", model.display());
+
+        let prev_work = std::env::var("DOUBAO_WATERMARK_WORKDIR").ok();
+        let root = temp_root("e2e");
+        std::env::set_var("DOUBAO_WATERMARK_WORKDIR", temp_root("e2e-work"));
+        let (x1, y1, x2, y2) = make_watermark_image(&root.join("case.png"), 2048, 2048, "AI");
+        let white_before = count_white_pixels(&root.join("case.png"), (x1, y1, x2, y2));
+        assert!(white_before > 200, "fixture should contain white text");
+
+        let options = PipelineOptions {
+            root: root.clone(),
+            files: vec!["case.png".to_string()],
+            keep_work: false,
+            mask_box: Some(MaskBox { x1: x1 - 20, y1: y1 - 20, x2: x2 + 20, y2: y2 + 20 }),
+        };
+        let log = |_line: &str| {};
+        let summary = run(&options, &model, &log).expect("pipeline run failed");
+        assert!(summary.final_review.exists());
+
+        let white_after = count_white_pixels(&root.join("case.png"), (x1, y1, x2, y2));
+        println!("white pixels before={}, after={}", white_before, white_after);
+        assert!(
+            white_after * 2 < white_before,
+            "watermark text should be largely removed (before={}, after={})",
+            white_before,
+            white_after
+        );
+
+        assert!(!root.join("original-watermark-backup").exists(), "backup cleaned");
+        assert!(!crate::workdir().exists(), "workdir cleaned");
+
+        match prev_work {
+            Some(v) => std::env::set_var("DOUBAO_WATERMARK_WORKDIR", v),
+            None => std::env::remove_var("DOUBAO_WATERMARK_WORKDIR"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+}
