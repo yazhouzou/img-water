@@ -102,7 +102,7 @@ LaMa 模型通常缓存于：
 
 项目提供 Tauri 桌面应用（`desktop/`），内置 Rust + ONNX Runtime 修复内核（v0.2 起，无需 Python）：
 
-- 内核：`desktop/src-tauri/src/lama.rs` 用 `ort` 推理 LaMa ONNX 模型（`.models/lama_fp32.onnx`，约 200MB），固定 512×512 窗口推理后合成回原图；遮罩 bbox 超过约 496px 会报错（角标水印场景足够）
+- 内核：`desktop/src-tauri/src/lama.rs` 用 `ort` 推理 LaMa ONNX 模型（`.models/lama_fp32.onnx`，约 200MB），固定 512×512 窗口推理后合成回原图；v0.3.9 起支持大遮罩 tile 分块推理：遮罩连通块 ≤496px 走单窗口居中，超过则按 `window_starts()`（step=416、重叠 96px、末窗右对齐）生成窗口网格，每窗口只写回自己负责的 tile 区域，级联用已修复结果作图像源保证接缝连续
 - 流水线：`desktop/src-tauri/src/pipeline.rs` 是 `tools/remove_doubao_watermark.py` 的 Rust 移植（备份/遮罩/修复/复查/覆盖/清理），桌面端进程内调用；`run` 模式清理前会把两张复查拼图复制到系统临时目录 `doubao-watermark-review/` 再输出路径，避免复查图被清理后失效
 - CLI：`clean-cli`（`cargo build --bin clean-cli`），参数与 Python 脚本一致（`--root`/`--mask-box`/`--keep-work` + `run|prepare|inpaint|review-lama|overwrite-review|cleanup`）
 - 模型下载：启动检测到模型缺失即自动开始下载（多连接分段+分段重试+源回退 hf-mirror→huggingface），顶栏进度条；`LAMA_ONNX_URL` 可覆盖下载源（单一地址），`LAMA_ONNX_PATH` 可覆盖模型位置
@@ -159,7 +159,7 @@ LaMa 模型通常缓存于：
 2. “去掉其它水印”才进入其它水印流程；如果用户同时给出水印文字或截图，按用户指定目标处理。
 3. v0.3.4 起检测全图化、v0.3.8 起带文字性特征过滤：`detect_watermark_boxes()`（Rust + Python 同步）全图扫描白字聚类，任意位置/多处分散水印返回多框画多矩形遮罩，`lama.rs` 按 mask 连通块多窗口推理（每块 ≤496px）。防误擦判据：组件 bbox 内原始白像素填充率 ≤0.6 且 x 投影列段数 ≥3（实心白块如灯罩/瓷盘 fill 0.8+/段数 1，文字水印 fill ~0.2/段数=字符数）；Python 连通域用 scipy（该环境 cv2.connectedComponents 会段错误）。右下角另有自适应阈值兜底（阈值=背景均值+60，识别半透明灰白粗体水印，贴右下边约束）。非白字水印（深色、彩色、半透明全图）检测不到，仍需 `--mask-box` 手动指定。
 4. 手动遮罩：`tools/remove_doubao_watermark.py --mask-box x1,y1,x2,y2 prepare ...`（单框）；遮罩必须只覆盖水印文字和必要边缘，不要覆盖大块画面。
-5. 单个水印区域超过 496px（LaMa 512 窗口上限）仍会报错，超大水印需分块或人工处理；候选框分数低于最高分 4% 会被丢弃（防噪声误擦）。
+5. 单个水印区域超过 496px（LaMa 512 窗口上限）时桌面端自动走 tile 分块推理（v0.3.9），不再报错；候选框分数低于最高分 4% 会被丢弃（防噪声误擦）。
 6. 最终质量标准仍相同：无目标水印残留，无明显糊块，不破坏主体和关键纹理。
 
 ## 质量标准
