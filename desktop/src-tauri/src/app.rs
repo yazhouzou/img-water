@@ -256,6 +256,7 @@ fn import_files(app: AppHandle, window: tauri::WebviewWindow, paths: Vec<String>
 }
 
 fn copy_one(
+    #[cfg_attr(not(target_os = "android"), allow(unused_variables))]
     window: &tauri::WebviewWindow,
     raw: &str,
     dir: &std::path::Path,

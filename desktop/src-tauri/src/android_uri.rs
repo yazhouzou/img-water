@@ -1,5 +1,7 @@
 //! Android 相册导入：把 content:// URI 通过 ContentResolver 拷贝到应用目录。
-//! 纯 JNI 逻辑（copy_with_jni）不依赖 android 编译目标，桌面端也参与编译以便本地类型检查。
+//! 纯 JNI 逻辑（copy_with_jni）不依赖 android 编译目标，桌面端也参与编译以便本地类型检查；
+//! 桌面端没人调用这些函数，属预期的 dead_code，桌面构建时静默。
+#![allow(dead_code)]
 
 use jni::objects::{JObject, JString, JValue};
 use jni::sys::jint;
