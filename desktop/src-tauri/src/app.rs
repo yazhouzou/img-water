@@ -232,7 +232,7 @@ fn cleanup_pipeline(storage: State<'_, AppStorage>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn import_files(app: AppHandle, paths: Vec<String>) -> Result<ImportResult, String> {
+fn import_files(app: AppHandle, window: tauri::WebviewWindow, paths: Vec<String>) -> Result<ImportResult, String> {
     let base = app
         .path()
         .app_data_dir()
@@ -246,28 +246,49 @@ fn import_files(app: AppHandle, paths: Vec<String>) -> Result<ImportResult, Stri
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut names: Vec<String> = Vec::new();
     for (index, raw) in paths.iter().enumerate() {
-        let source = PathBuf::from(raw);
-        if !source.is_file() {
-            return Err(format!("文件不存在: {}", raw));
-        }
-        let mut name = source
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| format!("image-{}.png", index));
-        if !name.to_lowercase().ends_with(".png") {
-            name.push_str(".png");
-        }
-        while names.iter().any(|existing| existing == &name) {
-            let stem = name.trim_end_matches(".png").to_string();
-            name = format!("{}-{}.png", stem, index);
-        }
-        std::fs::copy(&source, dir.join(&name)).map_err(|e| format!("拷贝 {} 失败: {}", name, e))?;
+        let name = copy_one(&window, raw, &dir, index, &names)?;
         names.push(name);
     }
     if names.is_empty() {
         return Err("未选择图片".into());
     }
     Ok(ImportResult { dir: dir.display().to_string(), names })
+}
+
+fn copy_one(
+    window: &tauri::WebviewWindow,
+    raw: &str,
+    dir: &std::path::Path,
+    index: usize,
+    existing: &[String],
+) -> Result<String, String> {
+    #[cfg(target_os = "android")]
+    if raw.starts_with("content://") {
+        return crate::android_uri::copy_content_uri(window, raw, dir, index, existing);
+    }
+    let source = PathBuf::from(raw);
+    if !source.is_file() {
+        return Err(format!("文件不存在: {}", raw));
+    }
+    let mut name = source
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("image-{}.png", index));
+    if !name.to_lowercase().ends_with(".png") {
+        name.push_str(".png");
+    }
+    let final_name = {
+        let mut final_name = name.clone();
+        let mut n = 1;
+        while existing.iter().any(|e| e == &final_name) {
+            let stem = name.trim_end_matches(".png");
+            final_name = format!("{}-{}.png", stem, n);
+            n += 1;
+        }
+        final_name
+    };
+    std::fs::copy(&source, dir.join(&final_name)).map_err(|e| format!("拷贝 {} 失败: {}", final_name, e))?;
+    Ok(final_name)
 }
 
 #[derive(Serialize)]

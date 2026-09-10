@@ -869,6 +869,7 @@ dependencies = [
  "base64 0.22.1",
  "image",
  "imageproc",
+ "jni",
  "ort",
  "serde",
  "serde_json",

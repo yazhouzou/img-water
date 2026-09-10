@@ -1,6 +1,6 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
-const { open } = window.__TAURI__.dialog;
+const { open, message } = window.__TAURI__.dialog;
 
 const els = {
   envBadge: document.getElementById('env-badge'),
@@ -264,7 +264,8 @@ async function init() {
         resetReviews();
         await refreshFiles();
       } catch (err) {
-        logLine('[错误] ' + String(err));
+        logLine('[导入失败] ' + String(err));
+        await message(String(err), { title: '导入失败' }).catch(() => {});
       }
       return;
     }

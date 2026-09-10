@@ -1,3 +1,4 @@
+pub mod android_uri;
 pub mod app;
 pub mod fetch;
 pub mod lama;
