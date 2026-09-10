@@ -85,6 +85,48 @@ def mask_box(width, height):
     return (max(0, width - box_width), max(0, height - box_height), width - 8, height - 8)
 
 
+def detect_watermark_box(image):
+    """在右下角搜索“纯白文字”聚类，返回 (x1, y1, x2, y2)；检测不到返回 None。"""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return None
+    img = np.array(image.convert('RGB'))
+    h, w = img.shape[:2]
+    x0, y0 = int(w * 0.55), int(h * 0.6)
+    region = img[y0:, x0:]
+    white = (region >= 248).all(axis=2).astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3))
+    merged = cv2.dilate(white, kernel, iterations=2)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(merged, 8)
+    best = None
+    best_score = 0.0
+    for i in range(1, count):
+        x, y, cw, ch, area = (int(v) for v in stats[i])
+        if area < 1200 or ch < h * 0.012 or ch > h * 0.09 or cw < ch:
+            continue
+        ratio = cw / ch
+        if ratio < 2.0 or ratio > 15:
+            continue
+        fill = area / float(cw * ch)
+        if fill < 0.2 or fill > 0.9:
+            continue
+        corner_dist = (w - (x0 + x + cw)) + (h - (y0 + y + ch))
+        score = area * min(ratio / 6.0, 1.0) / (1.0 + corner_dist / (w * 0.1))
+        if score > best_score:
+            best_score = score
+            best = (x0 + x, y0 + y, x0 + x + cw, y0 + y + ch)
+    if best is None:
+        return None
+    pad = max(10, h // 150)
+    x1 = max(0, best[0] - pad)
+    y1 = max(0, best[1] - pad)
+    x2 = min(w - 6, best[2] + pad)
+    y2 = min(h - 6, best[3] + pad)
+    return (x1, y1, x2, y2)
+
+
 def parse_box(value):
     try:
         parts = [int(part.strip()) for part in value.split(',')]
@@ -154,8 +196,19 @@ def prepare(names, custom_box, root, emit=True):
 
         with Image.open(backup) as image:
             width, height = image.size
+        box = None
+        if custom_box is None:
+            with Image.open(backup) as probe:
+                box = detect_watermark_box(probe)
+            if box:
+                print(f'{name}: auto-detected watermark box {box}')
+            else:
+                box = resolve_box(width, height, None)
+                print(f'{name}: detection failed, using default rule {box}')
+        else:
+            box = resolve_box(width, height, custom_box)
         mask = Image.new('L', (width, height), 0)
-        ImageDraw.Draw(mask).rounded_rectangle(resolve_box(width, height, custom_box), radius=4, fill=255)
+        ImageDraw.Draw(mask).rounded_rectangle(box, radius=4, fill=255)
         mask.save(MASKS / name)
 
     output = REVIEW / 'source-corner-review.png'
