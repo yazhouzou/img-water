@@ -61,11 +61,27 @@ function showReview(container, path) {
       container.innerHTML = '';
       const img = document.createElement('img');
       img.src = dataUrl;
+      img.title = '点击查看大图';
+      img.addEventListener('click', () => openLightbox(dataUrl));
       container.appendChild(img);
+      container.classList.add('has-image');
     })
     .catch((err) => {
       container.innerHTML = `<div class="placeholder">预览失败：${escapeHtml(String(err))}</div>`;
     });
+}
+
+function openLightbox(dataUrl) {
+  const lightbox = document.getElementById('lightbox');
+  const img = lightbox.querySelector('img');
+  img.src = dataUrl;
+  lightbox.classList.add('open');
+}
+
+function closeLightbox() {
+  const lightbox = document.getElementById('lightbox');
+  lightbox.classList.remove('open');
+  lightbox.querySelector('img').src = '';
 }
 
 function escapeHtml(text) {
@@ -238,6 +254,11 @@ async function init() {
   els.fileList.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-action="pick"]');
     if (btn) els.btnPick.click();
+  });
+
+  document.getElementById('lightbox').addEventListener('click', closeLightbox);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeLightbox();
   });
 
   els.btnClearLog.addEventListener('click', (e) => {

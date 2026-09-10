@@ -76,6 +76,128 @@ pub fn resolve_box(width: u32, height: u32, raw: Option<MaskBox>) -> Result<(i64
     Ok((x1, y1, x2, y2))
 }
 
+/// 与 Python `detect_watermark_box` 对齐：右下角搜索“纯白文字”聚类（白字+灰描边特征）。
+/// cv2 依赖不可用，膨胀用可分离矩形核、连通域用 BFS，行为与 Python 版一致。
+pub fn detect_watermark_box(image: &DynamicImage) -> Option<(i64, i64, i64, i64)> {
+    let rgb = image.to_rgb8();
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    let x0 = w * 55 / 100;
+    let y0 = h * 60 / 100;
+    let rw = w - x0;
+    let rh = h - y0;
+    if rw == 0 || rh == 0 {
+        return None;
+    }
+    let mut grid = vec![false; rw * rh];
+    for y in 0..rh {
+        for x in 0..rw {
+            let p = rgb.get_pixel((x0 + x) as u32, (y0 + y) as u32);
+            grid[y * rw + x] = p.0[0] >= 248 && p.0[1] >= 248 && p.0[2] >= 248;
+        }
+    }
+    let dilated = dilate_rect_9x3_twice(&grid, rw, rh);
+
+    let mut visited = vec![false; rw * rh];
+    let mut best: Option<(usize, usize, usize, usize)> = None;
+    let mut best_score = 0.0f64;
+    let (wf, hf) = (w as f64, h as f64);
+    for sy in 0..rh {
+        for sx in 0..rw {
+            let idx = sy * rw + sx;
+            if !dilated[idx] || visited[idx] {
+                continue;
+            }
+            let mut stack = vec![idx];
+            visited[idx] = true;
+            let (mut minx, mut miny, mut maxx, mut maxy) = (sx, sy, sx, sy);
+            let mut area = 0usize;
+            while let Some(cur) = stack.pop() {
+                area += 1;
+                let cx = cur % rw;
+                let cy = cur / rw;
+                minx = minx.min(cx);
+                maxx = maxx.max(cx);
+                miny = miny.min(cy);
+                maxy = maxy.max(cy);
+                for dy in -1i64..=1 {
+                    for dx in -1i64..=1 {
+                        let nx = cx as i64 + dx;
+                        let ny = cy as i64 + dy;
+                        if nx < 0 || ny < 0 || nx >= rw as i64 || ny >= rh as i64 {
+                            continue;
+                        }
+                        let ni = ny as usize * rw + nx as usize;
+                        if dilated[ni] && !visited[ni] {
+                            visited[ni] = true;
+                            stack.push(ni);
+                        }
+                    }
+                }
+            }
+            let (cw, ch) = (maxx - minx + 1, maxy - miny + 1);
+            if area < 1200 {
+                continue;
+            }
+            let (cwf, chf) = (cw as f64, ch as f64);
+            if !(hf * 0.012..=hf * 0.09).contains(&chf) || cw < ch {
+                continue;
+            }
+            let ratio = cwf / chf;
+            if !(2.0..=15.0).contains(&ratio) {
+                continue;
+            }
+            let fill = area as f64 / (cwf * chf);
+            if !(0.2..=0.9).contains(&fill) {
+                continue;
+            }
+            let corner_dist = ((w - (x0 + maxx + 1)) + (h - (y0 + maxy + 1))) as f64;
+            let score = area as f64 * (ratio / 6.0).min(1.0) / (1.0 + corner_dist / (wf * 0.1));
+            if score > best_score {
+                best_score = score;
+                best = Some((x0 + minx, y0 + miny, x0 + maxx + 1, y0 + maxy + 1));
+            }
+        }
+    }
+    let (bx1, by1, bx2, by2) = best?;
+    let pad = (h / 150).max(10) as i64;
+    let (iw, ih) = (w as i64, h as i64);
+    Some((
+        (bx1 as i64 - pad).max(0),
+        (by1 as i64 - pad).max(0),
+        (bx2 as i64 + pad).min(iw - 6),
+        (by2 as i64 + pad).min(ih - 6),
+    ))
+}
+
+/// 矩形核 9x3 膨胀两次（可分离实现：水平半径 4 + 垂直半径 1）
+fn dilate_rect_9x3_twice(grid: &[bool], rw: usize, rh: usize) -> Vec<bool> {
+    let mut cur = grid.to_vec();
+    for _ in 0..2 {
+        let mut horiz = vec![false; cur.len()];
+        for y in 0..rh {
+            for x in 0..rw {
+                if cur[y * rw + x] {
+                    for nx in x.saturating_sub(4)..=(x + 4).min(rw - 1) {
+                        horiz[y * rw + nx] = true;
+                    }
+                }
+            }
+        }
+        let mut out = vec![false; cur.len()];
+        for y in 0..rh {
+            for x in 0..rw {
+                if horiz[y * rw + x] {
+                    for ny in y.saturating_sub(1)..=(y + 1).min(rh - 1) {
+                        out[ny * rw + x] = true;
+                    }
+                }
+            }
+        }
+        cur = out;
+    }
+    cur
+}
+
 fn numeric_key(name: &str) -> (u8, u64, String) {
     let lower = name.to_lowercase();
     let stem = lower.strip_suffix(".png").unwrap_or(&lower);
@@ -229,7 +351,7 @@ fn save_png(image: DynamicImage, path: &Path) -> Result<(), String> {
     image.save_with_format(path, image::ImageFormat::Png).map_err(|e| e.to_string())
 }
 
-pub fn prepare(options: &PipelineOptions, names: &[String]) -> Result<(), String> {
+pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Result<(), String> {
     let work = crate::workdir();
     if work.exists() {
         fs::remove_dir_all(&work).map_err(|e| e.to_string())?;
@@ -246,7 +368,20 @@ pub fn prepare(options: &PipelineOptions, names: &[String]) -> Result<(), String
 
         let image = load_image(&backup)?;
         let (width, height) = (image.width(), image.height());
-        let (x1, y1, x2, y2) = resolve_box(width, height, options.mask_box)?;
+        let (x1, y1, x2, y2) = match options.mask_box {
+            Some(box_) => resolve_box(width, height, Some(box_))?,
+            None => match detect_watermark_box(&image) {
+                Some((bx1, by1, bx2, by2)) => {
+                    log(&format!("{}: auto-detected mask box ({}, {}, {}, {})", name, bx1, by1, bx2, by2));
+                    (bx1, by1, bx2, by2)
+                }
+                None => {
+                    let (bx1, by1, bx2, by2) = default_mask_box(width, height);
+                    log(&format!("{}: detection failed, using default rule ({}, {}, {}, {})", name, bx1, by1, bx2, by2));
+                    (bx1, by1, bx2, by2)
+                }
+            },
+        };
         let mut mask = GrayImage::from_pixel(width, height, image::Luma([0]));
         for y in y1..y2 {
             for x in x1..x2 {
@@ -356,7 +491,7 @@ pub struct RunSummary {
 pub fn run(options: &PipelineOptions, model_path: &Path, log: Logger) -> Result<RunSummary, String> {
     let names = target_names(&options.root, &options.files)?;
     log(&format!("processing {} file(s)", names.len()));
-    prepare(options, &names)?;
+    prepare(options, &names, log)?;
     inpaint(model_path, log)?;
     let candidate_review = review_lama(&names)?;
     let final_review = overwrite_review(options, &names)?;
@@ -396,7 +531,7 @@ mod tests {
     }
 
     /// 生成合成水印图：非纯白背景 + 右下角白色文字水印
-    fn make_watermark_image(path: &Path, width: u32, height: u32, text: &str) -> (i64, i64, i64, i64) {
+    pub(super) fn make_watermark_image(path: &Path, width: u32, height: u32, text: &str) -> (i64, i64, i64, i64) {
         let mut img = RgbImage::from_pixel(width, height, Rgb([240, 240, 233]));
         // 一些背景纹理
         for y in (0..height).step_by(97) {
@@ -448,6 +583,25 @@ mod tests {
     }
 
     #[test]
+    fn detect_watermark_box_hits_synthetic() {
+        let root = temp_root("detect");
+        let path = root.join("w.png");
+        let (tx1, ty1, tx2, ty2) = make_watermark_image(&path, 2848, 1600, "AI GENERATED");
+        let img = image::open(&path).unwrap();
+        let (dx1, dy1, dx2, dy2) = detect_watermark_box(&img).expect("should detect watermark");
+        // 字符可能断开成多个连通域（与 cv2 行为一致），主组件应覆盖大部分文字
+        let (dw, dh) = (dx2 - dx1, dy2 - dy1);
+        assert!(dw * 2 >= tx2 - tx1, "detected width {} should cover most of text width {}", dw, tx2 - tx1);
+        assert!(dy1 <= ty1 + 8 && dy2 >= ty2 - 8, "detected height range ({}, {}) should cover text ({}, {})", dy1, dy2, ty1, ty2);
+        assert!(dx1 >= tx1 - 100 && dx2 <= tx2 + 100, "detected box should stay near text box");
+        // 无水印的纯背景图应回退 None
+        let clean = root.join("clean.png");
+        save_png(DynamicImage::ImageRgb8(RgbImage::from_pixel(1600, 900, Rgb([240, 240, 233]))), &clean).unwrap();
+        assert_eq!(detect_watermark_box(&image::open(&clean).unwrap()), None);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn resolve_box_negative_and_invalid() {
         let box_ = resolve_box(1000, 800, Some(MaskBox { x1: -110, y1: -60, x2: -10, y2: -10 })).unwrap();
         assert_eq!(box_, (890, 740, 990, 790));
@@ -481,7 +635,8 @@ mod tests {
         let _ = y1;
         let options = PipelineOptions { root: root.clone(), files: vec!["b.png".to_string()], keep_work: false, mask_box: None };
         let names = target_names(&root, &options.files).unwrap();
-        prepare(&options, &names).unwrap();
+        let noop_log: Logger = &|_| {};
+        prepare(&options, &names, &noop_log).unwrap();
 
         let backup = root.join("original-watermark-backup/b.png");
         assert!(backup.exists(), "backup created");

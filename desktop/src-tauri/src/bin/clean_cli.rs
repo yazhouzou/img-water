@@ -79,7 +79,7 @@ fn main() {
         }),
         "prepare" => {
             let names = pipeline::target_names(&options.root, &options.files).unwrap_or_else(|e| exit_with(&e));
-            pipeline::prepare(&options, &names)
+            pipeline::prepare(&options, &names, &log)
         }
         "inpaint" => pipeline::inpaint(&model_path, &log),
         "review-lama" => {
