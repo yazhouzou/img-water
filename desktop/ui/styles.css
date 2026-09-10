@@ -307,6 +307,7 @@ body {
   white-space: pre-wrap;
   word-break: break-all;
   min-height: 120px;
+  max-height: 40vh;
 }
 
 /* ===== 移动端（Android/iOS WebView）：状态驱动单任务流 ===== */

@@ -483,17 +483,22 @@ fn preserved_review_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("doubao-watermark-review"))
 }
 
-fn preserve_reviews(candidate: &Path, final_: &Path) -> Result<(PathBuf, PathBuf), String> {
+fn preserve_reviews(source: &Path, candidate: &Path, final_: &Path) -> Result<(PathBuf, PathBuf, PathBuf), String> {
     let dest_dir = preserved_review_dir();
     fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
-    let c = dest_dir.join(candidate.file_name().ok_or("bad review path")?);
-    let f = dest_dir.join(final_.file_name().ok_or("bad review path")?);
-    fs::copy(candidate, &c).map_err(|e| e.to_string())?;
-    fs::copy(final_, &f).map_err(|e| e.to_string())?;
-    Ok((c, f))
+    let mut copy_one = |src: &Path| -> Result<PathBuf, String> {
+        let dest = dest_dir.join(src.file_name().ok_or("bad review path")?);
+        fs::copy(src, &dest).map_err(|e| e.to_string())?;
+        Ok(dest)
+    };
+    let s = copy_one(source)?;
+    let c = copy_one(candidate)?;
+    let f = copy_one(final_)?;
+    Ok((s, c, f))
 }
 
 pub struct RunSummary {
+    pub source_review: PathBuf,
     pub candidate_review: PathBuf,
     pub final_review: PathBuf,
     pub kept_work: bool,
@@ -503,17 +508,21 @@ pub fn run(options: &PipelineOptions, model_path: &Path, log: Logger) -> Result<
     let names = target_names(&options.root, &options.files)?;
     log(&format!("processing {} file(s)", names.len()));
     prepare(options, &names, log)?;
+    let (_, _, _, review_dir) = work_dirs();
+    let source_review = review_dir.join("source-corner-review.png");
     inpaint(model_path, log)?;
     let candidate_review = review_lama(&names)?;
     let final_review = overwrite_review(options, &names)?;
     if options.keep_work {
         return Ok(RunSummary {
+            source_review,
             candidate_review,
             final_review,
             kept_work: true,
         });
     }
-    let (candidate_review, final_review) = preserve_reviews(&candidate_review, &final_review)?;
+    let (source_review, candidate_review, final_review) =
+        preserve_reviews(&source_review, &candidate_review, &final_review)?;
     cleanup(options, &names)?;
     log(&format!(
         "cleaned: {} and {}",
@@ -521,6 +530,7 @@ pub fn run(options: &PipelineOptions, model_path: &Path, log: Logger) -> Result<
         crate::workdir().display()
     ));
     Ok(RunSummary {
+        source_review,
         candidate_review,
         final_review,
         kept_work: false,

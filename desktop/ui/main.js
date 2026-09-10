@@ -183,6 +183,13 @@ function resetReviews() {
   els.reviewFinal.innerHTML = '<div class="placeholder"><span class="spinner"></span>正在处理，请稍候…</div>';
 }
 
+// 选新文件夹/导入后清空旧预览，不显示"正在处理"
+function clearReviews() {
+  els.resultBanner.hidden = true;
+  els.reviewCandidate.innerHTML = '<div class="placeholder">开始处理后，这里显示修复前预览</div>';
+  els.reviewFinal.innerHTML = '<div class="placeholder">开始处理后，这里显示修复后预览</div>';
+}
+
 function setModelProgress(done, total) {
   els.modelProgress.hidden = false;
   const mb = 1048576;
@@ -229,9 +236,10 @@ function handleExit(payload) {
     : `处理失败：${payload.error || '退出码 ' + payload.code}`;
   setState('done');
   const logText = els.log.textContent;
-  const candidateMatch = logText.match(/candidate review: (.+)/);
-  const finalMatch = logText.match(/final review: (.+)/);
-  if (candidateMatch) showReview(els.reviewCandidate, candidateMatch[1].trim());
+  const lastMatch = (re) => [...logText.matchAll(re)].pop();
+  const sourceMatch = lastMatch(/source review: (.+)/g);
+  const finalMatch = lastMatch(/final review: (.+)/g);
+  if (sourceMatch) showReview(els.reviewCandidate, sourceMatch[1].trim());
   if (finalMatch) showReview(els.reviewFinal, finalMatch[1].trim());
   refreshEnv();
 }
@@ -282,7 +290,7 @@ async function init() {
         targetRoot = imported.dir;
         els.btnRefresh.disabled = false;
         els.btnCleanup.disabled = running;
-        resetReviews();
+        clearReviews();
         await refreshFiles();
       } catch (err) {
         logLine('[导入失败] ' + String(err));
@@ -295,7 +303,7 @@ async function init() {
     targetRoot = picked;
     els.btnRefresh.disabled = false;
     els.btnCleanup.disabled = running;
-    resetReviews();
+    clearReviews();
     await refreshFiles();
   });
 

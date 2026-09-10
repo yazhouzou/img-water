@@ -72,7 +72,8 @@ fn main() {
     let result = match command.as_str() {
         "run" => pipeline::run(&options, &model_path, &log).map(|summary| {
             println!(
-                "candidate review: {}\nfinal review: {}",
+                "source review: {}\ncandidate review: {}\nfinal review: {}",
+                summary.source_review.display(),
                 summary.candidate_review.display(),
                 summary.final_review.display()
             );

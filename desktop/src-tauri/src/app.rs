@@ -189,8 +189,8 @@ fn run_pipeline(
                 let _ = app_handle.emit(
                     EVENT_LOG,
                     format!(
-                        "candidate review: {}\nfinal review: {}",
-                        summary.candidate_review.display(),
+                        "source review: {}\nfinal review: {}",
+                        summary.source_review.display(),
                         summary.final_review.display()
                     ),
                 );
@@ -348,6 +348,12 @@ pub fn run_tauri_app() {
             cleanup_pipeline,
             read_image_base64
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // 退出前清理保留的临时复查产物（/tmp/doubao-watermark-review）
+            if matches!(event, tauri::RunEvent::Exit { .. }) {
+                let _ = pipeline::cleanup_preserved();
+            }
+        });
 }
