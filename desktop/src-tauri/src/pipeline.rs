@@ -76,16 +76,13 @@ pub fn resolve_box(width: u32, height: u32, raw: Option<MaskBox>) -> Result<(i64
     Ok((x1, y1, x2, y2))
 }
 
-/// 与 Python `detect_watermark_boxes` 对齐：两级检测，只信右下角。
-/// 1) 全图扫纯白文字（≥248），仅保留右下角候选（其它位置的纯白块如灯罩、餐盘
-///    形态上与文字水印无法区分，误擦会毁图）；
+/// 与 Python `detect_watermark_boxes` 对齐：两级检测。
+/// 1) 全图扫纯白文字（≥248），用“文字性特征”过滤画面主体误检：
+///    组件 bbox 内原始（膨胀前）白像素填充率 ≤0.6 且 x 投影列段数 ≥3
+///    （实心白块如灯罩/瓷盘 fill 0.8~1.0、段数 1，文字水印 fill ~0.2、段数=字符数）；
 /// 2) 右下角自适应阈值兜底（识别半透明/灰白粗体水印），与第 1 级合并去重。
 pub fn detect_watermark_boxes(image: &DynamicImage) -> Vec<(i64, i64, i64, i64)> {
-    let (w, h) = (image.width() as i64, image.height() as i64);
-    let mut full: Vec<(i64, i64, i64, i64)> = detect_full_white(image)
-        .into_iter()
-        .filter(|box_| box_.2 > (w as f64 * 0.85) as i64 && box_.3 > (h as f64 * 0.85) as i64)
-        .collect();
+    let mut full = detect_full_white(image);
     let corner = detect_corner_faded(image);
     for box_ in corner {
         if !full.iter().any(|f| boxes_overlap(&box_, f)) {
@@ -154,6 +151,31 @@ fn detect_full_white(image: &DynamicImage) -> Vec<(i64, i64, i64, i64)> {
             }
             let (cw, ch) = (maxx - minx + 1, maxy - miny + 1);
             if area < 1200 {
+                continue;
+            }
+            // 文字性特征：原始（膨胀前）白像素在膨胀 bbox 内的填充率 + x 投影列段数
+            let mut area_raw = 0usize;
+            let mut col_counts = vec![0usize; cw];
+            for y in miny..=maxy {
+                for x in minx..=maxx {
+                    if grid[y * rw + x] {
+                        area_raw += 1;
+                        col_counts[x - minx] += 1;
+                    }
+                }
+            }
+            let fill_raw = area_raw as f64 / (cw as f64 * ch as f64);
+            let col_thr = (ch as f64 * 0.08).max(1.0);
+            let mut segments = 0usize;
+            let mut prev_on = false;
+            for c in &col_counts {
+                let on = *c as f64 >= col_thr;
+                if on && !prev_on {
+                    segments += 1;
+                }
+                prev_on = on;
+            }
+            if fill_raw > 0.6 || segments < 3 {
                 continue;
             }
             let (cwf, chf) = (cw as f64, ch as f64);
@@ -752,26 +774,40 @@ mod tests {
     fn detect_watermark_boxes_multi_position() {
         let root = temp_root("detect-multi");
         let path = root.join("multi.png");
-        let mut img = RgbImage::from_pixel(2048, 2048, Rgb([200, 205, 210]));
+        let mut img = RgbImage::from_pixel(1728, 2304, Rgb([70, 80, 90]));
         let font = font();
-        // 只信右下角策略：右下水印必须命中；中部画面白色元素（拟灯罩）不误擦
-        let spots = [(1730i64, 1970i64)];
+        // 三个位置的水印 + 两个实心白块（拟灯罩/瓷盘，不得误擦）
+        let spots = [(150i64, 100i64), (600, 1200), (1300, 2100)];
         for &(x, y) in &spots {
-            draw_text_mut(&mut img, Rgb([120, 120, 120]), x as i32 - 2, y as i32 - 2, 52.0, &font, "WATERMARK");
-            draw_text_mut(&mut img, Rgb([255, 255, 255]), x as i32, y as i32, 52.0, &font, "WATERMARK");
+            draw_text_mut(&mut img, Rgb([120, 120, 120]), x as i32 - 2, y as i32 - 2, 60.0, &font, "AI GENERATE");
+            draw_text_mut(&mut img, Rgb([255, 255, 255]), x as i32, y as i32, 60.0, &font, "AI GENERATE");
         }
-        // 中部伪“画面主体”白块：实心矩形，形态近似灯罩
-        for y in 990..1080 {
-            for x in 880..1250 {
+        for y in 200..330 {
+            for x in 900..1270 {
+                let dx = (x as f64 - 1085.0) / 185.0;
+                let dy = (y as f64 - 265.0) / 65.0;
+                if dx * dx + dy * dy <= 1.0 {
+                    img.put_pixel(x, y, Rgb([255, 255, 255]));
+                }
+            }
+        }
+        for y in 1650..1710 {
+            for x in 1150..1400 {
                 img.put_pixel(x, y, Rgb([255, 255, 255]));
             }
         }
         let path_ref = path.clone();
         save_png(DynamicImage::ImageRgb8(img), &path_ref).unwrap();
         let boxes = detect_watermark_boxes(&image::open(&path).unwrap());
-        assert_eq!(boxes.len(), 1, "should only detect corner watermark, got {:?}", boxes);
-        let (x1, y1, x2, y2) = boxes[0];
-        assert!(x1 <= 1730 && x2 >= 2000 && y1 <= 1970 && y2 >= 2015, "corner box should cover watermark: {:?}", boxes[0]);
+        assert_eq!(boxes.len(), 3, "should detect exactly 3 watermarks, got {:?}", boxes);
+        // 检测框不应互相重叠（分散水印）
+        for i in 0..boxes.len() {
+            for j in i + 1..boxes.len() {
+                let (a, b) = (boxes[i], boxes[j]);
+                let disjoint = a.2 <= b.0 || b.2 <= a.0 || a.3 <= b.1 || b.3 <= a.1;
+                assert!(disjoint, "boxes should be disjoint: {:?} vs {:?}", a, b);
+            }
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 

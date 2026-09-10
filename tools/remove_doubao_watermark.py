@@ -86,15 +86,14 @@ def mask_box(width, height):
 
 
 def detect_watermark_boxes(image):
-    """两级检测，只信右下角：
-    1) 全图扫纯白文字（≥248），但仅保留落在右下角区域的候选——其它位置的纯白块
-       （灯罩、餐盘、白墙等画面主体）形态上与文字水印无法区分，擦掉会毁图；
-    2) 右下角自适应阈值兜底（识别半透明/灰白粗体水印），与第 1 级合并去重。
-    多位置水印请用 --mask-box 手动指定。"""
-    full = [box for box in _detect_full_white(image) if _is_corner_box(box, image)]
+    """两级检测：
+    1) 全图扫纯白文字（≥248），用“文字性特征”过滤画面主体误检：组件内原始白像素
+       填充率 ≤0.6 且 x 投影列段数 ≥3（实心块如灯罩 fill 0.8+、段数 1，文字水印
+       fill ~0.2、段数=字符数）；
+    2) 右下角自适应阈值兜底（识别半透明/灰白粗体水印），与第 1 级合并去重。"""
+    full = _detect_full_white(image)
     corner = _detect_corner_faded(image)
-    boxes = full + [b for b in corner if not any(_overlap(b, f) for f in full)]
-    return boxes
+    return full + [b for b in corner if not any(_overlap(b, f) for f in full)]
 
 
 def _is_corner_box(box, image):
@@ -107,21 +106,43 @@ def _overlap(a, b):
     return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
 
 
+def _text_likeness(white, x1, y1, x2, y2):
+    """组件 bbox 内的原始白像素填充率与 x 投影列段数。"""
+    sub = white[y1:y2, x1:x2]
+    fill_raw = float(sub.mean()) if sub.size else 1.0
+    proj = sub.sum(axis=0).astype(float)
+    thr = max(1.0, sub.shape[0] * 0.08) if sub.size else 1.0
+    segments = 0
+    prev = 0
+    for v in (proj >= thr).astype(int):
+        if v == 1 and prev == 0:
+            segments += 1
+        prev = v
+    return fill_raw, segments
+
+
 def _detect_full_white(image):
     try:
-        import cv2
         import numpy as np
+        import scipy.ndimage as ndi
     except ImportError:
         return []
     img = np.array(image.convert('RGB'))
     h, w = img.shape[:2]
-    white = (img >= 248).all(axis=2).astype(np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3))
-    merged = cv2.dilate(white, kernel, iterations=2)
-    count, _, stats, _ = cv2.connectedComponentsWithStats(merged, 8)
+    white = (img >= 248).all(axis=2)
+    kernel = np.ones((3, 9), dtype=np.uint8)
+    merged = white.astype(np.uint8)
+    for _ in range(2):
+        merged = ndi.binary_dilation(merged, structure=kernel).astype(np.uint8)
+    labeled, count = ndi.label(merged)
+    if count == 0:
+        return []
+    areas = np.bincount(labeled.ravel())
+    slices = ndi.find_objects(labeled)
     candidates = []
-    for i in range(1, count):
-        x, y, cw, ch, area = (int(v) for v in stats[i])
+    for i, sl in enumerate(slices, start=1):
+        y1, y2, x1, x2 = sl[0].start, sl[0].stop, sl[1].start, sl[1].stop
+        cw, ch, area = x2 - x1, y2 - y1, int(areas[i])
         if area < 1200 or ch < h * 0.012 or ch > h * 0.09 or cw < ch:
             continue
         ratio = cw / ch
@@ -130,9 +151,12 @@ def _detect_full_white(image):
         fill = area / float(cw * ch)
         if fill < 0.2 or fill > 0.95:
             continue
-        corner_dist = (w - (x + cw)) + (h - (y + ch))
+        fill_raw, segments = _text_likeness(white, x1, y1, x2, y2)
+        if fill_raw > 0.6 or segments < 3:
+            continue
+        corner_dist = (w - x2) + (h - y2)
         score = area * min(ratio / 6.0, 1.0) / (1.0 + corner_dist / (w * 0.1))
-        candidates.append(((x, y, x + cw, y + ch), score))
+        candidates.append(((x1, y1, x2, y2), score))
     if not candidates:
         return []
     top = max(score for _, score in candidates)
