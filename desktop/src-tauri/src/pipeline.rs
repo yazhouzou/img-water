@@ -608,7 +608,7 @@ fn preserved_review_dir() -> PathBuf {
 fn preserve_reviews(source: &Path, candidate: &Path, final_: &Path) -> Result<(PathBuf, PathBuf, PathBuf), String> {
     let dest_dir = preserved_review_dir();
     fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
-    let mut copy_one = |src: &Path| -> Result<PathBuf, String> {
+    let copy_one = |src: &Path| -> Result<PathBuf, String> {
         let dest = dest_dir.join(src.file_name().ok_or("bad review path")?);
         fs::copy(src, &dest).map_err(|e| e.to_string())?;
         Ok(dest)
