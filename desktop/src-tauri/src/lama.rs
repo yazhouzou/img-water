@@ -17,29 +17,52 @@ struct BBox {
     y2: u32,
 }
 
-fn mask_bbox(mask: &image::GrayImage) -> Option<BBox> {
-    let (width, height) = (mask.width(), mask.height());
-    let mut x1 = width;
-    let mut y1 = height;
-    let mut x2 = 0u32;
-    let mut y2 = 0u32;
-    for (x, y, value) in mask.enumerate_pixels() {
-        if value.0[0] > 0 {
-            x1 = x1.min(x);
-            y1 = y1.min(y);
-            x2 = x2.max(x);
-            y2 = y2.max(y);
+/// 把遮罩按 8 连通分解成多个独立区域（支持多位置分散水印），返回每块的包围盒。
+fn mask_components(mask: &image::GrayImage) -> Vec<BBox> {
+    let (width, height) = (mask.width() as usize, mask.height() as usize);
+    let active = |x: usize, y: usize| mask.get_pixel(x as u32, y as u32).0[0] > 0;
+    let mut visited = vec![false; width * height];
+    let mut boxes = Vec::new();
+    for sy in 0..height {
+        for sx in 0..width {
+            let idx = sy * width + sx;
+            if visited[idx] || !active(sx, sy) {
+                continue;
+            }
+            let mut stack = vec![idx];
+            visited[idx] = true;
+            let (mut minx, mut miny, mut maxx, mut maxy) = (sx, sy, sx, sy);
+            while let Some(cur) = stack.pop() {
+                let cx = cur % width;
+                let cy = cur / width;
+                minx = minx.min(cx);
+                maxx = maxx.max(cx);
+                miny = miny.min(cy);
+                maxy = maxy.max(cy);
+                for dy in -1i64..=1 {
+                    for dx in -1i64..=1 {
+                        let nx = cx as i64 + dx;
+                        let ny = cy as i64 + dy;
+                        if nx < 0 || ny < 0 || nx >= width as i64 || ny >= height as i64 {
+                            continue;
+                        }
+                        let ni = ny as usize * width + nx as usize;
+                        if !visited[ni] && active(nx as usize, ny as usize) {
+                            visited[ni] = true;
+                            stack.push(ni);
+                        }
+                    }
+                }
+            }
+            boxes.push(BBox {
+                x1: minx as u32,
+                y1: miny as u32,
+                x2: (maxx + 1) as u32,
+                y2: (maxy + 1) as u32,
+            });
         }
     }
-    if x2 < x1 || y2 < y1 {
-        return None;
-    }
-    Some(BBox {
-        x1,
-        y1,
-        x2: x2 + 1,
-        y2: y2 + 1,
-    })
+    boxes
 }
 
 fn reflect_pad(img: &DynamicImage, win: u32, ox: i64, oy: i64) -> image::RgbImage {
@@ -94,103 +117,107 @@ impl Lama {
         if width < WINDOW || height < WINDOW {
             return Err(format!("image {}x{} smaller than {}px window", width, height, WINDOW));
         }
-        let bbox = mask_bbox(mask).ok_or("mask is empty")?;
-        let bw = bbox.x2 - bbox.x1;
-        let bh = bbox.y2 - bbox.y1;
-        if bw > MAX_BBOX || bh > MAX_BBOX {
-            return Err(format!(
-                "mask region {}x{} exceeds {}x{} window support",
-                bw, bh, MAX_BBOX, MAX_BBOX
+        let components = mask_components(mask);
+        if components.is_empty() {
+            return Err("mask is empty".into());
+        }
+        let mut result = image.to_rgb8();
+        for (i, bbox) in components.iter().enumerate() {
+            let bw = bbox.x2 - bbox.x1;
+            let bh = bbox.y2 - bbox.y1;
+            if bw > MAX_BBOX || bh > MAX_BBOX {
+                return Err(format!(
+                    "mask region {}x{} exceeds {}x{} window support",
+                    bw, bh, MAX_BBOX, MAX_BBOX
+                ));
+            }
+
+            let ox = {
+                let center = (bbox.x1 + bbox.x2) as i64 / 2 - WINDOW as i64 / 2;
+                center.clamp(0, width as i64 - WINDOW as i64).max(0)
+            };
+            let oy = {
+                let center = (bbox.y1 + bbox.y2) as i64 / 2 - WINDOW as i64 / 2;
+                center.clamp(0, height as i64 - WINDOW as i64).max(0)
+            };
+
+            let win_img = reflect_pad(image, WINDOW, ox, oy);
+            let mut win_mask = image::GrayImage::new(WINDOW, WINDOW);
+            let oxu = ox as u32;
+            let oyu = oy as u32;
+            let y_end = (oyu + WINDOW).min(height);
+            let x_end = (oxu + WINDOW).min(width);
+            for y in oyu..y_end {
+                for x in oxu..x_end {
+                    let value = mask.get_pixel(x, y).0[0];
+                    if value > 0 {
+                        win_mask.put_pixel(x - oxu, y - oyu, image::Luma([value]));
+                    }
+                }
+            }
+
+            let mut chw = vec![0f32; 3 * WINDOW as usize * WINDOW as usize];
+            for y in 0..WINDOW {
+                for x in 0..WINDOW {
+                    let p = win_img.get_pixel(x, y);
+                    let base = (y * WINDOW + x) as usize;
+                    for c in 0..3 {
+                        chw[c * WINDOW as usize * WINDOW as usize + base] = p.0[c] as f32 / 255.0;
+                    }
+                }
+            }
+            let mask_data: Vec<f32> = win_mask
+                .pixels()
+                .map(|p| if p.0[0] > 0 { 1.0f32 } else { 0.0 })
+                .collect();
+
+            let outputs = self
+                .session
+                .run(
+                    ort::inputs![
+                        "image" => ort::value::Tensor::from_array((vec![1i64, 3, WINDOW as i64, WINDOW as i64], chw)).map_err(|e| e.to_string())?,
+                        "mask" => ort::value::Tensor::from_array((vec![1i64, 1, WINDOW as i64, WINDOW as i64], mask_data)).map_err(|e| e.to_string())?,
+                    ],
+                )
+                .map_err(|e| format!("ONNX 推理失败: {}", e))?;
+            let output = outputs["output"]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| e.to_string())?;
+            let expected = WINDOW as usize * WINDOW as usize * 3;
+            let data: &[f32] = output.1;
+            if data.len() < expected {
+                return Err(format!("unexpected model output size {}", data.len()));
+            }
+            let _ = output.0;
+
+            let plane = WINDOW as usize * WINDOW as usize;
+            let m = WINDOW as i64;
+            for y in 0..(height as i64 - oy).min(m) {
+                for x in 0..(width as i64 - ox).min(m) {
+                    let sx = (x + ox) as u32;
+                    let sy = (y + oy) as u32;
+                    if mask.get_pixel(sx, sy).0[0] == 0 {
+                        continue;
+                    }
+                    let base = (y * m + x) as usize;
+                    let pixel = image::Rgb([
+                        data[base].clamp(0.0, 255.0) as u8,
+                        data[plane + base].clamp(0.0, 255.0) as u8,
+                        data[2 * plane + base].clamp(0.0, 255.0) as u8,
+                    ]);
+                    result.put_pixel(sx, sy, pixel);
+                }
+            }
+            log(&format!(
+                "inferred region {}/{}: {}x{} window at ({}, {})",
+                i + 1,
+                components.len(),
+                WINDOW,
+                WINDOW,
+                ox,
+                oy
             ));
         }
-
-        let ox = {
-            let center = (bbox.x1 + bbox.x2) as i64 / 2 - WINDOW as i64 / 2;
-            center.clamp(0, width as i64 - WINDOW as i64).max(0)
-        };
-        let oy = {
-            let center = (bbox.y1 + bbox.y2) as i64 / 2 - WINDOW as i64 / 2;
-            center.clamp(0, height as i64 - WINDOW as i64).max(0)
-        };
-
-        let win_img = reflect_pad(image, WINDOW, ox, oy);
-        let mut win_mask = image::GrayImage::new(WINDOW, WINDOW);
-        let oxu = ox as u32;
-        let oyu = oy as u32;
-        let y_end = (oyu + WINDOW).min(height);
-        let x_end = (oxu + WINDOW).min(width);
-        for y in oyu..y_end {
-            for x in oxu..x_end {
-                let value = mask.get_pixel(x, y).0[0];
-                if value > 0 {
-                    win_mask.put_pixel(x - oxu, y - oyu, image::Luma([value]));
-                }
-            }
-        }
-        if std::env::var("LAMA_DEBUG_DUMP").is_ok() {
-            let dir = std::path::PathBuf::from("lama-debug");
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = win_img.save(dir.join("win_img.png"));
-            let _ = win_mask.save(dir.join("win_mask.png"));
-        }
-
-        let mut chw = vec![0f32; 3 * WINDOW as usize * WINDOW as usize];
-        for y in 0..WINDOW {
-            for x in 0..WINDOW {
-                let p = win_img.get_pixel(x, y);
-                let base = (y * WINDOW + x) as usize;
-                for c in 0..3 {
-                    chw[c * WINDOW as usize * WINDOW as usize + base] = p.0[c] as f32 / 255.0;
-                }
-            }
-        }
-        let mask_data: Vec<f32> = win_mask
-            .pixels()
-            .map(|p| if p.0[0] > 0 { 1.0f32 } else { 0.0 })
-            .collect();
-
-        let outputs = self
-            .session
-            .run(
-                ort::inputs![
-                    "image" => ort::value::Tensor::from_array((vec![1i64, 3, WINDOW as i64, WINDOW as i64], chw)).map_err(|e| e.to_string())?,
-                    "mask" => ort::value::Tensor::from_array((vec![1i64, 1, WINDOW as i64, WINDOW as i64], mask_data)).map_err(|e| e.to_string())?,
-                ],
-            )
-            .map_err(|e| format!("ONNX 推理失败: {}", e))?;
-        let output = outputs["output"]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| e.to_string())?;
-        let expected = WINDOW as usize * WINDOW as usize * 3;
-        let data: &[f32] = output.1;
-        if data.len() < expected {
-            return Err(format!("unexpected model output size {}", data.len()));
-        }
-        let _ = output.0;
-
-        let mut result = image.to_rgb8();
-        let plane = WINDOW as usize * WINDOW as usize;
-        let m = WINDOW as i64;
-        for y in 0..(height as i64 - oy).min(m) {
-            for x in 0..(width as i64 - ox).min(m) {
-                let sx = (x + ox) as u32;
-                let sy = (y + oy) as u32;
-                if mask.get_pixel(sx, sy).0[0] == 0 {
-                    continue;
-                }
-                let base = (y * m + x) as usize;
-                let pixel = image::Rgb([
-                    data[base].clamp(0.0, 255.0) as u8,
-                    data[plane + base].clamp(0.0, 255.0) as u8,
-                    data[2 * plane + base].clamp(0.0, 255.0) as u8,
-                ]);
-                result.put_pixel(sx, sy, pixel);
-            }
-        }
-        log(&format!(
-            "inferred {}x{} window at ({}, {})",
-            WINDOW, WINDOW, ox, oy
-        ));
         Ok(result)
     }
 }

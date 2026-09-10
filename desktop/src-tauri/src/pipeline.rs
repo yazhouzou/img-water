@@ -76,30 +76,28 @@ pub fn resolve_box(width: u32, height: u32, raw: Option<MaskBox>) -> Result<(i64
     Ok((x1, y1, x2, y2))
 }
 
-/// 与 Python `detect_watermark_box` 对齐：右下角搜索“纯白文字”聚类（白字+灰描边特征）。
+/// 与 Python `detect_watermark_boxes` 对齐：全图搜索“纯白文字”聚类（白字+灰描边特征），
+/// 返回所有通过过滤的水印候选框（右下角评分加权）。
 /// cv2 依赖不可用，膨胀用可分离矩形核、连通域用 BFS，行为与 Python 版一致。
-pub fn detect_watermark_box(image: &DynamicImage) -> Option<(i64, i64, i64, i64)> {
+pub fn detect_watermark_boxes(image: &DynamicImage) -> Vec<(i64, i64, i64, i64)> {
     let rgb = image.to_rgb8();
     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
-    let x0 = w * 55 / 100;
-    let y0 = h * 60 / 100;
-    let rw = w - x0;
-    let rh = h - y0;
+    let rw = w;
+    let rh = h;
     if rw == 0 || rh == 0 {
-        return None;
+        return Vec::new();
     }
     let mut grid = vec![false; rw * rh];
     for y in 0..rh {
         for x in 0..rw {
-            let p = rgb.get_pixel((x0 + x) as u32, (y0 + y) as u32);
+            let p = rgb.get_pixel(x as u32, y as u32);
             grid[y * rw + x] = p.0[0] >= 248 && p.0[1] >= 248 && p.0[2] >= 248;
         }
     }
     let dilated = dilate_rect_9x3_twice(&grid, rw, rh);
 
     let mut visited = vec![false; rw * rh];
-    let mut best: Option<(usize, usize, usize, usize)> = None;
-    let mut best_score = 0.0f64;
+    let mut boxes: Vec<((usize, usize, usize, usize), f64)> = Vec::new();
     let (wf, hf) = (w as f64, h as f64);
     for sy in 0..rh {
         for sx in 0..rw {
@@ -147,26 +145,34 @@ pub fn detect_watermark_box(image: &DynamicImage) -> Option<(i64, i64, i64, i64)
                 continue;
             }
             let fill = area as f64 / (cwf * chf);
-            if !(0.2..=0.9).contains(&fill) {
+            if !(0.2..=0.95).contains(&fill) {
                 continue;
             }
-            let corner_dist = ((w - (x0 + maxx + 1)) + (h - (y0 + maxy + 1))) as f64;
+            let corner_dist = ((w - (maxx + 1)) + (h - (maxy + 1))) as f64;
             let score = area as f64 * (ratio / 6.0).min(1.0) / (1.0 + corner_dist / (wf * 0.1));
-            if score > best_score {
-                best_score = score;
-                best = Some((x0 + minx, y0 + miny, x0 + maxx + 1, y0 + maxy + 1));
-            }
+            boxes.push(((minx, miny, maxx + 1, maxy + 1), score));
         }
     }
-    let (bx1, by1, bx2, by2) = best?;
+    if boxes.is_empty() {
+        return Vec::new();
+    }
+    // 只保留与最高分同量级的候选，避免低分噪声框误擦画面
+    let top = boxes.iter().map(|(_, s)| *s).fold(0.0f64, f64::max);
+    let threshold = top * 0.04;
     let pad = (h / 150).max(10) as i64;
     let (iw, ih) = (w as i64, h as i64);
-    Some((
-        (bx1 as i64 - pad).max(0),
-        (by1 as i64 - pad).max(0),
-        (bx2 as i64 + pad).min(iw - 6),
-        (by2 as i64 + pad).min(ih - 6),
-    ))
+    boxes
+        .into_iter()
+        .filter(|(_, s)| *s >= threshold)
+        .map(|((bx1, by1, bx2, by2), _)| {
+            (
+                (bx1 as i64 - pad).max(0),
+                (by1 as i64 - pad).max(0),
+                (bx2 as i64 + pad).min(iw - 6),
+                (by2 as i64 + pad).min(ih - 6),
+            )
+        })
+        .collect()
 }
 
 /// 矩形核 9x3 膨胀两次（可分离实现：水平半径 4 + 垂直半径 1）
@@ -368,24 +374,29 @@ pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Resu
 
         let image = load_image(&backup)?;
         let (width, height) = (image.width(), image.height());
-        let (x1, y1, x2, y2) = match options.mask_box {
-            Some(box_) => resolve_box(width, height, Some(box_))?,
-            None => match detect_watermark_box(&image) {
-                Some((bx1, by1, bx2, by2)) => {
-                    log(&format!("{}: auto-detected mask box ({}, {}, {}, {})", name, bx1, by1, bx2, by2));
-                    (bx1, by1, bx2, by2)
+        let boxes: Vec<(i64, i64, i64, i64)> = match options.mask_box {
+            Some(box_) => vec![resolve_box(width, height, Some(box_))?],
+            None => {
+                let detected = detect_watermark_boxes(&image);
+                if detected.is_empty() {
+                    let box_ = default_mask_box(width, height);
+                    log(&format!(
+                        "{}: detection failed, using default rule ({}, {}, {}, {})",
+                        name, box_.0, box_.1, box_.2, box_.3
+                    ));
+                    vec![box_]
+                } else {
+                    log(&format!("{}: auto-detected {} watermark box(es)", name, detected.len()));
+                    detected
                 }
-                None => {
-                    let (bx1, by1, bx2, by2) = default_mask_box(width, height);
-                    log(&format!("{}: detection failed, using default rule ({}, {}, {}, {})", name, bx1, by1, bx2, by2));
-                    (bx1, by1, bx2, by2)
-                }
-            },
+            }
         };
         let mut mask = GrayImage::from_pixel(width, height, image::Luma([0]));
-        for y in y1..y2 {
-            for x in x1..x2 {
-                mask.put_pixel(x as u32, y as u32, image::Luma([255]));
+        for (x1, y1, x2, y2) in boxes {
+            for y in y1..y2 {
+                for x in x1..x2 {
+                    mask.put_pixel(x as u32, y as u32, image::Luma([255]));
+                }
             }
         }
         save_png(DynamicImage::ImageLuma8(mask), &masks.join(name))?;
@@ -583,21 +594,52 @@ mod tests {
     }
 
     #[test]
-    fn detect_watermark_box_hits_synthetic() {
+    fn detect_watermark_boxes_hits_synthetic() {
         let root = temp_root("detect");
         let path = root.join("w.png");
         let (tx1, ty1, tx2, ty2) = make_watermark_image(&path, 2848, 1600, "AI GENERATED");
         let img = image::open(&path).unwrap();
-        let (dx1, dy1, dx2, dy2) = detect_watermark_box(&img).expect("should detect watermark");
-        // 字符可能断开成多个连通域（与 cv2 行为一致），主组件应覆盖大部分文字
-        let (dw, dh) = (dx2 - dx1, dy2 - dy1);
-        assert!(dw * 2 >= tx2 - tx1, "detected width {} should cover most of text width {}", dw, tx2 - tx1);
-        assert!(dy1 <= ty1 + 8 && dy2 >= ty2 - 8, "detected height range ({}, {}) should cover text ({}, {})", dy1, dy2, ty1, ty2);
-        assert!(dx1 >= tx1 - 100 && dx2 <= tx2 + 100, "detected box should stay near text box");
-        // 无水印的纯背景图应回退 None
+        let boxes = detect_watermark_boxes(&img);
+        assert!(!boxes.is_empty(), "should detect watermark");
+        // 命中的框应与文字框相交且高度对齐
+        assert!(
+            boxes.iter().any(|&(dx1, dy1, dx2, dy2)| {
+                dx1 < tx2 && dx2 > tx1 && (dy1 - ty1).abs() <= 8 && (dy2 - ty2).abs() <= 8
+            }),
+            "one of {:?} should cover text ({}, {}, {}, {})",
+            boxes, tx1, ty1, tx2, ty2
+        );
+        // 无水印的纯背景图应返回空
         let clean = root.join("clean.png");
         save_png(DynamicImage::ImageRgb8(RgbImage::from_pixel(1600, 900, Rgb([240, 240, 233]))), &clean).unwrap();
-        assert_eq!(detect_watermark_box(&image::open(&clean).unwrap()), None);
+        assert!(detect_watermark_boxes(&image::open(&clean).unwrap()).is_empty());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn detect_watermark_boxes_multi_position() {
+        let root = temp_root("detect-multi");
+        let path = root.join("multi.png");
+        let mut img = RgbImage::from_pixel(2048, 2048, Rgb([200, 205, 210]));
+        let font = font();
+        // 三个位置的水印：左上、中部、右下
+        let spots = [(40i64, 40i64), (900, 1000), (1660, 1920)];
+        for &(x, y) in &spots {
+            draw_text_mut(&mut img, Rgb([120, 120, 120]), x as i32 - 2, y as i32 - 2, 52.0, &font, "WATERMARK");
+            draw_text_mut(&mut img, Rgb([255, 255, 255]), x as i32, y as i32, 52.0, &font, "WATERMARK");
+        }
+        let path_ref = path.clone();
+        save_png(DynamicImage::ImageRgb8(img), &path_ref).unwrap();
+        let boxes = detect_watermark_boxes(&image::open(&path).unwrap());
+        assert!(boxes.len() >= 2, "should find multiple watermarks, got {:?}", boxes);
+        // 每个检测框不应互相重叠（分散水印）
+        for i in 0..boxes.len() {
+            for j in i + 1..boxes.len() {
+                let (a, b) = (boxes[i], boxes[j]);
+                let disjoint = a.2 <= b.0 || b.2 <= a.0 || a.3 <= b.1 || b.3 <= a.1;
+                assert!(disjoint, "boxes should be disjoint: {:?} vs {:?}", a, b);
+            }
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -622,8 +664,12 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// 两个测试都要改 DOUBAO_WATERMARK_WORKDIR 环境变量，必须串行执行
+    static WORKDIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn pipeline_file_flow_without_model() {
+        let _guard = WORKDIR_ENV_LOCK.lock().unwrap();
         let prev_work = std::env::var("DOUBAO_WATERMARK_WORKDIR").ok();
         let root = temp_root("flow");
         std::env::set_var(
@@ -677,6 +723,7 @@ mod tests {
     #[test]
     #[ignore]
     fn full_run_with_lama_e2e() {
+        let _guard = WORKDIR_ENV_LOCK.lock().unwrap();
         let model = std::path::PathBuf::from(
             std::env::var("LAMA_MODEL").unwrap_or_else(|_| ".models/lama_fp32.onnx".into()),
         );
