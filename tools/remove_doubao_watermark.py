@@ -77,6 +77,8 @@ def mask_box(width, height):
         return (width - 330, height - 118, width - 8, height - 8)
     if (width, height) == (2278, 1280):
         return (width - 275, height - 92, width - 7, height - 8)
+    if (width, height) == (2048, 2048):
+        return (width - 380, height - 125, width - 8, height - 40)
     scale = min(width / 2848, height / 1600)
     box_width = max(220, int(330 * scale))
     box_height = max(78, int(118 * scale))
