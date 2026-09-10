@@ -24,12 +24,24 @@ const els = {
   modelProgressText: document.getElementById('model-progress-text'),
   logBox: document.getElementById('log-box'),
   resultBanner: document.getElementById('result-banner'),
+  btnMask: document.getElementById('btn-mask'),
+  maskStatus: document.getElementById('mask-status'),
+  btnMaskClear: document.getElementById('btn-mask-clear'),
+  maskOverlay: document.getElementById('mask-overlay'),
+  maskImg: document.getElementById('mask-img'),
+  maskCanvasWrap: document.getElementById('mask-canvas-wrap'),
+  maskRect: document.getElementById('mask-rect'),
+  maskHint: document.getElementById('mask-hint'),
+  btnMaskCancel: document.getElementById('btn-mask-cancel'),
+  btnMaskReset: document.getElementById('btn-mask-reset'),
+  btnMaskOk: document.getElementById('btn-mask-ok'),
 };
 
 let targetRoot = null;
 let running = false;
 let taskKind = null;
 let lastRunCount = 0;
+let manualMask = null; // 相对右下角偏移 { dx1, dy1, dx2, dy2 }
 const mobileParam = new URLSearchParams(location.search).get('mobile');
 const isMobile =
   mobileParam === '1' ? true :
@@ -48,6 +60,7 @@ function setRunning(value) {
   els.btnPick.disabled = value;
   els.btnCleanup.disabled = value || !targetRoot;
   els.btnSetup.disabled = value;
+  els.btnMask.disabled = value || !targetRoot;
 }
 
 function logLine(text) {
@@ -175,6 +188,96 @@ function updateRunButton() {
   const count = selectedFiles().length;
   els.btnRun.textContent = count > 0 ? `开始处理（${count} 张）` : '开始处理';
   els.btnRun.disabled = running || !targetRoot || count === 0;
+  els.btnMask.disabled = running || !targetRoot || count === 0;
+  updateMaskUi();
+}
+
+function clearMaskSelection() {
+  manualMask = null;
+  updateMaskUi();
+}
+
+function updateMaskUi() {
+  const has = !!manualMask;
+  els.btnMaskClear.hidden = !has;
+  els.maskStatus.textContent = has
+    ? `已手动框选（右下角偏移 ${manualMask.dx1}, ${manualMask.dy1}, ${manualMask.dx2}, ${manualMask.dy2}）`
+    : '未框选，自动检测水印';
+  els.maskStatus.classList.toggle('manual', has);
+}
+
+// —— 手动框选水印区域 ——
+let maskSel = null; // 原图像素坐标 { x1, y1, x2, y2 }
+
+function maskImgPoint(ev) {
+  const img = els.maskImg;
+  const rect = img.getBoundingClientRect();
+  const scale = img.naturalWidth / rect.width;
+  const x = (ev.clientX - rect.left) * scale;
+  const y = (ev.clientY - rect.top) * scale;
+  return {
+    x: Math.max(0, Math.min(img.naturalWidth, x)),
+    y: Math.max(0, Math.min(img.naturalHeight, y)),
+  };
+}
+
+function renderMaskRect() {
+  if (!maskSel) {
+    els.maskRect.hidden = true;
+    return;
+  }
+  const img = els.maskImg;
+  const rect = img.getBoundingClientRect();
+  const scale = rect.width / img.naturalWidth;
+  els.maskRect.hidden = false;
+  els.maskRect.style.left = `${Math.min(maskSel.x1, maskSel.x2) * scale}px`;
+  els.maskRect.style.top = `${Math.min(maskSel.y1, maskSel.y2) * scale}px`;
+  els.maskRect.style.width = `${Math.abs(maskSel.x2 - maskSel.x1) * scale}px`;
+  els.maskRect.style.height = `${Math.abs(maskSel.y2 - maskSel.y1) * scale}px`;
+}
+
+function setMaskButtons() {
+  els.btnMaskOk.disabled = !maskSel;
+  els.btnMaskReset.disabled = !maskSel;
+  els.maskHint.textContent = maskSel
+    ? `已框选 ${Math.round(Math.abs(maskSel.x2 - maskSel.x1))}×${Math.round(Math.abs(maskSel.y2 - maskSel.y1))} 像素，确认或重画`
+    : '按住鼠标拖出一个矩形，覆盖住水印文字即可';
+}
+
+async function openMaskEditor() {
+  const files = selectedFiles();
+  if (files.length === 0 || !targetRoot || running) return;
+  const path = targetRoot.replace(/\/+$/, '') + '/' + files[0];
+  els.maskRect.hidden = true;
+  maskSel = null;
+  setMaskButtons();
+  els.maskImg.src = '';
+  els.maskOverlay.hidden = false;
+  try {
+    els.maskImg.src = await invoke('read_image_base64', { path });
+  } catch (err) {
+    els.maskOverlay.hidden = true;
+    logLine('[框选失败] ' + String(err));
+  }
+}
+
+function closeMaskEditor() {
+  els.maskOverlay.hidden = true;
+  els.maskImg.src = '';
+}
+
+function confirmMaskSelection() {
+  if (!maskSel) return;
+  const img = els.maskImg;
+  manualMask = {
+    dx1: Math.round(Math.min(maskSel.x1, maskSel.x2) - img.naturalWidth),
+    dy1: Math.round(Math.min(maskSel.y1, maskSel.y2) - img.naturalHeight),
+    dx2: Math.round(Math.max(maskSel.x1, maskSel.x2) - img.naturalWidth),
+    dy2: Math.round(Math.max(maskSel.y1, maskSel.y2) - img.naturalHeight),
+  };
+  updateMaskUi();
+  logLine(`[框选] 已设定手动遮罩（右下角偏移 ${manualMask.dx1}, ${manualMask.dy1}, ${manualMask.dx2}, ${manualMask.dy2}）`);
+  closeMaskEditor();
 }
 
 function resetReviews() {
@@ -266,8 +369,49 @@ async function init() {
 
   document.getElementById('lightbox').addEventListener('click', closeLightbox);
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeLightbox();
+    if (e.key === 'Escape') {
+      closeLightbox();
+      if (!els.maskOverlay.hidden) closeMaskEditor();
+    }
   });
+
+  els.btnMask.addEventListener('click', openMaskEditor);
+  els.btnMaskClear.addEventListener('click', () => {
+    clearMaskSelection();
+    logLine('[框选] 已清除手动遮罩，恢复自动检测');
+  });
+  els.btnMaskCancel.addEventListener('click', closeMaskEditor);
+  els.btnMaskReset.addEventListener('click', () => {
+    maskSel = null;
+    renderMaskRect();
+    setMaskButtons();
+  });
+  els.btnMaskOk.addEventListener('click', confirmMaskSelection);
+
+  let maskDragging = false;
+  els.maskCanvasWrap.addEventListener('pointerdown', (ev) => {
+    if (els.maskOverlay.hidden || !els.maskImg.naturalWidth) return;
+    ev.preventDefault();
+    maskDragging = true;
+    els.maskCanvasWrap.setPointerCapture(ev.pointerId);
+    const p = maskImgPoint(ev);
+    maskSel = { x1: p.x, y1: p.y, x2: p.x, y2: p.y };
+    renderMaskRect();
+    setMaskButtons();
+  });
+  els.maskCanvasWrap.addEventListener('pointermove', (ev) => {
+    if (!maskDragging) return;
+    const p = maskImgPoint(ev);
+    maskSel.x2 = p.x;
+    maskSel.y2 = p.y;
+    renderMaskRect();
+    setMaskButtons();
+  });
+  const endMaskDrag = () => {
+    maskDragging = false;
+  };
+  els.maskCanvasWrap.addEventListener('pointerup', endMaskDrag);
+  els.maskCanvasWrap.addEventListener('pointercancel', endMaskDrag);
 
   els.btnClearLog.addEventListener('click', (e) => {
     e.preventDefault();
@@ -291,6 +435,7 @@ async function init() {
         els.btnRefresh.disabled = false;
         els.btnCleanup.disabled = running;
         clearReviews();
+        clearMaskSelection();
         await refreshFiles();
       } catch (err) {
         logLine('[导入失败] ' + String(err));
@@ -304,6 +449,7 @@ async function init() {
     els.btnRefresh.disabled = false;
     els.btnCleanup.disabled = running;
     clearReviews();
+    clearMaskSelection();
     await refreshFiles();
   });
 
@@ -334,6 +480,9 @@ async function init() {
         root: targetRoot,
         files,
         keepWork: els.keepWork.checked,
+        maskBox: manualMask
+          ? [manualMask.dx1, manualMask.dy1, manualMask.dx2, manualMask.dy2]
+          : null,
       });
     } catch (err) {
       logLine('[错误] ' + String(err));

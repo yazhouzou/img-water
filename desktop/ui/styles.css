@@ -662,3 +662,72 @@ body.mobile .log {
   border-radius: 8px;
   box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
 }
+
+/* 手动框选水印 */
+.mask-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+#mask-status.manual { color: #b45309; font-weight: 500; }
+.mask-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  background: rgba(15, 15, 20, 0.85);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.mask-overlay[hidden] { display: none; }
+.mask-dialog {
+  background: var(--panel-bg, #fff);
+  border-radius: 12px;
+  padding: 14px 16px;
+  max-width: min(1100px, 94vw);
+  max-height: 94vh;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+}
+.mask-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  font-weight: 500;
+}
+.mask-canvas-wrap {
+  position: relative;
+  overflow: hidden;
+  border-radius: 6px;
+  line-height: 0;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: crosshair;
+}
+.mask-canvas-wrap img {
+  max-width: 100%;
+  max-height: 66vh;
+  object-fit: contain;
+  pointer-events: none;
+}
+.mask-rect {
+  position: absolute;
+  border: 2px solid #e5484d;
+  background: rgba(229, 72, 77, 0.18);
+  pointer-events: none;
+}
+.mask-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}

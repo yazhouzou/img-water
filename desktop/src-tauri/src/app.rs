@@ -152,6 +152,7 @@ fn run_pipeline(
     root: String,
     files: Vec<String>,
     keep_work: bool,
+    mask_box: Option<Vec<i64>>,
 ) -> Result<(), String> {
     if storage.running.swap(true, Ordering::SeqCst) {
         return Err("已有任务在运行中，请等待完成".into());
@@ -174,11 +175,19 @@ fn run_pipeline(
 
     let app_handle = app.clone();
     thread::spawn(move || {
+        let mask = mask_box.and_then(|b| {
+            (b.len() == 4).then(|| pipeline::MaskBox {
+                x1: b[0],
+                y1: b[1],
+                x2: b[2],
+                y2: b[3],
+            })
+        });
         let options = pipeline::PipelineOptions {
             root: PathBuf::from(&root),
             files,
             keep_work,
-            mask_box: None,
+            mask_box: mask,
         };
         let log = |line: &str| {
             let _ = app_handle.emit(EVENT_LOG, line);

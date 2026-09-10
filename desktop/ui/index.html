@@ -46,6 +46,11 @@
         <div class="placeholder">先选择图片或文件夹</div>
       </div>
       <div class="run-area">
+        <div class="mask-row">
+          <button id="btn-mask" class="btn small" disabled>框选水印</button>
+          <span id="mask-status" class="muted">未框选，自动检测水印</span>
+          <button id="btn-mask-clear" class="btn small ghost" hidden>清除框选</button>
+        </div>
         <label class="checkbox">
           <input type="checkbox" id="keep-work" />
           处理后保留备份与复查图（便于人工检查）
@@ -79,6 +84,26 @@
       </details>
     </section>
   </main>
+
+  <div id="mask-overlay" class="mask-overlay" hidden>
+    <div class="mask-dialog">
+      <div class="mask-head">
+        <span>拖拽框选水印区域（以第一张选中图为例，框会按右下角偏移应用到所有选中图）</span>
+        <button id="btn-mask-cancel" class="btn small ghost" type="button">取消</button>
+      </div>
+      <div id="mask-canvas-wrap" class="mask-canvas-wrap">
+        <img id="mask-img" src="" alt="框选参考图" draggable="false" />
+        <div id="mask-rect" class="mask-rect" hidden></div>
+      </div>
+      <div class="mask-foot">
+        <span id="mask-hint" class="muted">按住鼠标拖出一个矩形，覆盖住水印文字即可</span>
+        <div>
+          <button id="btn-mask-reset" class="btn small ghost" type="button" disabled>重画</button>
+          <button id="btn-mask-ok" class="btn primary small" type="button" disabled>确认框选</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <div id="lightbox" class="lightbox">
     <img src="" alt="预览大图" />
