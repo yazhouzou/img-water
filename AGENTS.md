@@ -18,7 +18,7 @@
 2. 确认目标图片都存在，并读取尺寸。
 3. 处理前备份原图到 `original-watermark-backup/`，备份文件已存在时不要覆盖。
 4. 生成右下角裁剪复查图，只用于确认水印位置、尺寸和遮罩范围，不用于筛选是否处理。
-5. 只给右下角水印文字区域生成遮罩，保留少量边距，不要大范围涂抹。
+5. 遮罩三层来源：自动检测（默认）→ 尺寸规则兜底 → `--mask-box` 手动指定；只覆盖水印文字区域，保留少量边距。
 6. 优先使用 LaMa / `iopaint` 批量修复。
 7. 覆盖目标 PNG 前，先生成候选结果右下角复查图。
 8. 候选结果确认无文字残留、无明显糊块后，再覆盖原图。
@@ -96,13 +96,7 @@ LaMa 模型通常缓存于：
 .img-inpaint-venv/bin/python tools/remove_doubao_watermark.py --mask-box x1,y1,x2,y2 prepare [可选文件列表]
 ```
 
-`--mask-box` 支持绝对坐标，也支持负数表示相对右下边界，例如 `-330,-118,-8,-8`。
-
-底层批量修复命令格式：
-
-```bash
-.img-inpaint-venv/bin/iopaint run --model lama --device mps --image /tmp/doubao-watermark-work/source --mask /tmp/doubao-watermark-work/masks --output /tmp/doubao-watermark-work/lama
-```
+`--mask-box` 支持绝对坐标，也支持负数表示相对右下边界，例如 `-330,-118,-8,-8`（argparse 负数需用 `=` 传参）。
 
 ## 桌面端
 
@@ -111,17 +105,16 @@ LaMa 模型通常缓存于：
 - 内核：`desktop/src-tauri/src/lama.rs` 用 `ort` 推理 LaMa ONNX 模型（`.models/lama_fp32.onnx`，约 200MB），固定 512×512 窗口推理后合成回原图；遮罩 bbox 超过约 496px 会报错（角标水印场景足够）
 - 流水线：`desktop/src-tauri/src/pipeline.rs` 是 `tools/remove_doubao_watermark.py` 的 Rust 移植（备份/遮罩/修复/复查/覆盖/清理），桌面端进程内调用；`run` 模式清理前会把两张复查拼图复制到系统临时目录 `doubao-watermark-review/` 再输出路径，避免复查图被清理后失效
 - CLI：`clean-cli`（`cargo build --bin clean-cli`），参数与 Python 脚本一致（`--root`/`--mask-box`/`--keep-work` + `run|prepare|inpaint|review-lama|overwrite-review|cleanup`）
-- 模型下载：应用内“一键下载修复模型”按钮，默认 hf-mirror（`LAMA_ONNX_URL` 可覆盖；`LAMA_ONNX_PATH` 可覆盖模型位置），进度实时回传界面
+- 模型下载：启动检测到模型缺失即自动开始下载（多连接分段+分段重试+源回退 hf-mirror→huggingface），顶栏进度条；`LAMA_ONNX_URL` 可覆盖下载源（单一地址），`LAMA_ONNX_PATH` 可覆盖模型位置
 - 开发调试：`cd desktop && pnpm install && pnpm tauri dev`；直接跑 `cargo build`/`cargo check` 必须先 `env -u CFLAGS -u CXXFLAGS -u CCFLAGS -u LDFLAGS -u MACOSX_DEPLOYMENT_TARGET`（`.zshrc` 旧 MacPorts 变量会破坏 `objc2-exception-helper` 编译），或统一用 `desktop/build.sh`
 - Windows 安装包无法在 macOS 上交叉编译；一键打包入口 `tools/package-app.sh`：`mac`（本机 DMG）、`win`（Windows Git Bash 本机构建，或 macOS 上 `--remote user@host --win-repo C:/path` 经 SSH 触发远程 Windows 构建并拉回）、`both`（两者一同打包）；产物统一在项目根目录 `dist/`
 - 旧 Python 流水线（`tools/remove_doubao_watermark.py` + `.img-inpaint-venv/`）保留作终端回退方案，不再被桌面端依赖
-- Android：代码层适配已就绪（路径重定向到应用目录、`import_files` 多选导入、移动端单列 UI）；CI 已可出 APK（debug 签名，70MB），真机验证待用户安装确认
+- Android：代码层适配已就绪（路径重定向到应用目录、相册 `content://` URI 经 JNI/ContentResolver 拷贝导入见 `android_uri.rs`、移动端状态驱动单列 UI）；APK 由 CI 出（debug 签名，约 70MB）；运行时问题优先真机复现 + 截图报错定位
 - UI 本地联调（零 SDK）：`./tools/ui-preview.sh` 起 http 服务并打开 `desktop/ui/index.html`；`ui/mock.js` 在浏览器环境 mock 全部 Tauri API（打包应用内自动失效），`?mobile=1/0` 强制移动/桌面视图、`?nomodel=1` 模拟未下载模型；改 ui 下 HTML/CSS/JS 后浏览器刷新即可，不依赖 CI
-- CI：GitHub Actions 已生效（仓库 `github.com/yazhouzou/img-water`，remote 名 `github`；origin 仍是 Codeup，双远端都推）。产物在 Actions 页 artifacts 下载：Windows NSIS 15MB、macOS arm64 DMG 21MB、Android APK 70MB；模型不入库，应用内下载
-- CI 注意：x86_64 macOS 已从矩阵移除（ort-sys rc.13 无该平台预编译库）；构建步骤必须 `shell: bash`（Windows runner 默认 pwsh 不支持 bash 语法）；Windows 产物路径含 `target/<triple>/`
+- CI：GitHub Actions（仓库 `github.com/yazhouzou/img-water`，remote 名 `github`；origin 仍是 Codeup，双远端都推）；产物自动附加到 Release（免登录下载）。注意：x86_64 macOS 已从矩阵移除（ort-sys 无该平台预编译库）；构建步骤必须 `shell: bash`（Windows runner 默认 pwsh）；Windows 产物路径含 `target/<triple>/`
 - 本机 Android 工具链（2026-09 已装，用户已同意）：brew `android-commandlinetools`（`/opt/homebrew/share/android-commandlinetools`）+ `openjdk@17`（`/opt/homebrew/opt/openjdk@17`，无需 sudo）+ NDK 26.3.11579264；环境变量已写入 `~/.zshrc`（JAVA_HOME/ANDROID_HOME/NDK_HOME）。推送前 Android 编译预检：`./tools/android-check.sh`（cargo check --target aarch64-linux-android，NDK 工具链已在脚本内加 PATH）。真机调试：手机开 USB 调试连 Mac，`adb devices` 确认后 `cd desktop && pnpm tauri android dev` 直接部署热重载，UI/运行时行为本地闭环，不再依赖 CI+真机装包迭代。桌面端预检仍是 macOS `cargo check` + `node --check ui/*.js`
 - 本机访问 GitHub：`github.com:443` 常被阻断，SSH 走 `ssh.github.com:443`（已写入 `~/.ssh/config` 的 `Host github.com`）；`api.github.com` 可直连，匿名 API 可查询 CI 状态/产物（日志需登录）
-- 发版：一键 `./tools/release.sh <x.y.z>`（本地预检 cargo check → 改版本号 → 提交推送双远端 → 打 tag 触发 CI），产物自动附加到 GitHub Release（免登录，`releases/latest` 永久地址）。会话中执行发布后立即结束回复并标注“CI 后台构建中”，不轮询；若构建成功但 Release 缺产物，让用户在 Actions run 页面点 Re-run failed jobs（仅重跑附加步骤约 1 分钟，不重构建）。踩坑记录：matrix 内并发 softprops 附加同一 Release 会竞态失败（须用独立 release job）；release job 无 checkout，gh 命令必须设 `GH_REPO`；APK artifact 解压带嵌套目录，需拍平后用 `find dist -type f` 上传；删除 tag 会把已发布 Release 转为 draft，release job 启动时会自动清理同 tag draft。不要删 tag 重推来修 release 问题，除非同时改了构建代码。v0.2.0 已发布（APK 277MB / exe 15MB / dmg 21MB，含新图标）；v0.1.0 为旧图标版
+- 发版：一键 `./tools/release.sh <x.y.z>`（本地预检 cargo check → 改版本号 → 提交推送双远端 → 打 tag 触发 CI），产物自动附加到 GitHub Release（免登录，`releases/latest` 永久地址）。会话中执行发布后立即结束回复并标注“CI 后台构建中”，不轮询；若构建成功但 Release 缺产物，让用户在 Actions run 页面点 Re-run failed jobs（仅重跑附加步骤约 1 分钟，不重构建）。踩坑记录：matrix 内并发 softprops 附加同一 Release 会竞态失败（须用独立 release job）；release job 无 checkout，gh 命令必须设 `GH_REPO`；APK artifact 解压带嵌套目录，需拍平后用 `find dist -type f` 上传；删除 tag 会把已发布 Release 转为 draft，release job 启动时会自动清理同 tag draft。不要删 tag 重推来修 release 问题，除非同时改了构建代码。v0.3.2 已发布（相册 content:// 导入、自动检测遮罩待同步到桌面端）；v0.2.0 含新图标；v0.1.0 为旧图标版
 
 ## 提效规则
 
@@ -142,32 +135,22 @@ LaMa 模型通常缓存于：
 
 ## 遮罩规则
 
-遮罩必须按当前图片尺寸生成，不能假设所有任务尺寸相同。
+遮罩按三层优先级生成，遮罩必须按当前图片尺寸生成，不能假设所有任务尺寸相同。
 
-对 `2848x1600` 图片，水印通常在右下角，可用近似区域：
+1. **自动检测（默认）**：`detect_watermark_box()` 在右下角搜索“纯白文字”聚类（白字+灰描边特征），按高度比例/宽高比/填充率过滤干扰，自动生成遮罩；处理日志会打印 `auto-detected` 或 `detection failed, using default rule`
+2. **尺寸规则兜底**（`mask_box()`，检测失败或纯白背景时启用）：
 
-```text
-x: width - 330 到 width - 8
-y: height - 118 到 height - 8
-```
+| 尺寸 | 遮罩区域（相对右下角） |
+|---|---|
+| 2848x1600 | x: -330~-8, y: -118~-8 |
+| 2278x1280 | x: -275~-7, y: -92~-8 |
+| 2048x2048 | x: -380~-8, y: -125~-40 |
 
-对 `2278x1280` 图片，水印通常在右下角，可用近似区域：
+3. **手动指定**：`--mask-box=x1,y1,x2,y2`（argparse 负数需用 `=` 传参），优先级最高
 
-```text
-x: width - 275 到 width - 7
-y: height - 92 到 height - 8
-```
+已知尺寸以外的图片，自动检测失败时必须先用右下角裁剪图实测水印位置，确认后把规则补进 `mask_box()` 和本文件。桌面端 `pipeline.rs` 的默认遮罩规则与 Python 脚本可能不同步，改动规则时两边都要更新。
 
-对 `2048x2048` 图片（2026-09 实测），水印在右下角但距边缘偏左偏上，用：
-
-```text
-x: width - 380 到 width - 8
-y: height - 125 到 height - 40
-```
-
-即 `--mask-box=-380,-125,-8,-40`；注意 argparse 负数需用 `=` 传参。默认缩放规则（`mask_box()` 按 2848x1600 等比缩放）对新尺寸会罩不住，遇到新尺寸必须先用右下角裁剪图实测，确认后把规则补进本文件和脚本。
-
-实际处理前必须用右下角裁剪图确认水印没有超出遮罩。如果水印位置、大小或图片尺寸不同，应按复查图调整遮罩。
+实际处理前必须用右下角裁剪图确认水印没有超出遮罩。如果水印样式变化（不再是白字）导致检测和规则都失效，按“其它水印流程”处理。
 
 ## 其它水印规则
 

@@ -12,39 +12,18 @@
 | Windows x64 | `doubao-watermark-remover-*-windows-x64-setup.exe` | ~15MB |
 | macOS Apple Silicon | `doubao-watermark-remover-*-macos-aarch64.dmg` | ~21MB |
 
-首次启动点击“一键下载修复模型”（约 200MB，国内镜像），之后离线可用。
+首次启动自动下载修复模型（约 200MB，国内镜像多连接加速），之后离线可用。
 
 ## 打包命令速查
 
-| 目标 | 在哪执行 | 命令 | 产物 |
-|---|---|---|---|
-| **macOS 安装包** | 本机 (macOS) | `tools/package-app.sh mac` | `dist/doubao-watermark-remover_*_aarch64.dmg` |
-| **Windows 安装包**（远程） | 本机 (macOS) | `tools/package-app.sh win --remote user@host --win-repo 'C:/path/to/repo'` | `dist/*_x64-setup.exe` |
-| **Windows 安装包**（本机） | Windows 机器 Git Bash | `tools/package-app.sh win` | `dist/*_x64-setup.exe` |
-| **mac + win 一同打包** | 本机 (macOS) | `tools/package-app.sh both --remote user@host --win-repo 'C:/path/to/repo'` | `dist/` 下两件 |
-| **Windows 安装包**（无 Windows 机器，推荐） | 本机 (macOS) | `tools/package-app.sh ci` | GitHub Actions artifacts |
-| **Android APK** | 无需本机环境 | `git push github main`（或 `tools/package-app.sh ci`） | GitHub Actions artifacts |
+| 目标 | 在哪执行 | 命令 |
+|---|---|---|
+| macOS 安装包 | 本机 (macOS) | `tools/package-app.sh mac` |
+| Windows 安装包 | Windows 机器 Git Bash | `tools/package-app.sh win` |
+| 无 Windows 机器 | 本机 (macOS) | `tools/package-app.sh ci`（走 CI，产物在 Release） |
 
-- 所有本地打包产物统一输出到项目根目录 **`dist/`**
-- `--remote` 需要 Windows 机器开启 OpenSSH 服务器并克隆好仓库（详见 `desktop/README.md`）
-- Android APK：推送后打开 https://github.com/yazhouzou/img-water/actions → 最新 run → **Artifacts** 下载（APK 70MB / Windows exe 15MB / macOS dmg 21MB）
-
-## 发新版本
-
-一键脚本（推荐）：
-
-```bash
-./tools/release.sh 0.3.0
-```
-
-自动完成：本地预检 → 改 `tauri.conf.json` 版本号 → 提交并推送双远端 → 打 tag 触发 CI。约 10-15 分钟后产物自动出现在 [Releases](https://github.com/yazhouzou/img-water/releases/latest)，`releases/latest` 地址永久有效。
-
-手动方式（等效）：
-
-1. 改 `desktop/src-tauri/tauri.conf.json` 的 `version`，提交并推送到两个远端
-2. `git tag v0.3.0 && git push github v0.3.0`（只推 `github`，Codeup 不触发 Release）
-
-偶发失败处理：若 Release 缺少部分产物（构建均成功、仅附加步骤失败），到 Actions 对应 run 页面点 **Re-run failed jobs**，只重跑附加步骤约 1 分钟，无需重新构建。
+- 本地打包产物统一输出到项目根目录 **`dist/`**
+- 正式发布一律用下面的发版脚本，产物自动附加到 Release（免登录下载）
 
 ## 日常使用
 
@@ -56,7 +35,18 @@
 cd desktop && pnpm install && pnpm tauri dev
 ```
 
-应用首次启动点击“一键下载修复模型”（约 200MB，国内镜像），之后离线可用。
+- 遮罩自动检测：脚本在图片右下角搜索“豆包AI生成”白字水印并自动生成遮罩，位置变化也能处理；检测不到时回退内置尺寸规则（支持 2848x1600 / 2278x1280 / 2048x2048）
+- 特殊水印可手动指定遮罩：`./tools/remove_doubao_watermark.py --mask-box=x1,y1,x2,y2 run ...`（负数表示距右下角偏移）
+
+## 发新版本
+
+```bash
+./tools/release.sh 0.3.0
+```
+
+自动完成：本地预检 → 改 `tauri.conf.json` 版本号 → 提交并推送双远端 → 打 tag 触发 CI。约 10-15 分钟后产物自动出现在 [Releases](https://github.com/yazhouzou/img-water/releases/latest)（手动方式等效：改版本号提交推送 + `git tag vX.Y.Z && git push github vX.Y.Z`）。
+
+偶发失败处理：若 Release 缺少部分产物（构建均成功、仅附加步骤失败），到 Actions 对应 run 页面点 **Re-run failed jobs**，只重跑附加步骤约 1 分钟，无需重新构建。
 
 ## 环境变量（可选）
 
@@ -64,18 +54,16 @@ cd desktop && pnpm install && pnpm tauri dev
 |---|---|---|
 | `LAMA_ONNX_URL` | 模型下载地址 | hf-mirror 国内镜像 |
 | `LAMA_ONNX_PATH` | 模型存放位置 | `<项目>/.models/lama_fp32.onnx` |
-| `LAMA_ONNX_DIR` | 模型目录 | `<项目>/.models/` |
 | `DOUBAO_WATERMARK_WORKDIR` | 流水线临时目录 | `/tmp/doubao-watermark-work` |
 
 ## 开发调试
 
 ```bash
-cd desktop && pnpm install && pnpm tauri dev   # 桌面端调试
-cd desktop && env -u CFLAGS -u CXXFLAGS -u CCFLAGS -u LDFLAGS -u MACOSX_DEPLOYMENT_TARGET cargo build --bin clean-cli
-# clean-cli 参数与 Python 脚本一致：--root <文件夹> --mask-box x1,y1,x2,y2 run
+cd desktop && pnpm install && pnpm tauri dev   # 桌面端调试（cargo 需先 unset ~/.zshrc 的 MacPorts 变量）
+./tools/ui-preview.sh                          # UI 浏览器联调（零 SDK，?mobile=1 移动端视图）
+./tools/android-check.sh                       # Android target 编译预检
+adb devices && cd desktop && pnpm tauri android dev   # 真机 USB 调试热重载
 ```
-
-> 本机直接跑 cargo 必须先 unset 上述变量（`~/.zshrc` 旧 MacPorts 配置会破坏编译），macOS 打包请统一用 `tools/package-app.sh mac` 或 `desktop/build.sh`。
 
 ## 目录结构
 
