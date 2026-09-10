@@ -119,7 +119,7 @@ LaMa 模型通常缓存于：
 - UI 本地联调（零 SDK）：`./tools/ui-preview.sh` 起 http 服务并打开 `desktop/ui/index.html`；`ui/mock.js` 在浏览器环境 mock 全部 Tauri API（打包应用内自动失效），`?mobile=1/0` 强制移动/桌面视图、`?nomodel=1` 模拟未下载模型；改 ui 下 HTML/CSS/JS 后浏览器刷新即可，不依赖 CI
 - CI：GitHub Actions 已生效（仓库 `github.com/yazhouzou/img-water`，remote 名 `github`；origin 仍是 Codeup，双远端都推）。产物在 Actions 页 artifacts 下载：Windows NSIS 15MB、macOS arm64 DMG 21MB、Android APK 70MB；模型不入库，应用内下载
 - CI 注意：x86_64 macOS 已从矩阵移除（ort-sys rc.13 无该平台预编译库）；构建步骤必须 `shell: bash`（Windows runner 默认 pwsh 不支持 bash 语法）；Windows 产物路径含 `target/<triple>/`
-- 本机交叉预检不可行：`cargo check --target aarch64-linux-android / x86_64-pc-windows-msvc` 已实测失败，ring/objc2 的 C 依赖需要 NDK clang 或 MSVC 编译器（用户明确不在本机装 SDK/NDK）；推送前本地预检仅限 macOS `cargo check` + `node --check ui/*.js`，不要重试交叉预检
+- 本机 Android 工具链（2026-09 已装，用户已同意）：brew `android-commandlinetools`（`/opt/homebrew/share/android-commandlinetools`）+ `openjdk@17`（`/opt/homebrew/opt/openjdk@17`，无需 sudo）+ NDK 26.3.11579264；环境变量已写入 `~/.zshrc`（JAVA_HOME/ANDROID_HOME/NDK_HOME）。推送前 Android 编译预检：`./tools/android-check.sh`（cargo check --target aarch64-linux-android，NDK 工具链已在脚本内加 PATH）。真机调试：手机开 USB 调试连 Mac，`adb devices` 确认后 `cd desktop && pnpm tauri android dev` 直接部署热重载，UI/运行时行为本地闭环，不再依赖 CI+真机装包迭代。桌面端预检仍是 macOS `cargo check` + `node --check ui/*.js`
 - 本机访问 GitHub：`github.com:443` 常被阻断，SSH 走 `ssh.github.com:443`（已写入 `~/.ssh/config` 的 `Host github.com`）；`api.github.com` 可直连，匿名 API 可查询 CI 状态/产物（日志需登录）
 - 发版：一键 `./tools/release.sh <x.y.z>`（本地预检 cargo check → 改版本号 → 提交推送双远端 → 打 tag 触发 CI），产物自动附加到 GitHub Release（免登录，`releases/latest` 永久地址）。会话中执行发布后立即结束回复并标注“CI 后台构建中”，不轮询；若构建成功但 Release 缺产物，让用户在 Actions run 页面点 Re-run failed jobs（仅重跑附加步骤约 1 分钟，不重构建）。踩坑记录：matrix 内并发 softprops 附加同一 Release 会竞态失败（须用独立 release job）；release job 无 checkout，gh 命令必须设 `GH_REPO`；APK artifact 解压带嵌套目录，需拍平后用 `find dist -type f` 上传；删除 tag 会把已发布 Release 转为 draft，release job 启动时会自动清理同 tag draft。不要删 tag 重推来修 release 问题，除非同时改了构建代码。v0.2.0 已发布（APK 277MB / exe 15MB / dmg 21MB，含新图标）；v0.1.0 为旧图标版
 
@@ -137,7 +137,8 @@ LaMa 模型通常缓存于：
 10. 每轮仍会有 LaMa 模型加载耗时，提效重点是把同一批图片合并到一次 `inpaint` 命令中，不要逐张运行。
 11. 图片复查只读取拼图，不逐张读取完整原图，减少图片解析和回传耗时。
 12. 涉及 CI 构建的会话默认异步等待：推送成功后在回复中标注“CI 后台验证中”即可，不原地轮询阻塞会话；下次会话开头先用 `api.github.com` 匿名 API 查上一轮结果再继续。仅当用户明确要求“等 CI 结果”时才轮询，间隔 ≥90s。
-13. 减少CI 白跑：涉及 Rust/JS 修改时，推送前必须先跑 macOS `cargo check`（清 MacPorts 变量）和 `node --check ui/*.js`，避免平台无关的低级错误消耗一轮 CI。
+13. 减少CI 白跑：涉及 Rust/JS 修改时，推送前必须先跑 macOS `cargo check`（清 MacPorts 变量）和 `node --check ui/*.js`；涉及 Android 行为/Rust 改动时再跑 `./tools/android-check.sh`（NDK 已就绪，本地可过 android target 编译）。
+14. Android 平台差异防御清单（写代码时对照）：dialog 选择器在 Android 返回 `content://` URI（已由 android_uri.rs 处理）；路径必须用 `app_data_dir`/`app_cache_dir` 重定向（MODEL_DIR_OVERRIDE/WORKDIR_OVERRIDE 已就绪）；command 失败必须有可见反馈（原生弹窗或 banner），不能只写折叠日志；新平台行为不确定时先查 `~/.cargo/registry/src/` 里 tauri/插件源码（Kotlin 实现都在 crate 内），再真机验证。
 
 ## 遮罩规则
 
