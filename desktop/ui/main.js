@@ -1,6 +1,7 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { open, message, confirm } = window.__TAURI__.dialog;
+const t = (key) => window.i18n.t(key);
 
 const els = {
   envBadge: document.getElementById('env-badge'),
@@ -89,12 +90,13 @@ function overwriteMode() {
   return checked && checked.value === 'overwrite';
 }
 
-const STAGE_LABEL = { prepare: '分析水印', inpaint: '修复中', save: '保存结果' };
+const STAGE_LABEL = () => ({ prepare: t('stagePrepare'), inpaint: t('stageInpaint'), save: t('stageSave') });
 
 function setRunProgress(stage, done, total, name) {
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
   els.runProgressBar.style.width = pct + '%';
-  const stageText = STAGE_LABEL[stage] || stage;
+  const labels = STAGE_LABEL();
+  const stageText = labels[stage] || stage;
   els.runProgressText.textContent = `${stageText} ${done}/${total}：${name}`;
 }
 
@@ -249,7 +251,7 @@ function selectedFiles() {
 
 function updateRunButton() {
   const count = selectedFiles().length;
-  els.btnRun.textContent = count > 0 ? `开始处理（${count} 张）` : '开始处理';
+  els.btnRun.textContent = count > 0 ? `${t('run')}（${count}）` : t('run');
   els.btnRun.disabled = running || !targetRoot || count === 0;
   els.btnMask.disabled = running || !targetRoot || count === 0;
   updateMaskUi();
@@ -264,8 +266,8 @@ function updateMaskUi() {
   const has = !!manualMask;
   els.btnMaskClear.hidden = !has;
   els.maskStatus.textContent = has
-    ? `已手动框选（右下角偏移 ${manualMask.dx1}, ${manualMask.dy1}, ${manualMask.dx2}, ${manualMask.dy2}）`
-    : '未框选，自动检测水印';
+    ? t('maskSelectedLabel')(`${manualMask.dx1}, ${manualMask.dy1}, ${manualMask.dx2}, ${manualMask.dy2}`)
+    : t('maskAuto');
   els.maskStatus.classList.toggle('manual', has);
 }
 
@@ -339,7 +341,7 @@ function confirmMaskSelection() {
     dy2: Math.round(Math.max(maskSel.y1, maskSel.y2) - img.naturalHeight),
   };
   updateMaskUi();
-  logLine(`[框选] 已设定手动遮罩（右下角偏移 ${manualMask.dx1}, ${manualMask.dy1}, ${manualMask.dx2}, ${manualMask.dy2}）`);
+  logLine(`[${t('maskSetLog')}] ${manualMask.dx1}, ${manualMask.dy1}, ${manualMask.dx2}, ${manualMask.dy2}`);
   closeMaskEditor();
 }
 
@@ -398,25 +400,25 @@ function handleExit(payload) {
   els.resultBanner.hidden = false;
   els.resultBanner.className = 'result-banner ' + (payload.success ? 'ok' : 'err');
   if (payload.success) {
-    const where = payload.overwritten ? '原图已覆盖（备份已清理）' : `已另存到 ${payload.outputDir || 'watermark-cleaned/'}`;
+    const where = payload.overwritten ? t('doneOverwritten') : `${t('doneSavedTo')} ${payload.outputDir || 'watermark-cleaned/'}`;
     els.resultBanner.innerHTML = '';
     const text = document.createElement('span');
-    text.textContent = `处理完成，${lastRunCount} 张图片，${where}`;
+    text.textContent = `${t('doneBanner')}，${lastRunCount} · ${where}`;
     els.resultBanner.appendChild(text);
     if (!isMobile && payload.outputDir) {
       const btn = document.createElement('button');
       btn.className = 'btn small';
       btn.type = 'button';
-      btn.textContent = '打开文件夹';
+      btn.textContent = t('openFolder');
       btn.addEventListener('click', () => {
         invoke('open_path', { path: payload.outputDir }).catch((err) => logLine('[错误] ' + String(err)));
       });
       els.resultBanner.appendChild(btn);
     }
   } else if (payload.cancelled) {
-    els.resultBanner.textContent = '已取消：已处理的图片保持有效';
+    els.resultBanner.textContent = t('cancelledBanner');
   } else {
-    els.resultBanner.textContent = `处理失败：${payload.error || '退出码 ' + payload.code}`;
+    els.resultBanner.textContent = `${t('failedBanner')}：${payload.error || 'exit ' + payload.code}`;
   }
   setState('done');
   const logText = els.log.textContent;
@@ -440,7 +442,7 @@ async function init() {
     const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
     const dark = mode === 'dark' || (mode !== 'light' && prefersDark);
     document.documentElement.dataset.theme = dark ? 'dark' : 'light';
-    btnTheme.textContent = dark ? '☀️' : '🌙';
+    btnTheme.textContent = dark ? t('themeLight') : t('themeDark');
   };
   const themeMode = () => localStorage.getItem('wm-theme') || 'auto';
   applyTheme(themeMode());
@@ -451,6 +453,19 @@ async function init() {
     applyTheme(next);
   });
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme(themeMode()));
+
+  // 语言切换
+  const btnLang = document.getElementById('btn-lang');
+  const applyLang = () => {
+    btnLang.textContent = window.i18n.lang === 'zh' ? 'EN' : '中';
+    window.i18n.applyI18n();
+    updateRunButton();
+  };
+  applyLang();
+  btnLang.addEventListener('click', () => {
+    window.i18n.setLang(window.i18n.lang === 'zh' ? 'en' : 'zh');
+    applyLang();
+  });
 
   els.btnDisclaimerOk.addEventListener('click', () => {
     localStorage.setItem('wm-disclaimer-ok', '1');
@@ -512,7 +527,7 @@ async function init() {
   els.btnMask.addEventListener('click', openMaskEditor);
   els.btnMaskClear.addEventListener('click', () => {
     clearMaskSelection();
-    logLine('[框选] 已清除手动遮罩，恢复自动检测');
+    logLine('[' + t('maskClearedLog') + ']');
   });
   els.btnMaskCancel.addEventListener('click', closeMaskEditor);
   els.btnMaskReset.addEventListener('click', () => {
@@ -561,11 +576,11 @@ async function init() {
       els.btnCleanup.disabled = running;
       clearReviews();
       clearMaskSelection();
-      logLine(`[导入] 已导入 ${paths.length} 个文件`);
+      logLine(`[${t('importedLog')}] ${paths.length}`);
       await refreshFiles();
     } catch (err) {
-      logLine('[导入失败] ' + String(err));
-      await message(String(err), { title: '导入失败' }).catch(() => {});
+      logLine(`[${t('importFailed')}] ` + String(err));
+      await message(String(err), { title: t('importFailed') }).catch(() => {});
     }
   }
 
@@ -626,17 +641,17 @@ async function init() {
     if (files.length === 0 || running) return;
     const overwrite = overwriteMode();
     if (overwrite) {
-      const ok = await confirm(
-        `将直接覆盖选中的 ${files.length} 张原图（自动备份到 original-watermark-backup/，可用"清理本轮产物"还原删除）。确定继续吗？`,
-        { title: '覆盖原图确认', kind: 'warning' }
-      ).catch(() => false);
+      const ok = await confirm(t('confirmOverwrite')(files.length), {
+        title: t('overwriteTitle'),
+        kind: 'warning',
+      }).catch(() => false);
       if (!ok) return;
     }
     lastRunCount = files.length;
     setRunning(true);
     setState('running');
     resetReviews();
-    logLine(`[开始] 处理 ${files.length} 张图片（${overwrite ? '覆盖原图' : '另存到 watermark-cleaned/'}）…`);
+    logLine(t('startLog')(files.length, overwrite ? t('modeOverwrite') : t('modeSave')));
     try {
       await invoke('run_pipeline', {
         root: targetRoot,
@@ -655,7 +670,7 @@ async function init() {
 
   els.btnCancel.addEventListener('click', async () => {
     els.btnCancel.disabled = true;
-    logLine('[取消] 正在取消，当前图片完成后停止…');
+    logLine(t('cancelLog'));
     try {
       await invoke('cancel_pipeline');
     } catch (err) {
@@ -678,15 +693,12 @@ async function init() {
       const data = await res.json();
       const latest = String(data.tag_name || '').replace(/^v/, '');
       if (latest && latest !== current) {
-        await message(
-          `发现新版本 v${latest}（当前 v${current}）。\n请到 GitHub Releases 页面下载：\nhttps://github.com/yazhouzou/img-water/releases/latest`,
-          { title: '检查更新' }
-        ).catch(() => {});
+        await message(t('updateFound')(latest, current), { title: t('updateTitle') }).catch(() => {});
       } else {
-        await message(`当前已是最新版本 v${current}`, { title: '检查更新' }).catch(() => {});
+        await message(t('updateNone')(current), { title: t('updateTitle') }).catch(() => {});
       }
     } catch (err) {
-      logLine('[更新检查失败] ' + String(err));
+      logLine(t('updateCheckFailed') + String(err));
     } finally {
       btnCheckUpdate.disabled = false;
       btnCheckUpdate.textContent = '检查更新';

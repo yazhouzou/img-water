@@ -1,77 +1,72 @@
-# 豆包水印清理助手
+# 图片水印清理助手 / Watermark Cleaner
 
-批量去除 PNG 图片右下角“豆包AI生成”水印。Rust + ONNX Runtime 内核（无需 Python），支持 macOS / Windows / Android。
+批量去除 AI 生成图片上的水印。**纯本地处理，图片永不上传**。
 
-## 下载安装（免登录，永久有效）
+- 官网（GitHub Pages）：https://yazhouzou.github.io/img-water/ （启用方法见下）
+- 下载（免登录）：https://github.com/yazhouzou/img-water/releases/latest
 
-**最新版**：https://github.com/yazhouzou/img-water/releases/latest
+## 功能
 
-| 平台 | 文件 | 大小 |
-|---|---|---|
-| Android（arm64） | `doubao-watermark-remover-*-android.apk` | ~276MB |
-| Windows x64 | `doubao-watermark-remover-*-windows-x64-setup.exe` | ~15MB |
-| macOS Apple Silicon | `doubao-watermark-remover-*-macos-aarch64.dmg` | ~21MB |
+- **自动检测**：全图扫描白色/浅色文字水印（含各类 AI 工具常见水印），右下角另有半透明水印自适应兜底
+- **手动框选**：深色、彩色、logo 等检测不到的水印，在预览图上框住即可擦除
+- **修复式擦除**：LaMa 修复模型按背景纹理智能补全，只处理水印区域，非模糊打码
+- **批量处理**：整文件夹一次处理，支持 PNG / JPEG / WebP
+- **安全输出**：默认另存到 `watermark-cleaned/`，不覆盖原图；覆盖模式需显式确认并自动备份
+- **可取消**：随时取消，已完成图片保持有效
+- **前后对比**：拖动分割线滑块查看处理前后差异
+- 三端支持：macOS（DMG）/ Windows（NSIS 安装包）/ Android（APK）
+- 中英双语 / 深色模式 / 应用内检查更新
 
-首次启动自动下载修复模型（约 200MB，国内镜像多连接加速），之后离线可用。
+## 隐私
 
-## 打包命令速查
+所有图片处理均在本机完成，图片与数据不会上传到任何服务器。应用仅联网用于：
 
-| 目标 | 在哪执行 | 命令 |
-|---|---|---|
-| macOS 安装包 | 本机 (macOS) | `tools/package-app.sh mac` |
-| Windows 安装包 | Windows 机器 Git Bash | `tools/package-app.sh win` |
-| 无 Windows 机器 | 本机 (macOS) | `tools/package-app.sh ci`（走 CI，产物在 Release） |
+1. 首次下载修复模型（LaMa ONNX，约 200MB，仅一次）
+2. 检查新版本（GitHub API）
 
-- 本地打包产物统一输出到项目根目录 **`dist/`**
-- 正式发布一律用下面的发版脚本，产物自动附加到 Release（免登录下载）
+## 使用条款 / 免责声明
 
-## 日常使用
+请**仅处理你拥有版权或已获授权的图片**。去除他人作品上的水印可能构成侵权，由此产生的法律责任由使用者自行承担。本项目按 "as is" 提供，不附带任何担保。
 
-```bash
-# 终端一键处理（需要先初始化 Python 回退环境）
-./tools/remove_doubao_watermark.py run [文件列表]
+## 使用
 
-# 或使用图形界面（推荐，普通用户零环境）
-cd desktop && pnpm install && pnpm tauri dev
-```
+1. 从 Releases 下载安装
+2. 首次启动下载修复模型（一次性）
+3. 选择文件夹或拖入图片 → 开始处理
+4. 结果另存在图片目录下 `watermark-cleaned/`
 
-- 遮罩自动检测：脚本在图片右下角搜索“豆包AI生成”白字水印并自动生成遮罩，位置变化也能处理；检测不到时回退内置尺寸规则（支持 2848x1600 / 2278x1280 / 2048x2048）
-- 特殊水印可手动指定遮罩：`./tools/remove_doubao_watermark.py --mask-box=x1,y1,x2,y2 run ...`（负数表示距右下角偏移）
-
-## 发新版本
+## CLI（开发者）
 
 ```bash
-./tools/release.sh 0.3.0
+cd desktop/src-tauri && cargo build --release --bin clean-cli
+./target/release/clean-cli --root /path/to/images run            # 结果另存 watermark-cleaned/
+./target/release/clean-cli --root /path/to/images --overwrite run  # 覆盖原图（自动备份）
+./target/release/clean-cli --root /path/to/images --mask-box=-330,-118,-8,-8 run
 ```
 
-自动完成：本地预检 → 改 `tauri.conf.json` 版本号 → 提交并推送双远端 → 打 tag 触发 CI。约 10-15 分钟后产物自动出现在 [Releases](https://github.com/yazhouzou/img-water/releases/latest)（手动方式等效：改版本号提交推送 + `git tag vX.Y.Z && git push github vX.Y.Z`）。
+终端快速处理（Python 回退方案）：`./tools/remove_doubao_watermark.py run`
 
-偶发失败处理：若 Release 缺少部分产物（构建均成功、仅附加步骤失败），到 Actions 对应 run 页面点 **Re-run failed jobs**，只重跑附加步骤约 1 分钟，无需重新构建。
+## 公开发布前置（需要账号的接入点）
 
-## 环境变量（可选）
+以下接入点代码已就绪，配置 secrets 后自动生效：
 
-| 变量 | 作用 | 默认 |
+| 事项 | 需要什么 | 配置位置 |
 |---|---|---|
-| `LAMA_ONNX_URL` | 模型下载地址 | hf-mirror 国内镜像 |
-| `LAMA_ONNX_PATH` | 模型存放位置 | `<项目>/.models/lama_fp32.onnx` |
-| `DOUBAO_WATERMARK_WORKDIR` | 流水线临时目录 | `/tmp/doubao-watermark-work` |
+| macOS 签名 + 公证 | Apple Developer 账号（$99/年） | Secrets：`APPLE_CERTIFICATE`（.p12 base64）、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`、`APPLE_ID`、`APPLE_PASSWORD`（app-specific）、`APPLE_TEAM_ID` |
+| Android release 签名 | 自建 keystore | Secrets：`ANDROID_KEYSTORE_BASE64`（.jks base64）、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD`；tag 构建自动出 release APK，未配置保持 debug 签名 |
+| Windows 签名 | EV/OV 代码签名证书 | 暂未接入（NSIS 包无签名会有 SmartScreen 提示，可先引导用户"仍要运行"） |
+| GitHub Pages 落地页 | 仓库设置 | Settings → Pages → Source 选 `main` 分支 `/docs` 目录 |
 
-## 开发调试
+## 开发
 
 ```bash
-cd desktop && pnpm install && pnpm tauri dev   # 桌面端调试（cargo 需先 unset ~/.zshrc 的 MacPorts 变量）
-./tools/ui-preview.sh                          # UI 浏览器联调（零 SDK，?mobile=1 移动端视图）
-./tools/android-check.sh                       # Android target 编译预检
-adb devices && cd desktop && pnpm tauri android dev   # 真机 USB 调试热重载
+cd desktop && pnpm install
+pnpm tauri dev            # 桌面调试
+pnpm tauri android dev    # Android 真机（需 NDK，见 tools/android-check.sh）
+./tools/ui-preview.sh     # UI 浏览器联调（零 SDK，?mobile=1/0 ?nomodel=1）
+cd src-tauri && cargo test -- --include-ignored   # 单测 + LaMa E2E（需 .models/lama_fp32.onnx）
 ```
 
-## 目录结构
+发布：`./tools/release.sh <x.y.z>`
 
-```
-tools/                # Python 流水线（终端回退方案）+ 打包脚本
-desktop/              # Tauri 应用（Rust ONNX 内核 + 前端）
-  src-tauri/src/      #   lama.rs 推理内核 / pipeline.rs 流水线 / app.rs 命令
-  build.sh            #   macOS 一键构建
-  build.ps1           #   Windows 一键构建
-dist/                 # 本地打包产物输出目录
-```
+架构细节与踩坑记录见 [AGENTS.md](AGENTS.md)。

@@ -28,11 +28,11 @@ android {
         create("ciRelease") {
             // 公开发布签名接入点：CI 注入以下环境变量后自动启用 release 签名，
             // 未配置时回退 debug 签名（保证始终可安装）。
-            val storeFile = System.getenv("ANDROID_KEYSTORE_FILE") ?: return@create
-            storeFile = file(storeFile)
-            storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD") ?: return@create
-            keyAlias = System.getenv("ANDROID_KEY_ALIAS") ?: return@create
-            keyPassword = System.getenv("ANDROID_KEY_PASSWORD") ?: return@create
+            val storeFilePath = System.getenv("ANDROID_KEYSTORE_FILE") ?: return@create
+            this.storeFile = file(storeFilePath)
+            this.storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD") ?: return@create
+            this.keyAlias = System.getenv("ANDROID_KEY_ALIAS") ?: return@create
+            this.keyPassword = System.getenv("ANDROID_KEY_PASSWORD") ?: return@create
         }
     }
     buildTypes {

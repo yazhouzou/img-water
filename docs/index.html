@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>图片水印清理助手 · Watermark Cleaner</title>
+  <meta name="description" content="批量去除 AI 生成图片水印。纯本地处理，图片永不上传。支持 macOS / Windows / Android。" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f1117; --panel: #171a22; --border: #262b38;
+      --text: #e8ebf2; --muted: #8a92a3; --primary: #6366f1; --primary2: #8b5cf6;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg); color: var(--text); line-height: 1.7;
+    }
+    .wrap { max-width: 960px; margin: 0 auto; padding: 0 24px; }
+    header { padding: 28px 0; display: flex; align-items: center; justify-content: space-between; }
+    .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 18px; }
+    .logo {
+      width: 40px; height: 40px; display: grid; place-items: center;
+      background: linear-gradient(135deg, #4f46e5, #8b5cf6); color: #fff;
+      border-radius: 10px; font-size: 20px;
+    }
+    .lang-btn, .gh-btn {
+      background: none; border: 1px solid var(--border); color: var(--muted);
+      padding: 6px 14px; border-radius: 8px; cursor: pointer; font-size: 13px;
+      text-decoration: none; margin-left: 8px;
+    }
+    .hero { text-align: center; padding: 72px 0 56px; }
+    .hero h1 { font-size: 40px; line-height: 1.25; margin-bottom: 16px; }
+    .hero h1 .grad {
+      background: linear-gradient(90deg, #6366f1, #a78bfa);
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .hero p.sub { color: var(--muted); font-size: 18px; margin-bottom: 36px; }
+    .download-btn {
+      display: inline-block; padding: 14px 40px; font-size: 17px; font-weight: 600;
+      background: linear-gradient(135deg, #4f46e5, #8b5cf6); color: #fff;
+      border-radius: 12px; text-decoration: none; box-shadow: 0 4px 24px rgba(99, 102, 241, 0.4);
+    }
+    .download-btn:hover { transform: translateY(-1px); }
+    .os-note { margin-top: 14px; color: var(--muted); font-size: 13px; }
+    .badges { display: flex; gap: 20px; justify-content: center; margin-top: 40px; flex-wrap: wrap; }
+    .badge-item { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px 28px; min-width: 180px; }
+    .badge-item b { display: block; font-size: 17px; margin-bottom: 4px; }
+    .badge-item span { color: var(--muted); font-size: 13px; }
+    section { padding: 48px 0; }
+    section h2 { font-size: 26px; margin-bottom: 28px; text-align: center; }
+    .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+    .step { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 24px; }
+    .step .num {
+      width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center;
+      background: linear-gradient(135deg, #4f46e5, #8b5cf6); font-weight: 700; margin-bottom: 14px;
+    }
+    .step b { display: block; margin-bottom: 6px; }
+    .step p { color: var(--muted); font-size: 14px; }
+    .legal { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 24px 28px; font-size: 14px; color: var(--muted); }
+    .legal b { color: var(--text); }
+    .legal p { margin-bottom: 10px; }
+    .faq-item { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px 24px; margin-bottom: 12px; }
+    .faq-item b { display: block; margin-bottom: 6px; }
+    .faq-item p { color: var(--muted); font-size: 14px; }
+    footer { text-align: center; color: var(--muted); font-size: 13px; padding: 40px 0 48px; border-top: 1px solid var(--border); margin-top: 40px; }
+    footer a { color: var(--primary); text-decoration: none; }
+    .en { display: none; }
+    html.lang-en .en { display: inline; }
+    html.lang-en .zh { display: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand"><span class="logo">去</span><span class="zh">图片水印清理助手</span><span class="en">Watermark Cleaner</span></div>
+      <div>
+        <button class="lang-btn" onclick="toggleLang()">EN / 中</button>
+        <a class="gh-btn" href="https://github.com/yazhouzou/img-water">GitHub</a>
+      </div>
+    </header>
+
+    <div class="hero">
+      <h1>
+        <span class="zh">一键去除 <span class="grad">AI 生成水印</span></span>
+        <span class="en">Remove <span class="grad">AI Watermarks</span> in One Click</span>
+      </h1>
+      <p class="sub">
+        <span class="zh">批量处理 · 修复式擦除（非打码）· 纯本地处理，图片永不上传</span>
+        <span class="en">Batch · Inpainting-based removal · 100% local, images never uploaded</span>
+      </p>
+      <a class="download-btn" href="https://github.com/yazhouzou/img-water/releases/latest" id="dl-btn">
+        <span class="zh">免费下载</span><span class="en">Download Free</span>
+      </a>
+      <p class="os-note" id="os-note"></p>
+      <div class="badges">
+        <div class="badge-item"><b>🔒 <span class="zh">隐私安全</span><span class="en">Private</span></b><span class="zh">图片不出你的电脑/手机</span><span class="en">Images never leave your device</span></div>
+        <div class="badge-item"><b>✨ <span class="zh">修复式擦除</span><span class="en">Inpainting</span></b><span class="zh">LaMa 智能补全背景纹理</span><span class="en">LaMa reconstructs background</span></div>
+        <div class="badge-item"><b>📦 <span class="zh">批量处理</span><span class="en">Batch</span></b><span class="zh">整文件夹一次搞定</span><span class="en">Whole folders at once</span></div>
+        <div class="badge-item"><b>🖥️ <span class="zh">三端支持</span><span class="en">3 Platforms</span></b><span class="zh">macOS / Windows / Android</span><span class="en">macOS / Windows / Android</span></div>
+      </div>
+    </div>
+
+    <section>
+      <h2><span class="zh">三步搞定</span><span class="en">Three Steps</span></h2>
+      <div class="steps">
+        <div class="step"><div class="num">1</div><b class="zh">导入图片</b><b class="en">Import</b><p class="zh">选择文件夹或直接拖入图片（PNG / JPEG / WebP）</p><p class="en">Choose a folder or drag images in (PNG / JPEG / WebP)</p></div>
+        <div class="step"><div class="num">2</div><b class="zh">自动或框选水印</b><b class="en">Detect or Select</b><p class="zh">自动检测水印文字；检测不到的样式手动框选即可</p><p class="en">Auto-detect watermark text, or manually box any style</p></div>
+        <div class="step"><div class="num">3</div><b class="zh">一键修复</b><b class="en">Clean</b><p class="zh">LaMa 修复模型补全背景，结果另存不覆盖原图</p><p class="en">LaMa inpaints the background; results saved separately</p></div>
+      </div>
+    </section>
+
+    <section>
+      <h2><span class="zh">隐私与使用条款</span><span class="en">Privacy & Terms</span></h2>
+      <div class="legal">
+        <p class="zh"><b>隐私：</b>所有图片处理均在本机完成，图片与数据不会上传到任何服务器。应用仅联网用于下载修复模型（首次约 200MB）与检查更新。</p>
+        <p class="en"><b>Privacy:</b> All processing happens locally. Images and data are never uploaded. The app only accesses the network to download the model (~200MB, one-time) and check for updates.</p>
+        <p class="zh"><b>使用条款：</b>请仅处理你拥有版权或已获授权的图片。去除他人作品上的水印可能构成侵权，由此产生的法律责任由使用者自行承担。本项目按 "as is" 提供，不附带任何担保。</p>
+        <p class="en"><b>Terms:</b> Only process images you own or are licensed to use. Removing watermarks from other people's work may infringe copyright; you bear all legal responsibility. Provided "as is", without warranty.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>FAQ</h2>
+      <div class="faq-item"><b class="zh">支持哪些水印？</b><b class="en">Which watermarks are supported?</b><p class="zh">白色/浅色文字水印（含各类 AI 工具水印）全自动检测；深色、彩色、logo 等其它样式用"框选水印"手动框住即可擦除。</p><p class="en">White/light text watermarks are auto-detected; dark, colored or logo watermarks can be removed by manually boxing them.</p></div>
+      <div class="faq-item"><b class="zh">会破坏画面吗？</b><b class="en">Will it damage the image?</b><p class="zh">采用 LaMa 修复模型按背景纹理智能补全，只处理水印区域。处理前有预览、处理后有对比，不满意可取消或重试。</p><p class="en">LaMa reconstructs only the watermark area. Preview before and compare after; cancel anytime.</p></div>
+      <div class="faq-item"><b class="zh">为什么首次要下载 200MB 模型？</b><b class="en">Why a 200MB model download?</b><p class="zh">修复模型在本地运行才能保证图片不上传，只需下载一次。</p><p class="en">Local inference is what keeps your images private. One-time download only.</p></div>
+    </section>
+
+    <footer>
+      <p><span class="zh">开源免费 · </span><span class="en">Open source · </span><a href="https://github.com/yazhouzou/img-water">GitHub</a> · <a href="https://github.com/yazhouzou/img-water/releases/latest"><span class="zh">下载最新版</span><span class="en">Latest Release</span></a></p>
+    </footer>
+  </div>
+
+  <script>
+    function toggleLang() {
+      document.documentElement.classList.toggle('lang-en');
+      try { localStorage.setItem('wm-landing-lang', document.documentElement.classList.contains('lang-en') ? 'en' : 'zh'); } catch (_) {}
+    }
+    try {
+      if (localStorage.getItem('wm-landing-lang') === 'en') document.documentElement.classList.add('lang-en');
+    } catch (_) {}
+    (function () {
+      var ua = navigator.userAgent;
+      var note = document.getElementById('os-note');
+      var os = /Mac/.test(ua) ? 'macOS' : /Android/.test(ua) ? 'Android' : /Win/.test(ua) ? 'Windows' : null;
+      var zh = !document.documentElement.classList.contains('lang-en');
+      if (os) {
+        note.textContent = zh ? '已为 ' + os + ' 识别到最新版本' : 'Latest build for ' + os + ' detected';
+      } else {
+        note.textContent = zh ? '支持 macOS / Windows / Android' : 'Available for macOS / Windows / Android';
+      }
+    })();
+  </script>
+</body>
+</html>

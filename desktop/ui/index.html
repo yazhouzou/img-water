@@ -12,7 +12,7 @@
       <span class="logo">去</span>
       <div>
         <h1>图片水印清理助手</h1>
-        <p class="subtitle">批量去除 AI 生成图片水印 · 纯本地处理，图片不上传</p>
+        <p class="subtitle" data-i18n="subtitle"></p>
       </div>
     </div>
     <div class="env-area">
@@ -22,35 +22,36 @@
         </div>
         <span id="model-progress-text" class="model-progress-text"></span>
       </div>
-      <button id="btn-setup" class="btn primary small" hidden>一键下载修复模型</button>
-      <button id="btn-check-update" class="btn small ghost">检查更新</button>
+      <button id="btn-setup" class="btn primary small" hidden data-i18n="setupModel"></button>
+      <button id="btn-check-update" class="btn small ghost" data-i18n="checkUpdate"></button>
       <button id="btn-theme" class="btn small ghost" title="切换深浅色">🌙</button>
-      <div id="env-badge" class="badge">检查环境中…</div>
+      <button id="btn-lang" class="btn small ghost">EN</button>
+      <div id="env-badge" class="badge" data-i18n="envChecking"></div>
     </div>
   </header>
 
   <main class="layout">
     <section class="panel files-panel">
       <div class="panel-head">
-        <h2>图片文件</h2>
+        <h2 data-i18n="filesTitle"></h2>
         <div class="actions">
-          <button id="btn-pick" class="btn">选择文件夹</button>
-          <button id="btn-refresh" class="btn ghost" disabled>刷新</button>
+          <button id="btn-pick" class="btn" data-i18n="pickFolder"></button>
+          <button id="btn-refresh" class="btn ghost" disabled data-i18n="refresh"></button>
         </div>
       </div>
-      <div id="folder-path" class="folder-path">未选择文件夹</div>
+      <div id="folder-path" class="folder-path" data-i18n="noFolder"></div>
       <div id="setup-hint" class="setup-hint" hidden>
-        <p>首次使用需要下载修复模型（约 200MB，仅此一次）：</p>
+        <p data-i18n="setupHintTitle"></p>
         <ul>
           <li id="setup-hint-path">下载后保存在应用数据目录，与图片无关</li>
-          <li>所有处理均在本地完成，图片不会上传到任何服务器</li>
-          <li id="setup-hint-wifi" hidden>当前为移动网络环境，建议连接 Wi-Fi 后下载</li>
+          <li data-i18n="setupHintPrivacy"></li>
+          <li id="setup-hint-wifi" hidden data-i18n="setupHintWifi"></li>
         </ul>
-        <button id="btn-setup-inline" class="btn primary small" hidden>一键下载修复模型</button>
+        <button id="btn-setup-inline" class="btn primary small" hidden data-i18n="setupModel"></button>
       </div>
       <div class="list-actions">
-        <button id="btn-select-all" class="btn small ghost" disabled>全选</button>
-        <button id="btn-select-none" class="btn small ghost" disabled>清空</button>
+        <button id="btn-select-all" class="btn small ghost" disabled data-i18n="selectAll"></button>
+        <button id="btn-select-none" class="btn small ghost" disabled data-i18n="selectNone"></button>
         <span id="file-count" class="muted">0 张</span>
       </div>
       <div id="file-list" class="file-list">
@@ -58,23 +59,23 @@
       </div>
       <div class="run-area">
         <div class="mask-row">
-          <button id="btn-mask" class="btn small" disabled>框选水印</button>
-          <span id="mask-status" class="muted">未框选，自动检测水印</span>
-          <button id="btn-mask-clear" class="btn small ghost" hidden>清除框选</button>
+          <button id="btn-mask" class="btn small" disabled data-i18n="pickMask"></button>
+          <span id="mask-status" class="muted" data-i18n="maskAuto"></span>
+          <button id="btn-mask-clear" class="btn small ghost" hidden data-i18n="maskClear"></button>
         </div>
         <div class="output-row" id="output-row">
-          <span class="output-label">输出方式</span>
-          <label class="radio"><input type="radio" name="output-mode" value="save" checked />另存到文件夹（推荐）</label>
-          <label class="radio"><input type="radio" name="output-mode" value="overwrite" />覆盖原图</label>
+          <span class="output-label" data-i18n="outputLabel"></span>
+          <label class="radio"><input type="radio" name="output-mode" value="save" checked /><span data-i18n="outputSave"></span></label>
+          <label class="radio"><input type="radio" name="output-mode" value="overwrite" /><span data-i18n="outputOverwrite"></span></label>
         </div>
         <label class="checkbox">
           <input type="checkbox" id="keep-work" />
-          处理后保留备份与复查图（便于人工检查）
+          <span data-i18n="keepWork"></span>
         </label>
         <div class="run-buttons">
-          <button id="btn-run" class="btn primary" disabled>开始处理</button>
-          <button id="btn-cancel" class="btn danger" hidden>取消</button>
-          <button id="btn-cleanup" class="btn danger ghost" disabled>清理本轮产物</button>
+          <button id="btn-run" class="btn primary" disabled data-i18n="run"></button>
+          <button id="btn-cancel" class="btn danger" hidden data-i18n="cancel"></button>
+          <button id="btn-cleanup" class="btn danger ghost" disabled data-i18n="cleanup"></button>
         </div>
         <div id="run-progress" class="run-progress" hidden>
           <div class="run-progress-track">
@@ -87,30 +88,30 @@
 
     <section class="panel right-panel">
       <div class="panel-head">
-        <h2>处理结果</h2>
+        <h2 data-i18n="resultTitle"></h2>
       </div>
       <div id="result-banner" class="result-banner" hidden></div>
       <div id="compare-box" class="compare-box" hidden>
         <img id="compare-final" class="compare-final" alt="处理后" draggable="false" />
         <img id="compare-source" class="compare-source" alt="处理前" draggable="false" />
-        <span class="compare-tag compare-tag-l">处理后</span>
-        <span class="compare-tag compare-tag-r">处理前</span>
+        <span class="compare-tag compare-tag-l" data-i18n="tagAfter"></span>
+        <span class="compare-tag compare-tag-r" data-i18n="tagBefore"></span>
         <div id="compare-handle" class="compare-handle"></div>
       </div>
       <div class="review-grid">
         <figure class="review-box">
-          <figcaption><i class="dot dot-candidate"></i>处理前预览（原水印位置）</figcaption>
-          <div id="review-candidate" class="review-img"><div class="placeholder">开始处理后，这里显示修复前预览</div></div>
+          <figcaption><i class="dot dot-candidate"></i><span data-i18n="beforePreview"></span></figcaption>
+          <div id="review-candidate" class="review-img"><div class="placeholder" data-i18n="placeholderBefore"></div></div>
         </figure>
         <figure class="review-box">
-          <figcaption><i class="dot dot-final"></i>处理后预览</figcaption>
-          <div id="review-final" class="review-img"><div class="placeholder">开始处理后，这里显示修复后预览</div></div>
+          <figcaption><i class="dot dot-final"></i><span data-i18n="afterPreview"></span></figcaption>
+          <div id="review-final" class="review-img"><div class="placeholder" data-i18n="placeholderAfter"></div></div>
         </figure>
       </div>
       <details id="log-box" class="log-box">
         <summary>
-          <span>运行日志</span>
-          <button id="btn-clear-log" class="btn small ghost" type="button">清空</button>
+          <span data-i18n="logTitle"></span>
+          <button id="btn-clear-log" class="btn small ghost" type="button" data-i18n="clearLog"></button>
         </summary>
         <pre id="log" class="log"></pre>
       </details>
@@ -119,14 +120,14 @@
 
   <div id="disclaimer-overlay" class="mask-overlay" hidden>
     <div class="mask-dialog disclaimer-dialog">
-      <h3>使用须知</h3>
+      <h3 data-i18n="disclaimerTitle"></h3>
       <div class="disclaimer-body">
-        <p><b>请仅处理你拥有版权或已获授权的图片。</b>去除他人作品上的水印可能构成侵权，由此产生的法律责任由使用者自行承担。</p>
-        <p><b>隐私说明：</b>所有图片处理均在本机完成，图片与数据不会上传到任何服务器；应用仅联网下载修复模型与检查新版本。</p>
+        <p data-i18n-html="disclaimerBody1"></p>
+        <p data-i18n-html="disclaimerBody2"></p>
       </div>
       <div class="mask-foot">
-        <span class="muted">同意后方可使用</span>
-        <button id="btn-disclaimer-ok" class="btn primary small" type="button">我已阅读并同意</button>
+        <span class="muted" data-i18n="disclaimerOnly"></span>
+        <button id="btn-disclaimer-ok" class="btn primary small" type="button" data-i18n="disclaimerAgree"></button>
       </div>
     </div>
   </div>
@@ -134,18 +135,18 @@
   <div id="mask-overlay" class="mask-overlay" hidden>
     <div class="mask-dialog">
       <div class="mask-head">
-        <span>拖拽框选水印区域（以第一张选中图为例，框会按右下角偏移应用到所有选中图）</span>
-        <button id="btn-mask-cancel" class="btn small ghost" type="button">取消</button>
+        <span data-i18n="maskHead"></span>
+        <button id="btn-mask-cancel" class="btn small ghost" type="button" data-i18n="maskCancel"></button>
       </div>
       <div id="mask-canvas-wrap" class="mask-canvas-wrap">
         <img id="mask-img" src="" alt="框选参考图" draggable="false" />
         <div id="mask-rect" class="mask-rect" hidden></div>
       </div>
       <div class="mask-foot">
-        <span id="mask-hint" class="muted">按住鼠标拖出一个矩形，覆盖住水印文字即可</span>
+        <span id="mask-hint" class="muted" data-i18n="maskHint"></span>
         <div>
-          <button id="btn-mask-reset" class="btn small ghost" type="button" disabled>重画</button>
-          <button id="btn-mask-ok" class="btn primary small" type="button" disabled>确认框选</button>
+          <button id="btn-mask-reset" class="btn small ghost" type="button" disabled data-i18n="maskReset"></button>
+          <button id="btn-mask-ok" class="btn primary small" type="button" disabled data-i18n="maskOk"></button>
         </div>
       </div>
     </div>
@@ -156,6 +157,7 @@
   </div>
 
   <script src="mock.js"></script>
+  <script src="i18n.js"></script>
   <script src="main.js"></script>
 </body>
 </html>
