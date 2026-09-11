@@ -226,7 +226,7 @@ body {
 .checkbox { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
 #btn-run { margin-left: auto; }
 
-.right-panel { gap: 8px; }
+.right-panel { gap: 8px; overflow-y: auto; min-height: 0; }
 
 .review-grid {
   display: grid;
@@ -259,7 +259,7 @@ body {
 .dot-candidate { background: #f59e0b; }
 .dot-final { background: var(--ok); }
 .review-img { min-height: 150px; display: grid; place-items: center; padding: 6px; }
-.review-img img { max-width: 100%; border-radius: 4px; }
+.review-img img { max-width: 100%; max-height: 38vh; object-fit: contain; border-radius: 4px; }
 
 .log-box { margin-top: 10px; }
 .log-box summary {
@@ -307,7 +307,7 @@ body {
   white-space: pre-wrap;
   word-break: break-all;
   min-height: 120px;
-  max-height: 40vh;
+  max-height: 32vh;
 }
 
 /* ===== 移动端（Android/iOS WebView）：状态驱动单任务流 ===== */
