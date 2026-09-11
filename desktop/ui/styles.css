@@ -672,6 +672,45 @@ body.mobile .log {
   margin-bottom: 6px;
 }
 #mask-status.manual { color: #b45309; font-weight: 500; }
+.output-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+.output-label { font-size: 12px; color: var(--muted); }
+.radio { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.run-buttons { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.run-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+.run-progress[hidden] { display: none; }
+.run-progress-track {
+  flex: 1;
+  height: 8px;
+  background: #e9ebf3;
+  border-radius: 999px;
+  overflow: hidden;
+}
+.run-progress-bar {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, #4f46e5, #8b5cf6);
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+.result-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
 .mask-overlay {
   position: fixed;
   inset: 0;
@@ -731,3 +770,24 @@ body.mobile .log {
   gap: 12px;
   flex-wrap: wrap;
 }
+
+/* 使用须知弹窗 */
+.disclaimer-dialog { max-width: 460px; }
+.disclaimer-dialog h3 { margin: 2px 0 8px; font-size: 16px; }
+.disclaimer-body { font-size: 13px; line-height: 1.7; color: var(--text); }
+.disclaimer-body p { margin: 0 0 8px; }
+
+/* 模型下载引导 */
+.setup-hint {
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--muted);
+  background: #f7f8fa;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+}
+.setup-hint p { margin: 0 0 2px; font-weight: 500; color: var(--text); }
+.setup-hint ul { margin: 0; padding-left: 18px; }
+.setup-hint[hidden] { display: none; }

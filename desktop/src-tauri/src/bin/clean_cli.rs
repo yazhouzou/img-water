@@ -19,6 +19,7 @@ fn main() {
     let mut root: Option<String> = None;
     let mut mask_box: Option<MaskBox> = None;
     let mut keep_work = false;
+    let mut overwrite = false;
     let mut model: Option<String> = None;
     let mut command: Option<String> = None;
     let mut files: Vec<String> = Vec::new();
@@ -32,9 +33,11 @@ fn main() {
                 exit(1);
             })),
             "--keep-work" => keep_work = true,
+            "--overwrite" | "--in-place" => overwrite = true,
             "--model" => model = args.next(),
             "-h" | "--help" => {
-                println!("usage: clean-cli [--root <dir>] [--mask-box x1,y1,x2,y2] [--keep-work] [--model <onnx>] <run|prepare|inpaint|review-lama|overwrite-review|cleanup> [files...]");
+                println!("usage: clean-cli [--root <dir>] [--mask-box x1,y1,x2,y2] [--keep-work] [--overwrite] [--model <onnx>] <run|prepare|inpaint|review-lama|overwrite-review|cleanup> [files...]");
+                println!("默认结果另存到 <root>/watermark-cleaned/；--overwrite 直接覆盖原图（自动备份 original-watermark-backup/）");
                 return;
             }
             other => {
@@ -66,30 +69,34 @@ fn main() {
         files,
         keep_work,
         mask_box,
+        overwrite_original: overwrite,
     };
 
     let log = |line: &str| println!("{}", line);
+    let no_progress = |_: &str, _: usize, _: usize, _: &str| {};
+    let not_cancelled = || false;
     let result = match command.as_str() {
-        "run" => pipeline::run(&options, &model_path, &log).map(|summary| {
+        "run" => pipeline::run(&options, &model_path, &log, &no_progress, &not_cancelled).map(|summary| {
             println!(
-                "source review: {}\ncandidate review: {}\nfinal review: {}",
+                "source review: {}\ncandidate review: {}\nfinal review: {}\noutput dir: {}",
                 summary.source_review.display(),
                 summary.candidate_review.display(),
-                summary.final_review.display()
+                summary.final_review.display(),
+                summary.output_dir.display()
             );
         }),
         "prepare" => {
             let names = pipeline::target_names(&options.root, &options.files).unwrap_or_else(|e| exit_with(&e));
             pipeline::prepare(&options, &names, &log)
         }
-        "inpaint" => pipeline::inpaint(&model_path, &log),
+        "inpaint" => pipeline::inpaint(&model_path, &log, &no_progress, &not_cancelled),
         "review-lama" => {
             let names = pipeline::target_names(&options.root, &options.files).unwrap_or_else(|e| exit_with(&e));
             pipeline::review_lama(&names).map(|_| ())
         }
         "overwrite-review" => {
             let names = pipeline::target_names(&options.root, &options.files).unwrap_or_else(|e| exit_with(&e));
-            pipeline::overwrite_review(&options, &names).map(|_| ())
+            pipeline::finalize_outputs(&options, &names, &log).map(|_| ())
         }
         "cleanup" => {
             let names = pipeline::target_names(&options.root, &options.files).unwrap_or_else(|e| exit_with(&e));

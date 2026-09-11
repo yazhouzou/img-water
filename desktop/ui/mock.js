@@ -27,11 +27,23 @@
       'candidate review: /tmp/mock/candidate.png',
       'final review: /tmp/mock/final.png',
     ];
-    for (const line of lines) {
+    for (let i = 0; i < FAKE_PNGS.length; i++) {
       await sleep(600);
+      emit('pipeline-progress', { stage: 'inpaint', done: i, total: FAKE_PNGS.length, name: FAKE_PNGS[i] });
+      emit('pipeline-log', 'inpainting ' + FAKE_PNGS[i] + '... (mock)');
+      emit('pipeline-progress', { stage: 'inpaint', done: i + 1, total: FAKE_PNGS.length, name: FAKE_PNGS[i] });
+    }
+    for (const line of lines) {
+      await sleep(300);
       emit('pipeline-log', line);
     }
-    emit('pipeline-exit', { code: 0, success: true });
+    emit('pipeline-exit', {
+      code: 0,
+      success: true,
+      processed: FAKE_PNGS.length,
+      overwritten: false,
+      outputDir: '/mock/Pictures/watermark/watermark-cleaned',
+    });
   }
 
   async function fakeSetup() {
@@ -66,6 +78,11 @@
         return Promise.resolve();
       case 'cleanup_pipeline':
         return Promise.resolve();
+      case 'cancel_pipeline':
+        return Promise.resolve();
+      case 'open_path':
+        console.log('[mock] open_path:', arguments[1] && arguments[1].path);
+        return Promise.resolve();
       default:
         return Promise.reject('mock 未实现命令: ' + cmd);
     }
@@ -84,6 +101,8 @@
         if (opts && opts.directory) return '/mock/Pictures/watermark';
         return ['/mock/import/a.png', '/mock/import/b.png'];
       },
+      confirm: async () => true,
+      message: async () => {},
     },
   };
 

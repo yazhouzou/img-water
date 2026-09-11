@@ -10,12 +10,14 @@ use tauri::{AppHandle, Emitter, Manager, State};
 const EVENT_LOG: &str = "pipeline-log";
 const EVENT_EXIT: &str = "pipeline-exit";
 const EVENT_MODEL_PROGRESS: &str = "model-progress";
+const EVENT_PROGRESS: &str = "pipeline-progress";
 
 #[derive(Default)]
 struct AppStorage {
     target_root: std::sync::Mutex<Option<PathBuf>>,
     last_files: std::sync::Mutex<Vec<String>>,
     running: AtomicBool,
+    cancel: AtomicBool,
 }
 
 fn finish(app: &AppHandle, payload: serde_json::Value) {
@@ -125,15 +127,19 @@ fn list_pngs(root: String) -> Result<Vec<String>, String> {
         .filter(|path| {
             path.is_file()
                 && path
-                    .extension()
-                    .map(|ext| ext.eq_ignore_ascii_case("png"))
+                    .file_name()
+                    .map(|name| pipeline::is_supported_image(&name.to_string_lossy()))
                     .unwrap_or(false)
         })
         .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
         .collect();
     names.sort_by(|a, b| {
         let key = |name: &str| -> (u8, String, u64) {
-            match name.strip_suffix(".png").unwrap_or(name).parse::<u64>() {
+            let stem = name
+                .rsplit_once('.')
+                .map(|(s, _)| s)
+                .unwrap_or(name);
+            match stem.parse::<u64>() {
                 Ok(number) => (0, String::new(), number),
                 Err(_) => (1, name.to_string(), 0),
             }
@@ -152,6 +158,7 @@ fn run_pipeline(
     root: String,
     files: Vec<String>,
     keep_work: bool,
+    overwrite_original: bool,
     mask_box: Option<Vec<i64>>,
 ) -> Result<(), String> {
     if storage.running.swap(true, Ordering::SeqCst) {
@@ -162,6 +169,7 @@ fn run_pipeline(
         storage.running.store(false, Ordering::SeqCst);
         return Err("修复模型未下载，请先点击“一键下载修复模型”".into());
     }
+    storage.cancel.store(false, Ordering::SeqCst);
 
     {
         let mut last = storage.last_files.lock().map_err(|e| e.to_string())?;
@@ -188,11 +196,26 @@ fn run_pipeline(
             files,
             keep_work,
             mask_box: mask,
+            overwrite_original,
         };
         let log = |line: &str| {
             let _ = app_handle.emit(EVENT_LOG, line);
         };
-        let result = pipeline::run(&options, &model_path, &log);
+        let progress_app = app_handle.clone();
+        let progress = move |stage: &str, done: usize, total: usize, name: &str| {
+            let _ = progress_app.emit(
+                EVENT_PROGRESS,
+                serde_json::json!({ "stage": stage, "done": done, "total": total, "name": name }),
+            );
+        };
+        let cancel_flag = app_handle.clone();
+        let is_cancelled = move || {
+            cancel_flag
+                .try_state::<AppStorage>()
+                .map(|s| s.cancel.load(Ordering::SeqCst))
+                .unwrap_or(false)
+        };
+        let result = pipeline::run(&options, &model_path, &log, &progress, &is_cancelled);
         match result {
             Ok(summary) => {
                 let _ = app_handle.emit(
@@ -203,7 +226,23 @@ fn run_pipeline(
                         summary.final_review.display()
                     ),
                 );
-                finish(&app_handle, serde_json::json!({ "code": 0, "success": true }));
+                finish(
+                    &app_handle,
+                    serde_json::json!({
+                        "code": 0,
+                        "success": true,
+                        "outputDir": summary.output_dir.display().to_string(),
+                        "processed": summary.processed,
+                        "overwritten": options.overwrite_original,
+                    }),
+                );
+            }
+            Err(err) if err == pipeline::CANCELLED => {
+                let _ = app_handle.emit(EVENT_LOG, "[取消] 任务已取消，已处理的图片保持有效");
+                finish(
+                    &app_handle,
+                    serde_json::json!({ "code": 2, "success": false, "cancelled": true }),
+                );
             }
             Err(err) => {
                 let _ = app_handle.emit(EVENT_LOG, format!("[错误] {}", err));
@@ -214,6 +253,28 @@ fn run_pipeline(
             }
         }
     });
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_pipeline(storage: State<'_, AppStorage>) -> Result<(), String> {
+    storage.cancel.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// 用系统文件管理器打开目录（结果文件夹）。
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let program = "xdg-open";
+    std::process::Command::new(program)
+        .arg(&path)
+        .spawn()
+        .map_err(|e| format!("打开失败: {}", e))?;
     Ok(())
 }
 
@@ -234,6 +295,7 @@ fn cleanup_pipeline(storage: State<'_, AppStorage>) -> Result<(), String> {
         files,
         keep_work: false,
         mask_box: None,
+        overwrite_original: true,
     };
     let names = pipeline::target_names(&options.root, &options.files)?;
     pipeline::cleanup(&options, &names)?;
@@ -314,11 +376,11 @@ fn read_image_base64(path: String) -> Result<String, String> {
         return Err(format!("文件不存在: {}", path));
     }
     if file
-        .extension()
-        .map(|ext| !ext.eq_ignore_ascii_case("png"))
+        .file_name()
+        .map(|name| !pipeline::is_supported_image(&name.to_string_lossy()))
         .unwrap_or(true)
     {
-        return Err("只支持预览 PNG 图片".into());
+        return Err("只支持预览 png/jpg/webp 图片".into());
     }
     let bytes = std::fs::read(&file).map_err(|e| e.to_string())?;
     if bytes.len() > 10 * 1024 * 1024 {
@@ -354,6 +416,8 @@ pub fn run_tauri_app() {
             list_pngs,
             import_files,
             run_pipeline,
+            cancel_pipeline,
+            open_path,
             cleanup_pipeline,
             read_image_base64
         ])

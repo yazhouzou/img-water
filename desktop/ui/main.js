@@ -1,6 +1,6 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
-const { open, message } = window.__TAURI__.dialog;
+const { open, message, confirm } = window.__TAURI__.dialog;
 
 const els = {
   envBadge: document.getElementById('env-badge'),
@@ -35,6 +35,17 @@ const els = {
   btnMaskCancel: document.getElementById('btn-mask-cancel'),
   btnMaskReset: document.getElementById('btn-mask-reset'),
   btnMaskOk: document.getElementById('btn-mask-ok'),
+  btnCancel: document.getElementById('btn-cancel'),
+  runProgress: document.getElementById('run-progress'),
+  runProgressBar: document.getElementById('run-progress-bar'),
+  runProgressText: document.getElementById('run-progress-text'),
+  outputRow: document.getElementById('output-row'),
+  disclaimerOverlay: document.getElementById('disclaimer-overlay'),
+  btnDisclaimerOk: document.getElementById('btn-disclaimer-ok'),
+  setupHint: document.getElementById('setup-hint'),
+  setupHintPath: document.getElementById('setup-hint-path'),
+  setupHintWifi: document.getElementById('setup-hint-wifi'),
+  btnSetupInline: document.getElementById('btn-setup-inline'),
 };
 
 let targetRoot = null;
@@ -56,11 +67,31 @@ function setState(state) {
 function setRunning(value) {
   running = value;
   els.btnRun.disabled = value || !targetRoot;
-  els.btnRun.textContent = value ? '处理中…' : '开始处理';
+  els.btnRun.hidden = value;
+  els.btnCancel.hidden = !value;
   els.btnPick.disabled = value;
   els.btnCleanup.disabled = value || !targetRoot;
   els.btnSetup.disabled = value;
   els.btnMask.disabled = value || !targetRoot;
+  els.runProgress.hidden = !value;
+  if (!value) {
+    els.runProgressBar.style.width = '0%';
+    els.runProgressText.textContent = '';
+  }
+}
+
+function overwriteMode() {
+  const checked = els.outputRow.querySelector('input[name=output-mode]:checked');
+  return checked && checked.value === 'overwrite';
+}
+
+const STAGE_LABEL = { prepare: '分析水印', inpaint: '修复中', save: '保存结果' };
+
+function setRunProgress(stage, done, total, name) {
+  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+  els.runProgressBar.style.width = pct + '%';
+  const stageText = STAGE_LABEL[stage] || stage;
+  els.runProgressText.textContent = `${stageText} ${done}/${total}：${name}`;
 }
 
 function logLine(text) {
@@ -109,8 +140,14 @@ async function refreshEnv() {
     els.envBadge.textContent = status.ready ? '修复环境就绪' : '修复环境未就绪';
     els.envBadge.className = 'badge ' + (status.ready ? 'ok' : 'bad');
     els.envBadge.hidden = isMobile && status.ready;
+    els.setupHint.hidden = status.ready;
     els.btnSetup.hidden = status.ready;
-    if (!status.ready) logLine('[环境] ' + status.hint);
+    els.btnSetupInline.hidden = status.ready;
+    if (!status.ready) {
+      els.setupHintPath.textContent = '保存位置：' + status.model_path;
+      els.setupHintWifi.hidden = !isMobile;
+      logLine('[环境] ' + status.hint);
+    }
     return status.ready;
   } catch (err) {
     els.envBadge.textContent = '环境检查失败';
@@ -334,9 +371,27 @@ function handleExit(payload) {
   if (!payload.success) els.logBox.open = true;
   els.resultBanner.hidden = false;
   els.resultBanner.className = 'result-banner ' + (payload.success ? 'ok' : 'err');
-  els.resultBanner.textContent = payload.success
-    ? `处理完成，${lastRunCount} 张图片已覆盖保存`
-    : `处理失败：${payload.error || '退出码 ' + payload.code}`;
+  if (payload.success) {
+    const where = payload.overwritten ? '原图已覆盖（备份已清理）' : `已另存到 ${payload.outputDir || 'watermark-cleaned/'}`;
+    els.resultBanner.innerHTML = '';
+    const text = document.createElement('span');
+    text.textContent = `处理完成，${lastRunCount} 张图片，${where}`;
+    els.resultBanner.appendChild(text);
+    if (!isMobile && payload.outputDir) {
+      const btn = document.createElement('button');
+      btn.className = 'btn small';
+      btn.type = 'button';
+      btn.textContent = '打开文件夹';
+      btn.addEventListener('click', () => {
+        invoke('open_path', { path: payload.outputDir }).catch((err) => logLine('[错误] ' + String(err)));
+      });
+      els.resultBanner.appendChild(btn);
+    }
+  } else if (payload.cancelled) {
+    els.resultBanner.textContent = '已取消：已处理的图片保持有效';
+  } else {
+    els.resultBanner.textContent = `处理失败：${payload.error || '退出码 ' + payload.code}`;
+  }
   setState('done');
   const logText = els.log.textContent;
   const lastMatch = (re) => [...logText.matchAll(re)].pop();
@@ -350,9 +405,24 @@ function handleExit(payload) {
 async function init() {
   const ready = await refreshEnv();
 
+  els.btnDisclaimerOk.addEventListener('click', () => {
+    localStorage.setItem('wm-disclaimer-ok', '1');
+    els.disclaimerOverlay.hidden = true;
+  });
+  if (!localStorage.getItem('wm-disclaimer-ok')) {
+    els.disclaimerOverlay.hidden = false;
+  }
+  els.btnSetupInline.addEventListener('click', () => {
+    if (!running) startModelDownload(false);
+  });
+
   listen('pipeline-log', (event) => logLine(event.payload));
   listen('pipeline-exit', (event) => handleExit(event.payload));
   listen('model-progress', (event) => setModelProgress(event.payload.done, event.payload.total));
+  listen('pipeline-progress', (event) => {
+    const p = event.payload;
+    setRunProgress(p.stage, p.done, p.total, p.name);
+  });
 
   if (isMobile) {
     els.btnPick.textContent = '选择图片';
@@ -470,16 +540,25 @@ async function init() {
   els.btnRun.addEventListener('click', async () => {
     const files = selectedFiles();
     if (files.length === 0 || running) return;
+    const overwrite = overwriteMode();
+    if (overwrite) {
+      const ok = await confirm(
+        `将直接覆盖选中的 ${files.length} 张原图（自动备份到 original-watermark-backup/，可用"清理本轮产物"还原删除）。确定继续吗？`,
+        { title: '覆盖原图确认', kind: 'warning' }
+      ).catch(() => false);
+      if (!ok) return;
+    }
     lastRunCount = files.length;
     setRunning(true);
     setState('running');
     resetReviews();
-    logLine(`[开始] 处理 ${files.length} 张图片…`);
+    logLine(`[开始] 处理 ${files.length} 张图片（${overwrite ? '覆盖原图' : '另存到 watermark-cleaned/'}）…`);
     try {
       await invoke('run_pipeline', {
         root: targetRoot,
         files,
         keepWork: els.keepWork.checked,
+        overwriteOriginal: overwrite,
         maskBox: manualMask
           ? [manualMask.dx1, manualMask.dy1, manualMask.dx2, manualMask.dy2]
           : null,
@@ -487,6 +566,18 @@ async function init() {
     } catch (err) {
       logLine('[错误] ' + String(err));
       setRunning(false);
+    }
+  });
+
+  els.btnCancel.addEventListener('click', async () => {
+    els.btnCancel.disabled = true;
+    logLine('[取消] 正在取消，当前图片完成后停止…');
+    try {
+      await invoke('cancel_pipeline');
+    } catch (err) {
+      logLine('[取消失败] ' + String(err));
+    } finally {
+      els.btnCancel.disabled = false;
     }
   });
 

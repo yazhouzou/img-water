@@ -76,6 +76,18 @@ jobs:
       - name: Build app
         working-directory: desktop
         shell: bash
+        env:
+          # macOS 签名+公证接入点：在仓库 Secrets 配置以下项即自动启用（全部可选）。
+          # APPLE_CERTIFICATE: base64 编码的 .p12 开发者证书
+          # APPLE_CERTIFICATE_PASSWORD: .p12 密码
+          # APPLE_SIGNING_IDENTITY: "Developer ID Application: ..."
+          # APPLE_ID / APPLE_PASSWORD(app-specific) / APPLE_TEAM_ID: 公证账号
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -o pipefail
           pnpm tauri build --target ${{ matrix.target }} 2>&1 | tee build.log
@@ -91,14 +103,14 @@ jobs:
         if: runner.os == 'macOS'
         uses: actions/upload-artifact@v4
         with:
-          name: doubao-watermark-remover-${{ matrix.target }}
+          name: watermark-cleaner-${{ matrix.target }}
           path: desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
 
       - name: Upload Windows installer
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: doubao-watermark-remover-${{ matrix.target }}
+          name: watermark-cleaner-${{ matrix.target }}
           path: desktop/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
 
   release:

@@ -1,4 +1,4 @@
 <resources>
-    <string name="app_name">"doubao-watermark-remover"</string>
-    <string name="main_activity_title">"doubao-watermark-remover"</string>
+    <string name="app_name">"图片水印清理助手"</string>
+    <string name="main_activity_title">"图片水印清理助手"</string>
 </resources>

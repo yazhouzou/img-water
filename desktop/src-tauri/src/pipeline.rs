@@ -25,6 +25,40 @@ pub struct PipelineOptions {
     pub files: Vec<String>,
     pub keep_work: bool,
     pub mask_box: Option<MaskBox>,
+    /// false（默认）：结果另存到 root/watermark-cleaned/，原图不动；
+    /// true：直接覆盖原图（旧模式，需备份 + 用户显式确认）。
+    pub overwrite_original: bool,
+}
+
+pub const SUPPORTED_EXTS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
+
+pub fn is_supported_image(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    SUPPORTED_EXTS.iter().any(|ext| lower.rsplit('.').next() == Some(*ext) && lower.contains('.'))
+}
+
+fn image_format_for(name: &str) -> image::ImageFormat {
+    let lower = name.to_lowercase();
+    if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        image::ImageFormat::Jpeg
+    } else if lower.ends_with(".webp") {
+        image::ImageFormat::WebP
+    } else {
+        image::ImageFormat::Png
+    }
+}
+
+/// 按原文件格式保存结果（JPEG 质量 92，其余走默认编码器）。
+fn save_result(image: DynamicImage, path: &Path) -> Result<(), String> {
+    let format = image_format_for(path.file_name().unwrap_or_default().to_string_lossy().as_ref());
+    if format == image::ImageFormat::Jpeg {
+        let rgb = image.to_rgb8();
+        let file = fs::File::create(path).map_err(|e| e.to_string())?;
+        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 92);
+        rgb.write_with_encoder(encoder).map_err(|e| e.to_string())
+    } else {
+        image.save_with_format(path, format).map_err(|e| e.to_string())
+    }
 }
 
 pub fn default_mask_box(width: u32, height: u32) -> (i64, i64, i64, i64) {
@@ -350,7 +384,13 @@ fn dilate_rect_9x3_twice(grid: &[bool], rw: usize, rh: usize) -> Vec<bool> {
 
 fn numeric_key(name: &str) -> (u8, u64, String) {
     let lower = name.to_lowercase();
-    let stem = lower.strip_suffix(".png").unwrap_or(&lower);
+    let stem = SUPPORTED_EXTS
+        .iter()
+        .find_map(|ext| {
+            let dot = format!(".{}", ext);
+            lower.strip_suffix(&dot)
+        })
+        .unwrap_or(&lower);
     match stem.parse::<u64>() {
         Ok(number) => (0, number, String::new()),
         Err(_) => (1, 0, name.to_string()),
@@ -363,14 +403,18 @@ pub fn target_names(root: &Path, files: &[String]) -> Result<Vec<String>, String
             .map_err(|e| e.to_string())?
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.file_name().to_string_lossy().to_string())
-            .filter(|name| name.to_lowercase().ends_with(".png"))
+            .filter(|name| is_supported_image(name))
             .collect();
         entries.sort_by_key(|name| numeric_key(name));
         entries
     } else {
         for name in files {
-            if !name.to_lowercase().ends_with(".png") {
-                return Err(format!("not a png: {}", name));
+            if !is_supported_image(name) {
+                return Err(format!(
+                    "unsupported image: {} (supported: {})",
+                    name,
+                    SUPPORTED_EXTS.join(", ")
+                ));
             }
             if !root.join(name).exists() {
                 return Err(format!("missing file: {}", name));
@@ -380,7 +424,7 @@ pub fn target_names(root: &Path, files: &[String]) -> Result<Vec<String>, String
     };
     if names.is_empty() {
         return Err(format!(
-            "no png files found in: {}\nhint: pass a folder, e.g. clean-cli --root /path/to/images run",
+            "no image files (png/jpg/webp) found in: {}\nhint: pass a folder, e.g. clean-cli --root /path/to/images run",
             root.display()
         ));
     }
@@ -389,6 +433,15 @@ pub fn target_names(root: &Path, files: &[String]) -> Result<Vec<String>, String
 
 fn backup_dir(root: &Path) -> PathBuf {
     root.join("original-watermark-backup")
+}
+
+/// 结果输出目录：覆盖模式就是原图目录，另存模式是 watermark-cleaned/。
+pub fn output_dir(options: &PipelineOptions) -> PathBuf {
+    if options.overwrite_original {
+        options.root.clone()
+    } else {
+        options.root.join("watermark-cleaned")
+    }
 }
 
 fn work_dirs() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
@@ -401,10 +454,14 @@ fn work_dirs() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     )
 }
 
-fn ensure_dirs(root: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), String> {
+fn ensure_dirs(root: &Path, with_backup: bool) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), String> {
     let (source, masks, lama, review) = work_dirs();
-    for path in [&source, &masks, &lama, &review, &backup_dir(root)] {
-        fs::create_dir_all(path).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&source).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&masks).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&lama).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&review).map_err(|e| e.to_string())?;
+    if with_backup {
+        fs::create_dir_all(backup_dir(root)).map_err(|e| e.to_string())?;
     }
     Ok((source, masks, lama, review))
 }
@@ -506,17 +563,28 @@ pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Resu
     if work.exists() {
         fs::remove_dir_all(&work).map_err(|e| e.to_string())?;
     }
-    let (source, masks, _lama, review_dir) = ensure_dirs(&options.root)?;
+    let (source, masks, _lama, review_dir) = ensure_dirs(&options.root, options.overwrite_original)?;
     let backup_root = backup_dir(&options.root);
-    for name in names {
+    for (index, name) in names.iter().enumerate() {
+        log(&format!(
+            "prepare {}/{}: {}",
+            index + 1,
+            names.len(),
+            name
+        ));
         let current = options.root.join(name);
-        let backup = backup_root.join(name);
-        if !backup.exists() {
-            fs::copy(&current, &backup).map_err(|e| e.to_string())?;
-        }
-        fs::copy(&backup, source.join(name)).map_err(|e| e.to_string())?;
+        let origin = if options.overwrite_original {
+            let backup = backup_root.join(name);
+            if !backup.exists() {
+                fs::copy(&current, &backup).map_err(|e| e.to_string())?;
+            }
+            backup
+        } else {
+            current.clone()
+        };
+        fs::copy(&origin, source.join(name)).map_err(|e| e.to_string())?;
 
-        let image = load_image(&backup)?;
+        let image = load_image(&origin)?;
         let (width, height) = (image.width(), image.height());
         let boxes: Vec<(i64, i64, i64, i64)> = match options.mask_box {
             Some(box_) => vec![resolve_box(width, height, Some(box_))?],
@@ -550,26 +618,43 @@ pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Resu
     Ok(())
 }
 
-pub fn inpaint(model_path: &Path, log: Logger) -> Result<(), String> {
+/// 取消标记：返回该错误的 run 会被上层识别为“用户取消”，不算失败。
+pub const CANCELLED: &str = "\u{0}cancelled";
+
+pub type ProgressFn<'a> = &'a dyn Fn(&str, usize, usize, &str);
+
+pub fn inpaint(
+    model_path: &Path,
+    log: Logger,
+    progress: ProgressFn,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<(), String> {
     let (source, masks, lama_dir, _) = work_dirs();
     let mut engine = Lama::load(model_path)?;
-    let entries: Vec<PathBuf> = fs::read_dir(&source)
+    let mut entries: Vec<PathBuf> = fs::read_dir(&source)
         .map_err(|e| e.to_string())?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| path.extension().map(|e| e.eq_ignore_ascii_case("png")).unwrap_or(false))
+        .filter(|path| path.is_file() && is_supported_image(&path.file_name().unwrap_or_default().to_string_lossy()))
         .collect();
+    entries.sort_by_key(|path| numeric_key(&path.file_name().unwrap_or_default().to_string_lossy()));
     if entries.is_empty() {
         return Err("workdir has no prepared source images; run prepare first".into());
     }
-    for path in entries {
+    let total = entries.len();
+    for (index, path) in entries.iter().enumerate() {
+        if is_cancelled() {
+            return Err(CANCELLED.to_string());
+        }
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        let image = load_image(&path)?;
+        let image = load_image(path)?;
         let mask = load_image(&masks.join(&name))?.to_luma8();
         log(&format!("inpainting {}...", name));
+        progress("inpaint", index, total, &name);
         let result = engine.inpaint_image(&image, &mask, log)?;
         save_png(DynamicImage::ImageRgb8(result), &lama_dir.join(&name))?;
         log(&format!("done {}", name));
+        progress("inpaint", index + 1, total, &name);
     }
     Ok(())
 }
@@ -581,14 +666,30 @@ pub fn review_lama(names: &[String]) -> Result<PathBuf, String> {
     Ok(output)
 }
 
-pub fn overwrite_review(options: &PipelineOptions, names: &[String]) -> Result<PathBuf, String> {
+/// 把修复结果按原格式写入输出目录（覆盖模式=原图位置，另存模式=watermark-cleaned/）。
+pub fn finalize_outputs(options: &PipelineOptions, names: &[String], log: Logger) -> Result<PathBuf, String> {
     let (_, _, lama_dir, review_dir) = work_dirs();
-    for name in names {
-        fs::copy(lama_dir.join(name), options.root.join(name)).map_err(|e| e.to_string())?;
+    let dest_dir = output_dir(options);
+    if !options.overwrite_original {
+        fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
     }
-    let output = review(&options.root, &review_dir, "overwritten-corner-review.png", names)?;
+    for name in names {
+        let result = load_image(&lama_dir.join(name))?;
+        save_result(result, &dest_dir.join(name))?;
+    }
+    if options.overwrite_original {
+        log("outputs written in place (originals overwritten)");
+    } else {
+        log(&format!("outputs saved to: {}", dest_dir.display()));
+    }
+    let output = review(&dest_dir, &review_dir, "overwritten-corner-review.png", names)?;
     println!("{}", output.display());
     Ok(output)
+}
+
+/// 兼容旧 CLI 命令名：等价于 finalize_outputs。
+pub fn overwrite_review(options: &PipelineOptions, names: &[String]) -> Result<PathBuf, String> {
+    finalize_outputs(options, names, &|_| {})
 }
 
 pub fn cleanup(options: &PipelineOptions, names: &[String]) -> Result<(), String> {
@@ -623,8 +724,8 @@ pub fn cleanup_preserved() -> Result<(), String> {
 fn preserved_review_dir() -> PathBuf {
     crate::workdir()
         .parent()
-        .map(|parent| parent.join("doubao-watermark-review"))
-        .unwrap_or_else(|| std::env::temp_dir().join("doubao-watermark-review"))
+        .map(|parent| parent.join("watermark-cleaner-review"))
+        .unwrap_or_else(|| std::env::temp_dir().join("watermark-cleaner-review"))
 }
 
 fn preserve_reviews(source: &Path, candidate: &Path, final_: &Path) -> Result<(PathBuf, PathBuf, PathBuf), String> {
@@ -646,23 +747,39 @@ pub struct RunSummary {
     pub candidate_review: PathBuf,
     pub final_review: PathBuf,
     pub kept_work: bool,
+    pub cancelled: bool,
+    pub processed: usize,
+    pub output_dir: PathBuf,
 }
 
-pub fn run(options: &PipelineOptions, model_path: &Path, log: Logger) -> Result<RunSummary, String> {
+pub fn run(
+    options: &PipelineOptions,
+    model_path: &Path,
+    log: Logger,
+    progress: ProgressFn,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Result<RunSummary, String> {
     let names = target_names(&options.root, &options.files)?;
     log(&format!("processing {} file(s)", names.len()));
+    if is_cancelled() {
+        return Err(CANCELLED.to_string());
+    }
     prepare(options, &names, log)?;
     let (_, _, _, review_dir) = work_dirs();
     let source_review = review_dir.join("source-corner-review.png");
-    inpaint(model_path, log)?;
+    inpaint(model_path, log, progress, is_cancelled)?;
     let candidate_review = review_lama(&names)?;
-    let final_review = overwrite_review(options, &names)?;
+    let final_review = finalize_outputs(options, &names, log)?;
+    let output_dir_path = output_dir(options);
     if options.keep_work {
         return Ok(RunSummary {
             source_review,
             candidate_review,
             final_review,
             kept_work: true,
+            cancelled: false,
+            processed: names.len(),
+            output_dir: output_dir_path,
         });
     }
     let (source_review, candidate_review, final_review) =
@@ -678,6 +795,9 @@ pub fn run(options: &PipelineOptions, model_path: &Path, log: Logger) -> Result<
         candidate_review,
         final_review,
         kept_work: false,
+        cancelled: false,
+        processed: names.len(),
+        output_dir: output_dir_path,
     })
 }
 
@@ -834,16 +954,33 @@ mod tests {
     }
 
     #[test]
+    fn output_dir_modes() {
+        let root = temp_root("outdir");
+        let options = PipelineOptions {
+            root: root.clone(),
+            files: vec![],
+            keep_work: false,
+            mask_box: None,
+            overwrite_original: true,
+        };
+        assert_eq!(output_dir(&options), root);
+        let options = PipelineOptions { overwrite_original: false, ..options };
+        assert_eq!(output_dir(&options), root.join("watermark-cleaned"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn target_names_sorted_and_filtered() {
         let root = temp_root("names");
-        for name in ["2.png", "10.png", "1.png", "ignore.jpg", "3.PNG"] {
+        for name in ["2.png", "10.png", "1.png", "ignore.jpg", "3.PNG", "4.webp", "5.jpeg", "skip.gif"] {
             fs::write(root.join(name), b"x").unwrap();
         }
         fs::create_dir_all(root.join("sub")).unwrap();
         let names = target_names(&root, &[]).unwrap();
-        assert_eq!(names, vec!["1.png", "2.png", "3.PNG", "10.png"]);
+        assert_eq!(names, vec!["1.png", "2.png", "3.PNG", "4.webp", "5.jpeg", "10.png", "ignore.jpg"]);
         let picked = target_names(&root, &["3.PNG".to_string()]).unwrap();
         assert_eq!(picked, vec!["3.PNG"]);
+        assert!(target_names(&root, &["skip.gif".to_string()]).is_err());
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -862,7 +999,7 @@ mod tests {
         let (x1, y1, _x2, _y2) = make_watermark_image(&root.join("b.png"), 1024, 1024, "AI");
         let _ = x1;
         let _ = y1;
-        let options = PipelineOptions { root: root.clone(), files: vec!["b.png".to_string()], keep_work: false, mask_box: None };
+        let options = PipelineOptions { root: root.clone(), files: vec!["b.png".to_string()], keep_work: false, mask_box: None, overwrite_original: true };
         let names = target_names(&root, &options.files).unwrap();
         let noop_log: Logger = &|_| {};
         prepare(&options, &names, &noop_log).unwrap();
@@ -924,9 +1061,10 @@ mod tests {
             files: vec!["case.png".to_string()],
             keep_work: false,
             mask_box: Some(MaskBox { x1: x1 - 20, y1: y1 - 20, x2: x2 + 20, y2: y2 + 20 }),
+            overwrite_original: true,
         };
         let log = |_line: &str| {};
-        let summary = run(&options, &model, &log).expect("pipeline run failed");
+        let summary = run(&options, &model, &log, &|_, _, _, _| {}, &|| false).expect("pipeline run failed");
         assert!(summary.final_review.exists());
 
         let white_after = count_white_pixels(&root.join("case.png"), (x1, y1, x2, y2));
