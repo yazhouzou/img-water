@@ -102,7 +102,7 @@ LaMa 模型通常缓存于：
 
 项目提供 Tauri 桌面应用（`desktop/`），内置 Rust + ONNX Runtime 修复内核（v0.2 起，无需 Python）：
 
-- 内核：`desktop/src-tauri/src/lama.rs` 用 `ort` 推理 LaMa ONNX 模型（`.models/lama_fp32.onnx`，约 200MB），固定 512×512 窗口推理后合成回原图；v0.3.9 起支持大遮罩 tile 分块推理：遮罩连通块 ≤496px 走单窗口居中，超过则按 `window_starts()`（step=416、重叠 96px、末窗右对齐）生成窗口网格，每窗口只写回自己负责的 tile 区域，级联用已修复结果作图像源保证接缝连续
+- 内核：`desktop/src-tauri/src/lama.rs` 用 `ort` 推理 LaMa ONNX 模型（`.models/lama_fp32.onnx`，约 200MB）；模型输入固定 [batch,3,512,512]（ONNX 导出时 H/W 静态，实测与 JIT big-lama 输出逐像素一致、无质量阉割；输入 0..1、输出 0..255、mask 二值不敏感）。v0.5.1 起推理策略对齐 iopaint CROP：每个遮罩连通块 crop bbox+128px margin（贴边补偿同 iopaint），crop ≤512 原分辨率 pad 512（居中+反射 pad）推理；更大时等比缩放到 512 推理后 Lanczos 还原写回——大水印整体修复，取代 v0.3.9 的 tile 分块（tile 每块只看半截水印导致接缝与模糊，是"App 端部分图模糊"的根因）；图像源函数内 clone 自当前已修复结果（级联）。
 - 流水线：`desktop/src-tauri/src/pipeline.rs` 是 `tools/remove_doubao_watermark.py` 的 Rust 移植（备份/遮罩/修复/复查/覆盖/清理），桌面端进程内调用；`run` 模式清理前会把两张复查拼图复制到系统临时目录 `doubao-watermark-review/` 再输出路径，避免复查图被清理后失效
 - CLI：`clean-cli`（`cargo build --bin clean-cli`），参数与 Python 脚本一致（`--root`/`--mask-box`/`--keep-work` + `run|prepare|inpaint|review-lama|overwrite-review|cleanup`）
 - 模型下载：启动检测到模型缺失即自动开始下载（多连接分段+分段重试+源回退 hf-mirror→huggingface），顶栏进度条；`LAMA_ONNX_URL` 可覆盖下载源（单一地址），`LAMA_ONNX_PATH` 可覆盖模型位置
