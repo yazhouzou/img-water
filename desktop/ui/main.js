@@ -46,6 +46,10 @@ const els = {
   setupHintPath: document.getElementById('setup-hint-path'),
   setupHintWifi: document.getElementById('setup-hint-wifi'),
   btnSetupInline: document.getElementById('btn-setup-inline'),
+  compareBox: document.getElementById('compare-box'),
+  compareSource: document.getElementById('compare-source'),
+  compareFinal: document.getElementById('compare-final'),
+  compareHandle: document.getElementById('compare-handle'),
 };
 
 let targetRoot = null;
@@ -132,6 +136,28 @@ function escapeHtml(text) {
   return text.replace(/[&<>"']/g, (ch) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   })[ch]);
+}
+
+// 前后对比 slider：左拖右滑看处理前/后差异（两张复查拼图尺寸一致）
+async function setupCompare(sourcePath, finalPath) {
+  try {
+    const [sourceUrl, finalUrl] = await Promise.all([
+      invoke('read_image_base64', { path: sourcePath }),
+      invoke('read_image_base64', { path: finalPath }),
+    ]);
+    els.compareSource.src = sourceUrl;
+    els.compareFinal.src = finalUrl;
+    els.compareBox.hidden = false;
+    setComparePos(50);
+  } catch (_) {
+    els.compareBox.hidden = true;
+  }
+}
+
+function setComparePos(pct) {
+  const pos = Math.max(0, Math.min(100, pct));
+  els.compareSource.style.clipPath = `inset(0 ${100 - pos}% 0 0)`;
+  els.compareHandle.style.left = pos + '%';
 }
 
 async function refreshEnv() {
@@ -399,11 +425,32 @@ function handleExit(payload) {
   const finalMatch = lastMatch(/final review: (.+)/g);
   if (sourceMatch) showReview(els.reviewCandidate, sourceMatch[1].trim());
   if (finalMatch) showReview(els.reviewFinal, finalMatch[1].trim());
+  if (sourceMatch && finalMatch) {
+    setupCompare(sourceMatch[1].trim(), finalMatch[1].trim());
+  }
   refreshEnv();
 }
 
 async function init() {
   const ready = await refreshEnv();
+
+  // 主题：默认跟随系统，手动切换后记忆
+  const btnTheme = document.getElementById('btn-theme');
+  const applyTheme = (mode) => {
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const dark = mode === 'dark' || (mode !== 'light' && prefersDark);
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+    btnTheme.textContent = dark ? '☀️' : '🌙';
+  };
+  const themeMode = () => localStorage.getItem('wm-theme') || 'auto';
+  applyTheme(themeMode());
+  btnTheme.addEventListener('click', () => {
+    const dark = document.documentElement.dataset.theme === 'dark';
+    const next = dark ? 'light' : 'dark';
+    localStorage.setItem('wm-theme', next);
+    applyTheme(next);
+  });
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme(themeMode()));
 
   els.btnDisclaimerOk.addEventListener('click', () => {
     localStorage.setItem('wm-disclaimer-ok', '1');
@@ -415,6 +462,23 @@ async function init() {
   els.btnSetupInline.addEventListener('click', () => {
     if (!running) startModelDownload(false);
   });
+
+  let compareDragging = false;
+  const comparePct = (ev) => {
+    const rect = els.compareBox.getBoundingClientRect();
+    return ((ev.clientX - rect.left) / rect.width) * 100;
+  };
+  els.compareBox.addEventListener('pointerdown', (ev) => {
+    if (els.compareBox.hidden) return;
+    compareDragging = true;
+    els.compareBox.setPointerCapture(ev.pointerId);
+    setComparePos(comparePct(ev));
+  });
+  els.compareBox.addEventListener('pointermove', (ev) => {
+    if (compareDragging) setComparePos(comparePct(ev));
+  });
+  els.compareBox.addEventListener('pointerup', () => { compareDragging = false; });
+  els.compareBox.addEventListener('pointercancel', () => { compareDragging = false; });
 
   listen('pipeline-log', (event) => logLine(event.payload));
   listen('pipeline-exit', (event) => handleExit(event.payload));
@@ -489,31 +553,36 @@ async function init() {
     els.log.textContent = '';
   });
 
+  async function importPaths(paths) {
+    try {
+      const imported = await invoke('import_files', { paths });
+      targetRoot = imported.dir;
+      els.btnRefresh.disabled = false;
+      els.btnCleanup.disabled = running;
+      clearReviews();
+      clearMaskSelection();
+      logLine(`[导入] 已导入 ${paths.length} 个文件`);
+      await refreshFiles();
+    } catch (err) {
+      logLine('[导入失败] ' + String(err));
+      await message(String(err), { title: '导入失败' }).catch(() => {});
+    }
+  }
+
   els.btnPick.addEventListener('click', async () => {
     if (isMobile) {
       const picked = await open({
         multiple: true,
-        filters: [{ name: 'PNG', extensions: ['png'] }],
+        filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
         title: '选择要处理的图片',
       });
       if (!picked) return;
       const paths = Array.isArray(picked) ? picked : [picked];
       if (paths.length === 0) return;
-      try {
-        const imported = await invoke('import_files', { paths });
-        targetRoot = imported.dir;
-        els.btnRefresh.disabled = false;
-        els.btnCleanup.disabled = running;
-        clearReviews();
-        clearMaskSelection();
-        await refreshFiles();
-      } catch (err) {
-        logLine('[导入失败] ' + String(err));
-        await message(String(err), { title: '导入失败' }).catch(() => {});
-      }
+      await importPaths(paths);
       return;
     }
-    const picked = await open({ directory: true, multiple: false, title: '选择包含 PNG 的文件夹' });
+    const picked = await open({ directory: true, multiple: false, title: '选择包含图片的文件夹' });
     if (!picked) return;
     targetRoot = picked;
     els.btnRefresh.disabled = false;
@@ -522,6 +591,21 @@ async function init() {
     clearMaskSelection();
     await refreshFiles();
   });
+
+  // 桌面拖拽导入：把图片文件拖进窗口即导入
+  if (!isMobile && window.__TAURI__.window) {
+    try {
+      const { getCurrentWindow } = window.__TAURI__.window;
+      getCurrentWindow().onDragDropEvent((event) => {
+        if (running) return;
+        const payload = event.payload;
+        if (payload.type === 'drop' && Array.isArray(payload.paths)) {
+          const paths = payload.paths.filter((p) => /\.(png|jpe?g|webp)$/i.test(p));
+          if (paths.length > 0) importPaths(paths);
+        }
+      });
+    } catch (_) { /* 旧版本 API 缺失时忽略 */ }
+  }
 
   els.btnRefresh.addEventListener('click', refreshFiles);
   els.btnSelectAll.addEventListener('click', () => {
@@ -578,6 +662,34 @@ async function init() {
       logLine('[取消失败] ' + String(err));
     } finally {
       els.btnCancel.disabled = false;
+    }
+  });
+
+  const btnCheckUpdate = document.getElementById('btn-check-update');
+  btnCheckUpdate.addEventListener('click', async () => {
+    btnCheckUpdate.disabled = true;
+    btnCheckUpdate.textContent = '检查中…';
+    try {
+      const [current, res] = await Promise.all([
+        invoke('app_version'),
+        fetch('https://api.github.com/repos/yazhouzou/img-water/releases/latest'),
+      ]);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const data = await res.json();
+      const latest = String(data.tag_name || '').replace(/^v/, '');
+      if (latest && latest !== current) {
+        await message(
+          `发现新版本 v${latest}（当前 v${current}）。\n请到 GitHub Releases 页面下载：\nhttps://github.com/yazhouzou/img-water/releases/latest`,
+          { title: '检查更新' }
+        ).catch(() => {});
+      } else {
+        await message(`当前已是最新版本 v${current}`, { title: '检查更新' }).catch(() => {});
+      }
+    } catch (err) {
+      logLine('[更新检查失败] ' + String(err));
+    } finally {
+      btnCheckUpdate.disabled = false;
+      btnCheckUpdate.textContent = '检查更新';
     }
   });
 

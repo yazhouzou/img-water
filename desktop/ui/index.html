@@ -23,6 +23,8 @@
         <span id="model-progress-text" class="model-progress-text"></span>
       </div>
       <button id="btn-setup" class="btn primary small" hidden>一键下载修复模型</button>
+      <button id="btn-check-update" class="btn small ghost">检查更新</button>
+      <button id="btn-theme" class="btn small ghost" title="切换深浅色">🌙</button>
       <div id="env-badge" class="badge">检查环境中…</div>
     </div>
   </header>
@@ -88,6 +90,13 @@
         <h2>处理结果</h2>
       </div>
       <div id="result-banner" class="result-banner" hidden></div>
+      <div id="compare-box" class="compare-box" hidden>
+        <img id="compare-final" class="compare-final" alt="处理后" draggable="false" />
+        <img id="compare-source" class="compare-source" alt="处理前" draggable="false" />
+        <span class="compare-tag compare-tag-l">处理后</span>
+        <span class="compare-tag compare-tag-r">处理前</span>
+        <div id="compare-handle" class="compare-handle"></div>
+      </div>
       <div class="review-grid">
         <figure class="review-box">
           <figcaption><i class="dot dot-candidate"></i>处理前预览（原水印位置）</figcaption>

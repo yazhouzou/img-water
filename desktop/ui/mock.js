@@ -83,6 +83,8 @@
       case 'open_path':
         console.log('[mock] open_path:', arguments[1] && arguments[1].path);
         return Promise.resolve();
+      case 'app_version':
+        return Promise.resolve('0.0.0-mock');
       default:
         return Promise.reject('mock 未实现命令: ' + cmd);
     }
@@ -90,6 +92,9 @@
 
   window.__TAURI__ = {
     core: { invoke },
+    window: {
+      getCurrentWindow: () => ({ onDragDropEvent: async () => {} }),
+    },
     event: {
       listen: (name, cb) => {
         (handlers[name] = handlers[name] || []).push(cb);

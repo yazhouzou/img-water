@@ -262,6 +262,11 @@ fn cancel_pipeline(storage: State<'_, AppStorage>) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 /// 用系统文件管理器打开目录（结果文件夹）。
 #[tauri::command]
 fn open_path(path: String) -> Result<(), String> {
@@ -418,6 +423,7 @@ pub fn run_tauri_app() {
             run_pipeline,
             cancel_pipeline,
             open_path,
+            app_version,
             cleanup_pipeline,
             read_image_base64
         ])

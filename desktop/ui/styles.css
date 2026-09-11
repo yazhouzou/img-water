@@ -14,6 +14,34 @@
   --shadow: 0 1px 3px rgba(16, 24, 40, 0.07), 0 1px 2px rgba(16, 24, 40, 0.04);
 }
 
+/* 深色模式：默认跟随系统，可手动覆盖（html[data-theme]） */
+html[data-theme='dark'] {
+  color-scheme: dark;
+  --bg: #12141a;
+  --panel: #1b1e26;
+  --border: #2c3140;
+  --text: #e6e9f0;
+  --muted: #8a92a3;
+  --primary: #6366f1;
+  --primary-dark: #4f46e5;
+  --primary-soft: #262a3d;
+  --danger: #f87171;
+  --ok: #4ade80;
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+html[data-theme='dark'] .setup-hint,
+html[data-theme='dark'] .folder-path { background: #20242e; }
+html[data-theme='dark'] .run-progress-track,
+html[data-theme='dark'] .model-progress-track { background: #2c3140; }
+html[data-theme='dark'] .btn { background: #232734; }
+html[data-theme='dark'] .btn.primary { background: var(--primary); }
+html[data-theme='dark'] .review-box { background: #20242e; }
+html[data-theme='dark'] .review-box figcaption { background: #232734; }
+html[data-theme='dark'] .badge { background: #232734; }
+html[data-theme='dark'] .badge.ok { background: #13301f; }
+html[data-theme='dark'] .badge.bad { background: #381a1a; }
+html[data-theme='dark'] .file-item.active { background: var(--primary-soft); }
+
 * { box-sizing: border-box; }
 
 body {
@@ -791,3 +819,64 @@ body.mobile .log {
 .setup-hint p { margin: 0 0 2px; font-weight: 500; color: var(--text); }
 .setup-hint ul { margin: 0; padding-left: 18px; }
 .setup-hint[hidden] { display: none; }
+
+/* 前后对比 slider */
+.compare-box {
+  position: relative;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #1e2430;
+  user-select: none;
+  touch-action: none;
+}
+.compare-box[hidden] { display: none; }
+.compare-box img {
+  display: block;
+  width: 100%;
+  height: auto;
+  pointer-events: none;
+}
+.compare-source {
+  position: absolute;
+  inset: 0;
+  clip-path: inset(0 50% 0 0);
+}
+.compare-tag {
+  position: absolute;
+  top: 8px;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(15, 15, 20, 0.65);
+  color: #fff;
+  pointer-events: none;
+}
+.compare-tag-l { left: 8px; }
+.compare-tag-r { right: 8px; }
+.compare-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 3px;
+  margin-left: -1.5px;
+  background: #fff;
+  cursor: ew-resize;
+}
+.compare-handle::after {
+  content: '⇆';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 26px;
+  height: 26px;
+  line-height: 26px;
+  text-align: center;
+  border-radius: 50%;
+  background: #fff;
+  color: #333;
+  font-size: 13px;
+  box-shadow: 0 1px 6px rgba(0,0,0,0.4);
+}
