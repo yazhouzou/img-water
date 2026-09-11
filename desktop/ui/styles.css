@@ -41,6 +41,10 @@ html[data-theme='dark'] .badge { background: #232734; }
 html[data-theme='dark'] .badge.ok { background: #13301f; }
 html[data-theme='dark'] .badge.bad { background: #381a1a; }
 html[data-theme='dark'] .file-item.active { background: var(--primary-soft); }
+html[data-theme='dark'] .btn { background: #232734; }
+html[data-theme='dark'] body.mobile #btn-refresh,
+html[data-theme='dark'] #btn-refresh { background: #232734; }
+html[data-theme='dark'] .dot { background: #3a4050; }
 
 * { box-sizing: border-box; }
 
@@ -751,7 +755,7 @@ body.mobile .log {
 }
 .mask-overlay[hidden] { display: none; }
 .mask-dialog {
-  background: var(--panel-bg, #fff);
+  background: var(--panel);
   border-radius: 12px;
   padding: 14px 16px;
   max-width: min(1100px, 94vw);

@@ -4,7 +4,6 @@ use image::DynamicImage;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 
 const WINDOW: u32 = 512;
-const MAX_BBOX: u32 = 496;
 
 pub struct Lama {
     session: Session,
@@ -64,19 +63,6 @@ fn mask_components(mask: &image::GrayImage) -> Vec<BBox> {
         }
     }
     boxes
-}
-
-fn reflect_pad_rgb(img: &image::RgbImage, win: u32, ox: i64, oy: i64) -> image::RgbImage {
-    let (w, h) = (img.width() as i64, img.height() as i64);
-    let mut out = image::RgbImage::new(win, win);
-    for y in 0..win as i64 {
-        for x in 0..win as i64 {
-            let sx = reflect_coord(x + ox, w);
-            let sy = reflect_coord(y + oy, h);
-            out.put_pixel(x as u32, y as u32, img.get_pixel(sx as u32, sy as u32).clone());
-        }
-    }
-    out
 }
 
 fn reflect_coord(mut v: i64, size: i64) -> i64 {
@@ -165,7 +151,12 @@ fn infer_crop(
         crop_img
     };
     let mask_for_infer = if scale < 1.0 {
-        image::imageops::resize(&crop_mask, rw, rh, image::imageops::FilterType::Nearest)
+        let soft = image::imageops::resize(&crop_mask, rw, rh, image::imageops::FilterType::Lanczos3);
+        let mut bin = soft.clone();
+        for p in bin.pixels_mut() {
+            p.0[0] = if p.0[0] > 64 { 255 } else { 0 };
+        }
+        bin
     } else {
         crop_mask.clone()
     };
@@ -273,9 +264,6 @@ pub fn inpaint_image(
     let (width, height) = (image.width(), image.height());
     if width != mask.width() || height != mask.height() {
         return Err("image and mask size mismatch".into());
-    }
-    if width < WINDOW || height < WINDOW {
-        return Err(format!("image {}x{} smaller than {}px window", width, height, WINDOW));
     }
     let components = mask_components(mask);
     if components.is_empty() {

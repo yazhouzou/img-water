@@ -54,6 +54,15 @@ LaMa 模型通常缓存于：
 ./tools/remove_doubao_watermark.py run [可选文件列表]
 ```
 
+**双端一致性回归测试**（防 App 内核细节 bug 依赖人工排查）：`tools/compare_pipelines.py` 生成多场景合成图（小水印/828 大水印/贴边/400 小图/多位置），同一遮罩框分别跑终端 iopaint 与 clean-cli，量化对比修复区 MAD。改 lama.rs / pipeline.rs 推理链路后必须跑：
+
+```bash
+cd desktop/src-tauri && cargo build --release --bin clean-cli
+.img-inpaint-venv/bin/python tools/compare_pipelines.py
+```
+
+无缩放场景阈值 MAD<8（双端同为原分辨率推理应高度一致），缩放场景 <25（App 侧 resize 策略差异，视觉等价）；未处理区 PSNR>100dB。历史排查结论：ONNX 与 JIT 模型逐像素一致（输入 0..1/输出 0..255/mask 二值不敏感），差异只可能出在工程链路。
+
 首次使用或环境损坏时先运行：
 
 ```bash

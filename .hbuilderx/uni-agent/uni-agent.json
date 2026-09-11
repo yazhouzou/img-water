@@ -4,7 +4,8 @@
       "/tmp/*": "allow",
       "/Users/yazhouzou/.ssh/*": "allow",
       "/Users/yazhouzou/ai/*": "allow",
-      "/Users/yazhouzou/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tauri-plugin-dialog-2.7.3/android/src/main/java/*": "allow"
+      "/Users/yazhouzou/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tauri-plugin-dialog-2.7.3/android/src/main/java/*": "allow",
+      "/Users/yazhouzou/Library/Application Support/HBuilderX/extensions/hbuilderx-ai-chat/uni-agent/temp-images/*": "allow"
     }
   }
 }
