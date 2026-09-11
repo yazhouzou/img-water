@@ -111,7 +111,7 @@ cd desktop/src-tauri && cargo build --release --bin clean-cli
 
 项目提供 Tauri 桌面应用（`desktop/`），内置 Rust + ONNX Runtime 修复内核（v0.2 起，无需 Python）：
 
-- 内核：`desktop/src-tauri/src/lama.rs` 用 `ort` 推理 LaMa ONNX 模型（`.models/lama_fp32.onnx`，约 200MB）；模型输入固定 [batch,3,512,512]（ONNX 导出时 H/W 静态，实测与 JIT big-lama 输出逐像素一致、无质量阉割；输入 0..1、输出 0..255、mask 二值不敏感）。v0.5.1 起推理策略对齐 iopaint CROP：每个遮罩连通块 crop bbox+128px margin（贴边补偿同 iopaint），crop ≤512 原分辨率 pad 512（居中+反射 pad）推理；更大时等比缩放到 512 推理后 Lanczos 还原写回——大水印整体修复，取代 v0.3.9 的 tile 分块（tile 每块只看半截水印导致接缝与模糊，是"App 端部分图模糊"的根因）；图像源函数内 clone 自当前已修复结果（级联）。
+- 内核：`desktop/src-tauri/src/lama.rs` 用 `ort` 推理 LaMa ONNX 模型（`.models/lama_fp32.onnx`，约 200MB）；模型输入固定 [batch,3,512,512]（ONNX 导出时 H/W 静态，实测与 JIT big-lama 输出逐像素一致、无质量阉割；输入 0..1、输出 0..255、mask 二值不敏感）。v0.5.1 起推理策略对齐 iopaint CROP：每个遮罩连通块 crop bbox+128px margin（`crop_box()` 贴边补偿同 iopaint），crop ≤512 原分辨率 pad 512（居中）推理；更大时等比缩放到 512 推理后 Lanczos 还原写回——大水印整体修复，取代 v0.3.9 的 tile 分块（tile 每块只看半截水印导致接缝与模糊，是"App 端部分图模糊"的根因之一）；图像源函数内 clone 自当前已修复结果（级联）。**pad 区必须用图像均值色常数填充，禁止反射 pad**：反射会把贴近 crop 边缘的水印文字镜像进模型上下文，模型照字形延续产生残影（v0.5.3 排查结论，水印贴图底时 mask 必然贴 crop 边，此坑必现；iopaint 原分辨率推理 pad 仅 ≤7px 故无此问题）。FFT 算子不可导出 ONNX（aten::fft_rfftn 不支持），Carve 固定 512 正因 FFT 在固定尺寸下可预计算为矩阵乘——动态尺寸 ONNX 导出已验证不可行。
 - 流水线：`desktop/src-tauri/src/pipeline.rs` 是 `tools/remove_doubao_watermark.py` 的 Rust 移植（备份/遮罩/修复/复查/覆盖/清理），桌面端进程内调用；`run` 模式清理前会把两张复查拼图复制到系统临时目录 `doubao-watermark-review/` 再输出路径，避免复查图被清理后失效
 - CLI：`clean-cli`（`cargo build --bin clean-cli`），参数与 Python 脚本一致（`--root`/`--mask-box`/`--keep-work` + `run|prepare|inpaint|review-lama|overwrite-review|cleanup`）
 - 模型下载：启动检测到模型缺失即自动开始下载（多连接分段+分段重试+源回退 hf-mirror→huggingface），顶栏进度条；`LAMA_ONNX_URL` 可覆盖下载源（单一地址），`LAMA_ONNX_PATH` 可覆盖模型位置
