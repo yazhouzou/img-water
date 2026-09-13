@@ -168,9 +168,9 @@ cd desktop/src-tauri && cargo build --release --bin clean-cli
 2. “去掉其它水印”才进入其它水印流程；如果用户同时给出水印文字或截图，按用户指定目标处理。
 3. v0.3.4 起检测全图化、v0.3.8 起带文字性特征过滤：`detect_watermark_boxes()`（Rust + Python 同步）全图扫描白字聚类，任意位置/多处分散水印返回多框画多矩形遮罩，`lama.rs` 按 mask 连通块多窗口推理（每块 ≤496px）。防误擦判据：组件 bbox 内原始白像素填充率 ≤0.6 且 x 投影列段数 ≥3（实心白块如灯罩/瓷盘 fill 0.8+/段数 1，文字水印 fill ~0.2/段数=字符数）；Python 连通域用 scipy（该环境 cv2.connectedComponents 会段错误）。右下角另有自适应阈值兜底（阈值=背景均值+60，识别半透明灰白粗体水印，贴右下边约束）。非白字水印（深色、彩色、半透明全图）检测不到，仍需 `--mask-box` 手动指定。
 4. 手动遮罩：`tools/remove_doubao_watermark.py --mask-box x1,y1,x2,y2 prepare ...`（单框）；遮罩必须只覆盖水印文字和必要边缘，不要覆盖大块画面。
-5. 单个水印区域超过 496px（LaMa 512 窗口上限）时桌面端自动走 tile 分块推理（v0.3.9），不再报错；候选框分数低于最高分 4% 会被丢弃（防噪声误擦）。
-6. 最终质量标准仍相同：无目标水印残留，无明显糊块，不破坏主体和关键纹理。
-
+5. **任意位置文字水印（`--any-position`，默认关）**：默认管线只保留贴右下角的检出框（防雪景/busy photo 误检毁图）；显式开启后保留全部文字性通过的框，处理任意位置白字水印。能力边界以 `tools/synthetic_watermark_test.py` 合成矩阵为准（分层量化：检测层/管线层/--any-position 层）：纯白字（≥248）任意位置全通；灰白/半透明字仅右下角（corner 兜底）；深色/彩色字基本检测不到需 `--mask-box`；复杂照片背景（雪景类）全图检测必误检（7-8 框），--any-position 下误检框会被硬修——开启后必须人工复查候选图再覆盖。App 端（pipeline.rs）未同步此开关。后续补齐方向：灰白字全图检测（opt-in 随 --any-position）、深色字负片检测、--mask-box 多框。
+6. 单个水印区域超过 496px（LaMa 512 窗口上限）时桌面端自动走 tile 分块推理（v0.3.9），不再报错；候选框分数低于最高分 4% 会被丢弃（防噪声误擦）。
+7. 最终质量标准仍相同：无目标水印残留，无明显糊块，不破坏主体和关键纹理。
 ## 质量标准
 
 最终结果必须满足：
@@ -202,6 +202,8 @@ original-watermark-backup/
 2. 备份文件已存在时，不要覆盖。
 3. 每次会话完成且最终落盘复查通过后，删除 `original-watermark-backup/` 里的备份原图；如目录为空，可以保留空目录或删除目录。
 4. 同一时机删除 `/tmp` 中本次任务生成的复查拼图和临时任务目录，避免后续会话误读旧结果。
+
+**覆盖安全（md5 校验，防再犯）**：prepare 会把本轮处理源文件的 md5 记入 `WORK/manifest.json`；`overwrite-review` 覆盖前校验目标文件 md5 与之一致，不一致（--root 传错目录/文件被改动）直接拒绝覆盖并退出。`overwrite-review` 不带 manifest 会拒绝执行（先跑 prepare）。**事故教训（2026-09）**：曾误用 `--root dist` 执行 overwrite-review + cleanup，把处理结果覆盖进 dist/ 原图目录且备份被清理，原图丢失（用户手动恢复）。`--root` 始终是"被处理文件所在的输出目录"，本项目内 dist/ 是只读原图源，任何写操作（overwrite-review/cleanup/run）的 --root 都不得指向 dist/。
 
 ## 用户沟通
 

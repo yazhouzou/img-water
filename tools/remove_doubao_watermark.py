@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -585,17 +587,32 @@ def ensure_work_dirs(root):
         path.mkdir(parents=True, exist_ok=True)
 
 
-def prepare(names, custom_box, root, emit=True, model='mat', refine=False):
+MANIFEST = WORK / 'manifest.json'
+
+
+def _md5(path):
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def prepare(names, custom_box, root, emit=True, model='mat', refine=False, any_position=False):
     if WORK.exists():
         rmtree(WORK)
     ensure_work_dirs(root)
     backup_root = backup_dir(root)
+    manifest = {}
     for name in names:
         current = Path(root) / name
         backup = backup_root / name
         if not backup.exists():
             copyfile(current, backup)
         copyfile(backup, SOURCE / name)
+        # 记录本轮处理源文件的 md5：overwrite-review 覆盖前校验目标文件
+        # 与源文件一致，防止 --root 传错目录时静默毁掉其它文件
+        manifest[name] = _md5(backup)
 
         with Image.open(backup) as image:
             width, height = image.size
@@ -618,9 +635,12 @@ def prepare(names, custom_box, root, emit=True, model='mat', refine=False):
                 with Image.open(backup) as probe:
                     boxes = detect_watermark_boxes(probe)
                     # 豆包水印必贴右下角：丢弃远离右下角的检出框，
-                    # 否则雪景白点/白墙/栏杆等画面内容会被误检硬修（毁图）
+                    # 否则雪景白点/白墙/栏杆等画面内容会被误检硬修（毁图）。
+                    # --any-position 显式开启时保留全部文字性通过的框（处理
+                    # 任意位置的其它文字水印），误检风险由调用方承担
                     pw, ph = probe.size
-                    boxes = [b for b in boxes if b[2] > pw - 40 and b[3] > ph - 40]
+                    if not any_position:
+                        boxes = [b for b in boxes if b[2] > pw - 40 and b[3] > ph - 40]
                 if boxes:
                     print(f'{name}: auto-detected {len(boxes)} watermark box(es) {boxes} (template fallback: {tpl_info})')
                 else:
@@ -653,6 +673,7 @@ def prepare(names, custom_box, root, emit=True, model='mat', refine=False):
         # skipped 也保存空 mask：inpaint 据此透传原图，不进模型
         mask.save(MASKS / name)
 
+    MANIFEST.write_text(json.dumps(manifest))
     output = REVIEW / 'source-corner-review.png'
     review(SOURCE, output.name, names)
     if emit:
@@ -759,8 +780,28 @@ def review_lama(names, emit=True):
 
 
 def overwrite_review(names, root, emit=True):
+    if not MANIFEST.exists():
+        raise SystemExit(
+            'overwrite-review: no prepare manifest found in workdir — refusing to '
+            'overwrite anything (run prepare first, it records the source md5 used '
+            'to verify the overwrite target)')
+    manifest = json.loads(MANIFEST.read_text())
+    pending = []
     for name in names:
-        copyfile(LAMA / name, Path(root) / name)
+        src = LAMA / name
+        dst = Path(root) / name
+        if not src.exists():
+            raise SystemExit(f'overwrite-review: missing inpainted file {src}')
+        expected = manifest.get(name)
+        if expected is None or _md5(dst) != expected:
+            raise SystemExit(
+                f'overwrite-review: {dst} does not match the file processed this run '
+                f'(md5 mismatch) — refusing to overwrite. Check that --root points to '
+                f'the same folder used by prepare, and that the file was not modified '
+                f'in between.')
+        pending.append((src, dst))
+    for src, dst in pending:
+        copyfile(src, dst)
     output = REVIEW / 'overwritten-corner-review.png'
     review(root, output.name, names)
     if emit:
@@ -780,8 +821,8 @@ def cleanup(names, root):
         rmtree(WORK)
 
 
-def run_all(names, custom_box, keep_work, root, model='mat', refine=False):
-    prepare(names, custom_box, root, emit=False, model=model, refine=refine)
+def run_all(names, custom_box, keep_work, root, model='mat', refine=False, any_position=False):
+    prepare(names, custom_box, root, emit=False, model=model, refine=refine, any_position=any_position)
     inpaint(model)
     candidate_review = review_lama(names, emit=False)
     final_review = overwrite_review(names, root, emit=False)
@@ -825,6 +866,15 @@ def main():
              'highlights) it can miss most strokes, so it is off by default and the '
              'full box + coarse fill + MAT path is used instead.',
     )
+    parser.add_argument(
+        '--any-position',
+        action='store_true',
+        help='keep watermark boxes detected anywhere in the image, not only the '
+             'bottom-right corner (for text watermarks at arbitrary positions). '
+             'Detections already pass text-likeness filters, but busy photos can '
+             'still produce false positives, so review the corner review image '
+             'before overwriting.',
+    )
     parser.add_argument('command', choices=['run', 'prepare', 'inpaint', 'review-lama', 'overwrite-review', 'cleanup'])
     parser.add_argument('files', nargs='*')
     args = parser.parse_args()
@@ -834,9 +884,9 @@ def main():
     names = target_names(args.files, root)
 
     if args.command == 'run':
-        run_all(names, args.mask_box, args.keep_work, root, args.model, args.refine)
+        run_all(names, args.mask_box, args.keep_work, root, args.model, args.refine, args.any_position)
     elif args.command == 'prepare':
-        prepare(names, args.mask_box, root, model=args.model, refine=args.refine)
+        prepare(names, args.mask_box, root, model=args.model, refine=args.refine, any_position=args.any_position)
     elif args.command == 'inpaint':
         inpaint(args.model)
     elif args.command == 'review-lama':
