@@ -1,6 +1,7 @@
 *.png
 !desktop/src-tauri/icons/**/*.png
 !desktop/icon-source.png
+!tools/doubao-wm-template.png
 .img-inpaint-venv/
 original-watermark-backup/
 __pycache__/

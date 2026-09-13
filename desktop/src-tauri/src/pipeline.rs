@@ -10,6 +10,159 @@ use crate::lama::Lama;
 
 const WINDOW: u32 = 512;
 
+// 模板笔画 mask：豆包水印字形全图固定（半透明白字 α≈0.6 叠加），从黑底图提取
+// 笔画级模板（阈值 ≥125 + 3x3 闭运算，填充率仅 ~21%）。资产编译进二进制，
+// CLI 与打包 App 均可用。
+const TEMPLATE_PNG: &[u8] = include_bytes!("../../../tools/doubao-wm-template.png");
+const TEMPLATE_META_JSON: &str = include_str!("../../../tools/doubao-wm-template.json");
+// gap-score（笔画均亮 - 间隙均亮）实测：黑底 144 / 雪景 102-136 / 花墙 57 /
+// 沙滩 62；纸面低对比 15 回退整框检测。阈值取中间空档。
+const TEMPLATE_MIN_SCORE: f64 = 40.0;
+// 膨胀核 19x11 矩形（水平 ±9 / 垂直 ±5）：水平填满字符间距使 mask 连成片，
+// 消除间隙里的字形上下文，防止 LaMa FFT 感受野"见字生字"；垂直只需盖住
+// 抗锯齿带（±5px），少侵入 mask 上下画面——水印横跨花墙棱线等强结构边界时，
+// 全向 9px 会让 LaMa 重绘垂直宽带产生混沌（6.png 教训）。
+// mask 必须放在 gap-score 匹配位置：手工放置偏 8px 时小膨胀盖不住字形，
+// 会误判为"垂直膨胀不足"（位置对齐比膨胀参数更关键）。
+const TEMPLATE_DILATE_W: usize = 19;
+const TEMPLATE_DILATE_H: usize = 11;
+
+#[derive(serde::Deserialize)]
+struct TemplateMeta {
+    #[serde(rename = "ref_short_side")]
+    ref_short_side: f64,
+}
+
+fn load_template() -> Result<(GrayImage, TemplateMeta), String> {
+    let tpl = image::load_from_memory_with_format(TEMPLATE_PNG, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?
+        .to_luma8();
+    let meta: TemplateMeta =
+        serde_json::from_str(TEMPLATE_META_JSON).map_err(|e| e.to_string())?;
+    Ok((tpl, meta))
+}
+
+/// 模板笔画 mask 匹配：按图片短边比例缩放模板（水印尺寸随短边等比），在右下角
+/// 40px 余量窗口内做 gap-score 匹配（笔画区均亮 - 间隙区均亮），命中返回
+/// (mask, 描述)。分数不足返回 None 交给整框检测回退。
+fn template_stroke_mask(image: &DynamicImage) -> Result<Option<(GrayImage, String)>, String> {
+    let (tpl, meta) = load_template()?;
+    let rgb = image.to_rgb8();
+    let (iw, ih) = (rgb.width() as usize, rgb.height() as usize);
+    let mut gray = vec![0f64; iw * ih];
+    for (i, p) in rgb.pixels().enumerate() {
+        gray[i] = p.0.iter().copied().fold(0u8, u8::max) as f64;
+    }
+    let scale = (iw.min(ih) as f64) / meta.ref_short_side;
+    let tw = ((tpl.width() as f64) * scale) as u32;
+    let th = ((tpl.height() as f64) * scale) as u32;
+    if tw >= rgb.width() || th >= rgb.height() {
+        return Ok(None);
+    }
+    let t = image::imageops::resize(&tpl, tw, th, FilterType::Nearest);
+    // 稀疏笔画点（相对模板左上角的偏移）与计数
+    let mut pts: Vec<(usize, usize)> = Vec::new();
+    for y in 0..th as usize {
+        for x in 0..tw as usize {
+            if t.get_pixel(x as u32, y as u32).0[0] > 127 {
+                pts.push((x, y));
+            }
+        }
+    }
+    let n_in = pts.len() as f64;
+    let n_out = (tw as usize * th as usize) as f64 - n_in;
+    // 积分图（前缀和）求任意矩形和：S_all 与匹配窗口内的 S_out
+    let iw1 = iw + 1;
+    let mut integral = vec![0f64; iw1 * (ih + 1)];
+    for y in 0..ih {
+        let mut row_acc = 0f64;
+        for x in 0..iw {
+            row_acc += gray[y * iw + x];
+            integral[(y + 1) * iw1 + (x + 1)] = integral[y * iw1 + (x + 1)] + row_acc;
+        }
+    }
+    let rect_sum = |x1: usize, y1: usize, x2: usize, y2: usize| -> f64 {
+        integral[y2 * iw1 + x2] + integral[y1 * iw1 + x1] - integral[y1 * iw1 + x2]
+            - integral[y2 * iw1 + x1]
+    };
+    // 水印必贴右下角：模板左上角只可能在 (w-tw-40..=w-tw, h-th-40..=h-th)
+    let max_py = ih - th as usize;
+    let max_px = iw - tw as usize;
+    let min_py = max_py.saturating_sub(40);
+    let min_px = max_px.saturating_sub(40);
+    let mut best = (f64::MIN, 0usize, 0usize);
+    for py in min_py..=max_py {
+        for px in min_px..=max_px {
+            let mut s_in = 0f64;
+            for &(dx, dy) in &pts {
+                s_in += gray[(py + dy) * iw + px + dx];
+            }
+            let s_all = rect_sum(px, py, px + tw as usize, py + th as usize);
+            let gap = s_in / n_in - (s_all - s_in) / n_out;
+            if gap > best.0 {
+                best = (gap, px, py);
+            }
+        }
+    }
+    let (score, px, py) = best;
+    if score < TEMPLATE_MIN_SCORE {
+        return Ok(None);
+    }
+    // 膨胀矩形核（水平 ±9 / 垂直 ±5）：方形核可分解，横向 19 + 纵向 11 两次一维扩展
+    let mut bin = vec![false; (tw as usize) * (th as usize)];
+    for &(dx, dy) in &pts {
+        bin[dy * tw as usize + dx] = true;
+    }
+    let dilate_1d = |src: &[bool], w: usize, h: usize, horizontal: bool| -> Vec<bool> {
+        let (rx, ry) = if horizontal {
+            (TEMPLATE_DILATE_W / 2, 0)
+        } else {
+            (0, TEMPLATE_DILATE_H / 2)
+        };
+        let mut dst = vec![false; src.len()];
+        for y in 0..h {
+            for x in 0..w {
+                if src[y * w + x] {
+                    dst[y * w + x] = true;
+                    continue;
+                }
+                let lo = x.saturating_sub(rx);
+                let hi = (x + rx).min(w - 1);
+                let lo_y = y.saturating_sub(ry);
+                let hi_y = (y + ry).min(h - 1);
+                if horizontal {
+                    for xx in lo..=hi {
+                        if src[y * w + xx] {
+                            dst[y * w + x] = true;
+                            break;
+                        }
+                    }
+                } else {
+                    for yy in lo_y..=hi_y {
+                        if src[yy * w + x] {
+                            dst[y * w + x] = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        dst
+    };
+    let dilated = dilate_1d(&dilate_1d(&bin, tw as usize, th as usize, true), tw as usize, th as usize, false);
+    let mut mask = GrayImage::from_pixel(rgb.width(), rgb.height(), image::Luma([0]));
+    for y in 0..th as usize {
+        for x in 0..tw as usize {
+            if dilated[y * tw as usize + x] {
+                mask.put_pixel((px + x) as u32, (py + y) as u32, image::Luma([255]));
+            }
+        }
+    }
+    let info = format!("template mask matched at ({px},{py}) score {score:.1}");
+    Ok(Some((mask, info)))
+}
+
+
 pub type Logger<'a> = &'a dyn Fn(&str);
 
 #[derive(Clone, Copy, Debug)]
@@ -250,9 +403,229 @@ fn detect_full_white(image: &DynamicImage) -> Vec<(i64, i64, i64, i64)> {
         })
         .collect()
 }
+/// 迭代合并重叠框：水印在不同阈值下切出的组件不完整，融合后覆盖完整水印。
+fn fuse_boxes(boxes: Vec<(i64, i64, i64, i64)>) -> Vec<(i64, i64, i64, i64)> {
+    let mut boxes = boxes;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut result = Vec::new();
+        while let Some(mut cur) = boxes.pop() {
+            let mut i = 0;
+            while i < boxes.len() {
+                let o = boxes[i];
+                let overlaps = !(cur.2 <= o.0 || o.2 <= cur.0 || cur.3 <= o.1 || o.3 <= cur.1);
+                if overlaps {
+                    boxes.remove(i);
+                    cur = (
+                        cur.0.min(o.0),
+                        cur.1.min(o.1),
+                        cur.2.max(o.2),
+                        cur.3.max(o.3),
+                    );
+                    changed = true;
+                } else {
+                    i += 1;
+                }
+            }
+            result.push(cur);
+        }
+        boxes = result;
+    }
+    boxes
+}
 
-/// 右下角自适应阈值兜底：识别半透明/灰白粗体水印（豆包新样式，亮度 150~240 不等）。
-/// 仅扫右下角区域，阈值取背景中位数 +60，要求候选框贴近右下边缘，避免误擦画面元素。
+/// 形态学顶帽：原图减开运算（31x31 椭圆核），突出局部亮结构。
+fn top_hat(gray: &[u8], rw: usize, rh: usize) -> Vec<u8> {
+    let r = 15usize;
+    let mut se = vec![false; (2 * r + 1) * (2 * r + 1)];
+    for dy in 0..=(2 * r) {
+        for dx in 0..=(2 * r) {
+            let fx = (dx as f64 - r as f64) / (r as f64 + 0.5);
+            let fy = (dy as f64 - r as f64) / (r as f64 + 0.5);
+            if fx * fx + fy * fy <= 1.0 {
+                se[dy * (2 * r + 1) + dx] = true;
+            }
+        }
+    }
+    let eroded = morph_min(gray, rw, rh, &se, r);
+    morph_max(&eroded, rw, rh, &se, r)
+        .iter()
+        .zip(gray.iter())
+        .map(|(&opened, &orig)| orig.saturating_sub(opened))
+        .collect()
+}
+
+fn morph_min(gray: &[u8], rw: usize, rh: usize, se: &[bool], r: usize) -> Vec<u8> {
+    let mut out = vec![255u8; rw * rh];
+    for y in 0..rh {
+        for x in 0..rw {
+            let mut m = 255u8;
+            for dy in 0..=(2 * r) {
+                let iy = y as i64 + dy as i64 - r as i64;
+                if iy < 0 || iy >= rh as i64 {
+                    continue;
+                }
+                for dx in 0..=(2 * r) {
+                    if !se[dy * (2 * r + 1) + dx] {
+                        continue;
+                    }
+                    let ix = x as i64 + dx as i64 - r as i64;
+                    if ix < 0 || ix >= rw as i64 {
+                        continue;
+                    }
+                    m = m.min(gray[iy as usize * rw + ix as usize]);
+                }
+            }
+            out[y * rw + x] = m;
+        }
+    }
+    out
+}
+
+fn morph_max(gray: &[u8], rw: usize, rh: usize, se: &[bool], r: usize) -> Vec<u8> {
+    let mut out = vec![0u8; rw * rh];
+    for y in 0..rh {
+        for x in 0..rw {
+            let mut m = 0u8;
+            for dy in 0..=(2 * r) {
+                let iy = y as i64 + dy as i64 - r as i64;
+                if iy < 0 || iy >= rh as i64 {
+                    continue;
+                }
+                for dx in 0..=(2 * r) {
+                    if !se[dy * (2 * r + 1) + dx] {
+                        continue;
+                    }
+                    let ix = x as i64 + dx as i64 - r as i64;
+                    if ix < 0 || ix >= rw as i64 {
+                        continue;
+                    }
+                    m = m.max(gray[iy as usize * rw + ix as usize]);
+                }
+            }
+            out[y * rw + x] = m;
+        }
+    }
+    out
+}
+
+/// 字符行分析：从二值图中找“高度一致的字符序列”（水印是单行文字，
+/// 字符高度统一；沙滩亮斑/花影粘连块高度杂乱或超高，不成行即排除）。
+fn corner_text_boxes(
+    grid: &[bool],
+    rw: usize,
+    rh: usize,
+    h: i64,
+    w: i64,
+    x0: usize,
+    y0: usize,
+    pad: i64,
+) -> Vec<(i64, i64, i64, i64)> {
+    // 轻度膨胀：合并字符内笔画碎片，字符间距不会粘连
+    let dilated = dilate_square5(grid, rw, rh);
+    let mut visited = vec![false; rw * rh];
+    let mut chars: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for sy in 0..rh {
+        for sx in 0..rw {
+            let idx = sy * rw + sx;
+            if !dilated[idx] || visited[idx] {
+                continue;
+            }
+            let mut stack = vec![idx];
+            visited[idx] = true;
+            let (mut minx, mut miny, mut maxx, mut maxy) = (sx, sy, sx, sy);
+            let mut area = 0usize;
+            while let Some(cur) = stack.pop() {
+                area += 1;
+                let cx = cur % rw;
+                let cy = cur / rw;
+                minx = minx.min(cx);
+                maxx = maxx.max(cx);
+                miny = miny.min(cy);
+                maxy = maxy.max(cy);
+                for dy in -1i64..=1 {
+                    for dx in -1i64..=1 {
+                        let nx = cx as i64 + dx;
+                        let ny = cy as i64 + dy;
+                        if nx < 0 || ny < 0 || nx >= rw as i64 || ny >= rh as i64 {
+                            continue;
+                        }
+                        let ni = ny as usize * rw + nx as usize;
+                        if dilated[ni] && !visited[ni] {
+                            visited[ni] = true;
+                            stack.push(ni);
+                        }
+                    }
+                }
+            }
+            let (cw, ch) = (maxx - minx + 1, maxy - miny + 1);
+            // 字符级组件：高度占图高 1.2%~4.5%（豆包水印 ~2.9%），宽高比合理
+            let chf = ch as f64;
+            if (chf < h as f64 * 0.012) || (chf > h as f64 * 0.045) {
+                continue;
+            }
+            if (cw as f64) < chf * 0.25 || (cw as f64) > chf * 7.0 || area < 120 {
+                continue;
+            }
+            chars.push((minx, miny, maxx + 1, maxy + 1));
+        }
+    }
+    if chars.len() < 4 {
+        return Vec::new();
+    }
+    // 按 y 中心聚类成行
+    chars.sort_by_key(|b| b.1 + b.3);
+    let mut rows: Vec<(Vec<(usize, usize, usize, usize)>, i64, i64)> = Vec::new();
+    for c in chars {
+        let cy = (c.1 + c.3) as f64 / 2.0;
+        let ch = (c.3 - c.1) as i64;
+        let mut placed = false;
+        for row in rows.iter_mut() {
+            let tol = (ch.max(row.2) as f64 * 0.7) as i64;
+            if (cy as i64 - row.1).abs() < tol {
+                row.0.push(c);
+                let n = row.0.len() as f64;
+                row.1 = (row.0.iter().map(|b| (b.1 + b.3) as f64 / 2.0).sum::<f64>() / n) as i64;
+                row.2 = row.2.max(ch);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            rows.push((vec![c], cy as i64, ch));
+        }
+    }
+    let mut boxes = Vec::new();
+    for row in rows {
+        if row.0.len() < 4 {
+            continue;
+        }
+        let hs: Vec<i64> = row.0.iter().map(|b| (b.3 - b.1) as i64).collect();
+        let hmin = *hs.iter().min().unwrap_or(&1);
+        let hmax = *hs.iter().max().unwrap_or(&1);
+        if hmax * 10 > hmin.max(1) * 18 {
+            continue;
+        }
+        let x1 = row.0.iter().map(|b| b.0).min().unwrap();
+        let y1 = row.0.iter().map(|b| b.1).min().unwrap();
+        let x2 = row.0.iter().map(|b| b.2).max().unwrap();
+        let y2 = row.0.iter().map(|b| b.3).max().unwrap();
+        let (gx2, gy2) = ((x0 + x2) as i64, (y0 + y2) as i64);
+        // 水印贴右下角：右缘距图右 <40px、底缘距图底 <40px
+        if gx2 < w - 40 || gy2 < h - 40 {
+            continue;
+        }
+        boxes.push((
+            ((x0 + x1) as i64 - pad).max(0),
+            ((y0 + y1) as i64 - pad).max(0),
+            (gx2 + pad).min(w - 6),
+            (gy2 + pad).min(h - 6),
+        ));
+    }
+    boxes
+}
+
 fn detect_corner_faded(image: &DynamicImage) -> Vec<(i64, i64, i64, i64)> {
     let rgb = image.to_rgb8();
     let (w, h) = (rgb.width() as i64, rgb.height() as i64);
@@ -264,23 +637,64 @@ fn detect_corner_faded(image: &DynamicImage) -> Vec<(i64, i64, i64, i64)> {
         return Vec::new();
     }
     let mut gray = vec![0u8; rw * rh];
-    let mut sum_sq = 0u64;
+    let mut sat = vec![0u8; rw * rh];
     for y in 0..rh {
         for x in 0..rw {
             let p = rgb.get_pixel((x0 + x) as u32, (y0 + y) as u32);
-            let v = p.0[0].max(p.0[1]).max(p.0[2]);
-            gray[y * rw + x] = v;
-            sum_sq += v as u64;
+            let (mut mx, mut mn) = (p.0[0], p.0[0]);
+            for c in p.0.iter().take(3) {
+                mx = mx.max(*c);
+                mn = mn.min(*c);
+            }
+            gray[y * rw + x] = mx;
+            sat[y * rw + x] = mx.saturating_sub(mn);
         }
     }
-    // 用平均值近似背景水平（区域小，水印占比低，均值≈背景）
-    let mean = (sum_sq / (rw * rh) as u64) as i64;
-    let threshold = (mean + 60).clamp(150, 248);
-    let mut grid = vec![false; rw * rh];
-    for (i, v) in gray.iter().enumerate() {
-        grid[i] = *v as i64 >= threshold;
+    let pad = (h / 150).max(10) as i64;
+    // 1) 多阈值扫描：全部阈值的字符行 + 行块双模式检出融合（高阈值只能切出暗水印
+    //    最亮部分，低阈值才切出完整文字，如 2.png 水印亮度 150~162）
+    let mut all_boxes = Vec::new();
+    for threshold in [248i64, 240, 230, 220, 210, 200, 190, 180, 170, 160, 150] {
+        let grid: Vec<bool> = gray.iter().map(|&v| v as i64 >= threshold).collect();
+        all_boxes.extend(corner_text_boxes(&grid, rw, rh, h, w, x0, y0, pad));
+        all_boxes.extend(corner_row_boxes(&grid, rw, rh, h, w, x0, y0, pad));
     }
-    let dilated = dilate_rect_9x3_twice(&grid, rw, rh);
+    if !all_boxes.is_empty() {
+        return fuse_boxes(all_boxes);
+    }
+    // 2) 顶帽兜底：突出局部亮结构，对光照不均鲁棒；
+    //    再用低饱和过滤（灰白水印 RGB 均衡，彩色背景如红花绿叶高饱和）防止花斑并入。
+    //    顶帽只配字符行模式：顶帽图里花影/墙面亮斑与水印粘连，行块模式会把大片
+    //    画面罩进框整块重绘（6.png 花丛曾被行块大框毁图）——宁漏检不误修。
+    let tophat = top_hat(&gray, rw, rh);
+    for threshold in [60i64, 50, 40, 30] {
+        let grid: Vec<bool> = (0..rw * rh)
+            .map(|i| tophat[i] as i64 >= threshold && sat[i] <= 60)
+            .collect();
+        let boxes = corner_text_boxes(&grid, rw, rh, h, w, x0, y0, pad);
+        if !boxes.is_empty() {
+            return fuse_boxes(boxes);
+        }
+    }
+    Vec::new()
+}
+
+/// 行块模式：9x3 膨胀两次直接合并字符成行（水印字符与背景亮斑粘连、
+/// 字符级分离失败时——如雪景雪点——仍能定位整行）。防御：
+/// 1) 行框高度上限 6% 图高（排除大面积粘连块，如 1.png 沙滩亮斑 12%）；
+/// 2) 组件必须整体位于 corner 检测区内（排除从区外伸进来的画面内容）；
+/// 3) 文字性验证 + 贴边约束同字符行模式。
+fn corner_row_boxes(
+    grid: &[bool],
+    rw: usize,
+    rh: usize,
+    h: i64,
+    w: i64,
+    x0: usize,
+    y0: usize,
+    pad: i64,
+) -> Vec<(i64, i64, i64, i64)> {
+    let dilated = dilate_rect_9x3_twice(grid, rw, rh);
     let mut visited = vec![false; rw * rh];
     let mut boxes = Vec::new();
     for sy in 0..rh {
@@ -317,8 +731,7 @@ fn detect_corner_faded(image: &DynamicImage) -> Vec<(i64, i64, i64, i64)> {
                 }
             }
             let (cw, ch) = (maxx - minx + 1, maxy - miny + 1);
-            let (gx1, gy1, gx2, gy2) = (
-                (x0 + minx) as i64,
+            let (gy1, gx2, gy2) = (
                 (y0 + miny) as i64,
                 (x0 + maxx + 1) as i64,
                 (y0 + maxy + 1) as i64,
@@ -330,30 +743,77 @@ fn detect_corner_faded(image: &DynamicImage) -> Vec<(i64, i64, i64, i64)> {
             if !(0.15..=0.95).contains(&fill) {
                 continue;
             }
+            if ch as f64 > h as f64 * 0.06 {
+                continue;
+            }
+            let gx1 = (x0 + minx) as i64;
+            if gx1 < x0 as i64 - 20 {
+                continue;
+            }
             if gx2 < w - 40 || gy2 < h - 40 {
                 continue;
             }
-            boxes.push((gx1, gy1, gx2, gy2));
+            // 文字性验证：膨胀前白像素填充率 + x 投影列段数（区域局部坐标）
+            let mut area_raw = 0usize;
+            let mut col_counts = vec![0usize; cw];
+            for y in miny..=maxy {
+                for x in minx..=maxx {
+                    if grid[y * rw + x] {
+                        area_raw += 1;
+                        col_counts[x - minx] += 1;
+                    }
+                }
+            }
+            let fill_raw = area_raw as f64 / (cw as f64 * ch as f64);
+            let col_thr = (ch as f64 * 0.08).max(1.0);
+            let mut segments = 0usize;
+            let mut prev_on = false;
+            for c in &col_counts {
+                let on = *c as f64 >= col_thr;
+                if on && !prev_on {
+                    segments += 1;
+                }
+                prev_on = on;
+            }
+            if fill_raw > 0.6 || segments < 3 {
+                continue;
+            }
+            boxes.push((
+                (gx1 - pad).max(0),
+                (gy1 - pad).max(0),
+                (gx2 + pad).min(w - 6),
+                (gy2 + pad).min(h - 6),
+            ));
         }
     }
-    if boxes.is_empty() {
-        return Vec::new();
-    }
-    let pad = (h / 150).max(10) as i64;
     boxes
-        .into_iter()
-        .map(|(x1, y1, x2, y2)| {
-            (
-                (x1 - pad).max(0),
-                (y1 - pad).max(0),
-                (x2 + pad).min(w - 6),
-                (y2 + pad).min(h - 6),
-            )
-        })
-        .collect()
 }
 
-/// 矩形核 9x3 膨胀两次（可分离实现：水平半径 4 + 垂直半径 1）
+/// 5x5 方形膨胀一次（可分离：水平半径 2 + 垂直半径 2），合并字符内笔画碎片。
+fn dilate_square5(grid: &[bool], rw: usize, rh: usize) -> Vec<bool> {
+    let mut horiz = vec![false; grid.len()];
+    for y in 0..rh {
+        for x in 0..rw {
+            if grid[y * rw + x] {
+                for nx in x.saturating_sub(2)..=(x + 2).min(rw - 1) {
+                    horiz[y * rw + nx] = true;
+                }
+            }
+        }
+    }
+    let mut out = vec![false; grid.len()];
+    for y in 0..rh {
+        for x in 0..rw {
+            if horiz[y * rw + x] {
+                for ny in y.saturating_sub(2)..=(y + 2).min(rh - 1) {
+                    out[ny * rw + x] = true;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn dilate_rect_9x3_twice(grid: &[bool], rw: usize, rh: usize) -> Vec<bool> {
     let mut cur = grid.to_vec();
     for _ in 0..2 {
@@ -589,14 +1049,23 @@ pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Resu
         let boxes: Vec<(i64, i64, i64, i64)> = match options.mask_box {
             Some(box_) => vec![resolve_box(width, height, Some(box_))?],
             None => {
-                let detected = detect_watermark_boxes(&image);
+                // 三级策略 ①：模板笔画 mask（复杂场景精确修复，见 template_stroke_mask）
+                if let Some((tpl_mask, info)) = template_stroke_mask(&image)? {
+                    log(&format!("{}: {}", name, info));
+                    save_png(DynamicImage::ImageLuma8(tpl_mask), &masks.join(name))?;
+                    continue;
+                }
+                // 三级策略 ②：整框检测回退
+                let mut detected = detect_watermark_boxes(&image);
+                // 豆包水印必贴右下角：丢弃远离右下角的检出框，
+                // 否则雪景白点/白墙/栏杆等画面内容会被误检硬修（毁图）
+                let (pw, ph) = (image.width() as i64, image.height() as i64);
+                detected.retain(|b| b.2 > pw - 40 && b.3 > ph - 40);
                 if detected.is_empty() {
-                    let box_ = default_mask_box(width, height);
-                    log(&format!(
-                        "{}: detection failed, using default rule ({}, {}, {}, {})",
-                        name, box_.0, box_.1, box_.2, box_.3
-                    ));
-                    vec![box_]
+                    // 三级策略 ③：检测不到水印，写全空 mask 跳过修复，绝不用默认
+                    // 规则硬修——对已无水印的图硬修会把真实画面重绘成模糊块
+                    log(&format!("{}: no watermark detected, skipped", name));
+                    Vec::new()
                 } else {
                     log(&format!("{}: auto-detected {} watermark box(es)", name, detected.len()));
                     detected
@@ -604,9 +1073,9 @@ pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Resu
             }
         };
         let mut mask = GrayImage::from_pixel(width, height, image::Luma([0]));
-        for (x1, y1, x2, y2) in boxes {
-            for y in y1..y2 {
-                for x in x1..x2 {
+        for (x1, y1, x2, y2) in &boxes {
+            for y in *y1..*y2 {
+                for x in *x1..*x2 {
                     mask.put_pixel(x as u32, y as u32, image::Luma([255]));
                 }
             }
@@ -649,6 +1118,13 @@ pub fn inpaint(
         let name = path.file_name().unwrap().to_string_lossy().to_string();
         let image = load_image(path)?;
         let mask = load_image(&masks.join(&name))?.to_luma8();
+        // 空 mask（未检测到水印）的图直接原样通过，不进模型
+        if mask.iter().all(|&v| v == 0) {
+            fs::copy(path, lama_dir.join(&name)).map_err(|e| e.to_string())?;
+            log(&format!("{}: empty mask, passed through without inpainting", name));
+            progress("inpaint", index + 1, total, &name);
+            continue;
+        }
         log(&format!("inpainting {}...", name));
         progress("inpaint", index, total, &name);
         let result = engine.inpaint_image(&image, &mask, log)?;
@@ -868,6 +1344,67 @@ mod tests {
     }
 
     #[test]
+    fn template_assets_embedded() {
+        let (tpl, meta) = load_template().expect("template assets must compile into binary");
+        assert_eq!(meta.ref_short_side, 1600.0);
+        assert!(tpl.width() > 200 && tpl.height() > 60);
+        let filled = tpl.pixels().filter(|p| p.0[0] > 127).count();
+        // 笔画填充率 ~21%（远小于整框）
+        let ratio = filled as f64 / (tpl.width() as f64 * tpl.height() as f64);
+        assert!(ratio < 0.35, "template fill ratio too high: {ratio}");
+    }
+
+    #[test]
+    fn template_stroke_mask_hits_real_style_watermark() {
+        // 用真实模板字形以 α=0.6 白色叠加合成水印（同豆包混合模型），
+        // template_stroke_mask 应命中且 mask 覆盖笔画区
+        let (tpl, _meta) = load_template().unwrap();
+        let (w, h) = (1728u32, 2304u32);
+        let scale = 1728.0 / 1600.0;
+        let t = image::imageops::resize(&tpl, (tpl.width() as f64 * scale) as u32, (tpl.height() as f64 * scale) as u32, FilterType::Nearest);
+        let mut img = RgbImage::from_pixel(w, h, Rgb([100, 105, 110]));
+        // 贴右下角放置：笔画右缘贴图右缘（对齐提取时的边界关系）
+        let px = (w - t.width()) as i32;
+        let py = (h - t.height()) as i32;
+        for ty in 0..t.height() {
+            for tx in 0..t.width() {
+                if t.get_pixel(tx, ty).0[0] > 127 {
+                    let p = img.get_pixel((px + tx as i32) as u32, (py + ty as i32) as u32);
+                    let blend = |c: u8| -> u8 { (c as f64 * 0.4 + 255.0 * 0.6) as u8 };
+                    img.put_pixel((px + tx as i32) as u32, (py + ty as i32) as u32, Rgb([blend(p.0[0]), blend(p.0[1]), blend(p.0[2])]));
+                }
+            }
+        }
+        let hit = template_stroke_mask(&DynamicImage::ImageRgb8(img)).unwrap();
+        assert!(hit.is_some(), "template should match real-style watermark");
+        let (mask, info) = hit.unwrap();
+        let whites = mask.pixels().filter(|p| p.0[0] > 0).count();
+        assert!(whites > 10000, "mask should cover strokes ({whites}px): {info}");
+        // mask 必须集中在右下角（水印贴角）
+        let bbox = maskPixels(&mask);
+        assert!(bbox.2 >= (w as i64 - 60) && bbox.3 >= (h as i64 - 60), "mask should hug bottom-right: {bbox:?}");
+    }
+
+    fn maskPixels(mask: &GrayImage) -> (i64, i64, i64, i64) {
+        let mut b = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
+        for (x, y, p) in mask.enumerate_pixels() {
+            if p.0[0] > 0 {
+                b.0 = b.0.min(x as i64);
+                b.1 = b.1.min(y as i64);
+                b.2 = b.2.max(x as i64);
+                b.3 = b.3.max(y as i64);
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn template_stroke_mask_misses_clean_image() {
+        let img = RgbImage::from_pixel(1600, 900, Rgb([240, 240, 233]));
+        assert!(template_stroke_mask(&DynamicImage::ImageRgb8(img)).unwrap().is_none());
+    }
+
+    #[test]
     fn detect_watermark_boxes_hits_synthetic() {
         let root = temp_root("detect");
         let path = root.join("w.png");
@@ -938,8 +1475,8 @@ mod tests {
         let path = root.join("faded.png");
         let mut img = RgbImage::from_pixel(1728, 2304, Rgb([40, 45, 50]));
         let font = font();
-        draw_text_mut(&mut img, Rgb([100, 100, 100]), 1503, 2232, 62.0, &font, "AI GEN");
-        draw_text_mut(&mut img, Rgb([210, 212, 215]), 1505, 2234, 62.0, &font, "AI GEN");
+        draw_text_mut(&mut img, Rgb([100, 100, 100]), 1520, 2232, 62.0, &font, "AI GEN");
+        draw_text_mut(&mut img, Rgb([210, 212, 215]), 1522, 2234, 62.0, &font, "AI GEN");
         save_png(DynamicImage::ImageRgb8(img), &path).unwrap();
         let boxes = detect_watermark_boxes(&image::open(&path).unwrap());
         assert_eq!(boxes.len(), 1, "faded watermark should be detected, got {:?}", boxes);
