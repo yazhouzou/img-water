@@ -160,15 +160,73 @@ def mask_box(width, height):
     return (max(0, width - box_width), max(0, height - box_height), width - 8, height - 8)
 
 
-def detect_watermark_boxes(image):
+def detect_watermark_boxes(image, extended=False):
     """两级检测：
-    1) 全图扫纯白文字（≥248），用“文字性特征”过滤画面主体误检：组件内原始白像素
+    1) 全图扫纯白文字（≥248），用"文字性特征"过滤画面主体误检：组件内原始白像素
        填充率 ≤0.6 且 x 投影列段数 ≥3（实心块如灯罩 fill 0.8+、段数 1，文字水印
        fill ~0.2、段数=字符数）；
-    2) 右下角自适应阈值兜底（识别半透明/灰白粗体水印），与第 1 级合并去重。"""
+    2) 右下角自适应阈值兜底（识别半透明/灰白粗体水印），与第 1 级合并去重。
+    extended=True（--any-position 时）：追加全图灰白多阈值扫描与深色字负片检测，
+    用于任意位置的非纯白文字水印；busy photo 误检风险由显式开启承担。"""
     full = _detect_full_white(image)
     corner = _detect_corner_faded(image)
-    return full + [b for b in corner if not any(_overlap(b, f) for f in full)]
+    found = full + [b for b in corner if not any(_overlap(b, f) for f in full)]
+    if extended:
+        faded = _detect_full_faded(image)
+        dark = _detect_full_dark(image)
+        for b in faded + dark:
+            if not any(_overlap(b, f) for f in found):
+                found.append(b)
+    return found
+
+
+def _boxes_from_mask(mask, h, w):
+    """从候选像素 mask 提取符合文字性特征的框（膨胀成行 → 组件过滤 → 低分裁剪）。"""
+    import numpy as np
+    import scipy.ndimage as ndi
+    merged = mask.astype(np.uint8)
+    kernel = np.ones((3, 9), dtype=np.uint8)
+    for _ in range(2):
+        merged = ndi.binary_dilation(merged, structure=kernel).astype(np.uint8)
+    labeled, count = ndi.label(merged)
+    if count == 0:
+        return []
+    areas = np.bincount(labeled.ravel())
+    slices = ndi.find_objects(labeled)
+    candidates = []
+    for i, sl in enumerate(slices, start=1):
+        y1, y2, x1, x2 = sl[0].start, sl[0].stop, sl[1].start, sl[1].stop
+        cw, ch, area = x2 - x1, y2 - y1, int(areas[i])
+        if area < 1200 or ch < h * 0.012 or ch > h * 0.09 or cw < ch:
+            continue
+        ratio = cw / ch
+        if ratio < 2.0 or ratio > 15:
+            continue
+        fill = area / float(cw * ch)
+        if fill < 0.2 or fill > 0.95:
+            continue
+        fill_raw, segments = _text_likeness(mask, x1, y1, x2, y2)
+        if fill_raw > 0.6 or segments < 3:
+            continue
+        corner_dist = (w - x2) + (h - y2)
+        score = area * min(ratio / 6.0, 1.0) / (1.0 + corner_dist / (w * 0.1))
+        candidates.append(((x1, y1, x2, y2), score))
+    if not candidates:
+        return []
+    top = max(score for _, score in candidates)
+    threshold = top * 0.04
+    pad = max(10, h // 150)
+    boxes = []
+    for (x1, y1, x2, y2), score in candidates:
+        if score < threshold:
+            continue
+        boxes.append((
+            max(0, x1 - pad),
+            max(0, y1 - pad),
+            min(w - 6, x2 + pad),
+            min(h - 6, y2 + pad),
+        ))
+    return boxes
 
 
 def _is_corner_box(box, image):
@@ -205,49 +263,39 @@ def _detect_full_white(image):
     img = np.array(image.convert('RGB'))
     h, w = img.shape[:2]
     white = (img >= 248).all(axis=2)
-    kernel = np.ones((3, 9), dtype=np.uint8)
-    merged = white.astype(np.uint8)
-    for _ in range(2):
-        merged = ndi.binary_dilation(merged, structure=kernel).astype(np.uint8)
-    labeled, count = ndi.label(merged)
-    if count == 0:
+    return _boxes_from_mask(white, h, w)
+
+
+def _detect_full_faded(image):
+    """全图灰白/半透明文字检测（--any-position opt-in）：多阈值扫描 230→160，
+    每阈值独立做文字性过滤后融合去重（暗水印高阈值只能切出局部组件，
+    必须靠低阈值补全——corner 兜底的同款经验推广到全图）。"""
+    try:
+        import numpy as np
+        import scipy.ndimage as ndi
+    except ImportError:
         return []
-    areas = np.bincount(labeled.ravel())
-    slices = ndi.find_objects(labeled)
-    candidates = []
-    for i, sl in enumerate(slices, start=1):
-        y1, y2, x1, x2 = sl[0].start, sl[0].stop, sl[1].start, sl[1].stop
-        cw, ch, area = x2 - x1, y2 - y1, int(areas[i])
-        if area < 1200 or ch < h * 0.012 or ch > h * 0.09 or cw < ch:
-            continue
-        ratio = cw / ch
-        if ratio < 2.0 or ratio > 15:
-            continue
-        fill = area / float(cw * ch)
-        if fill < 0.2 or fill > 0.95:
-            continue
-        fill_raw, segments = _text_likeness(white, x1, y1, x2, y2)
-        if fill_raw > 0.6 or segments < 3:
-            continue
-        corner_dist = (w - x2) + (h - y2)
-        score = area * min(ratio / 6.0, 1.0) / (1.0 + corner_dist / (w * 0.1))
-        candidates.append(((x1, y1, x2, y2), score))
-    if not candidates:
-        return []
-    top = max(score for _, score in candidates)
-    threshold = top * 0.04
-    pad = max(10, h // 150)
+    img = np.array(image.convert('RGB'))
+    h, w = img.shape[:2]
     boxes = []
-    for (x1, y1, x2, y2), score in candidates:
-        if score < threshold:
-            continue
-        boxes.append((
-            max(0, x1 - pad),
-            max(0, y1 - pad),
-            min(w - 6, x2 + pad),
-            min(h - 6, y2 + pad),
-        ))
-    return boxes
+    for th in (230, 210, 190, 170):
+        cand = _boxes_from_mask((img >= th).all(axis=2), h, w)
+        boxes.extend(cand)
+    return _fuse_boxes(boxes)
+
+
+def _detect_full_dark(image):
+    """全图深色文字检测（--any-position opt-in）：亮背景上的暗字负片扫描。
+    大面积暗区（黑底/深色书本）会因组件超高（>9%H）或填充率过高被拒。"""
+    try:
+        import numpy as np
+        import scipy.ndimage as ndi
+    except ImportError:
+        return []
+    img = np.array(image.convert('RGB'))
+    h, w = img.shape[:2]
+    dark = (img <= 40).all(axis=2)
+    return _boxes_from_mask(dark, h, w)
 
 
 def _corner_row_boxes(white, H, W, x0, y0, pad):
@@ -542,6 +590,14 @@ def parse_box(value):
     return tuple(parts)
 
 
+def parse_boxes(value):
+    """一个或多个遮罩框，分号分隔：x1,y1,x2,y2;x1,y1,x2,y2（argparse 负数需用 = 传参）。"""
+    boxes = [parse_box(part) for part in value.split(';') if part.strip()]
+    if not boxes:
+        raise argparse.ArgumentTypeError('at least one box is required')
+    return boxes
+
+
 def resolve_box(width, height, raw_box):
     if raw_box is None:
         return mask_box(width, height)
@@ -633,7 +689,7 @@ def prepare(names, custom_box, root, emit=True, model='mat', refine=False, any_p
                 print(f'{name}: template mask ({tpl_info})')
             else:
                 with Image.open(backup) as probe:
-                    boxes = detect_watermark_boxes(probe)
+                    boxes = detect_watermark_boxes(probe, extended=any_position)
                     # 豆包水印必贴右下角：丢弃远离右下角的检出框，
                     # 否则雪景白点/白墙/栏杆等画面内容会被误检硬修（毁图）。
                     # --any-position 显式开启时保留全部文字性通过的框（处理
@@ -649,7 +705,7 @@ def prepare(names, custom_box, root, emit=True, model='mat', refine=False, any_p
                     skipped = True
                     print(f'{name}: no watermark detected, skipped (template fallback: {tpl_info})')
         else:
-            boxes = [resolve_box(width, height, custom_box)]
+            boxes = [resolve_box(width, height, b) for b in custom_box]
         if not skipped and not (MASKS / f'{name}.tpl').exists() and boxes:
             # 框内笔画精分割（mask 最小化原则的泛化）：手动框/检测框都先尝试
             # 缩小到笔画级；失败（背景与水印不可分/过度碎化）退回整框+粗填。
@@ -840,8 +896,9 @@ def main():
     parser = argparse.ArgumentParser(description='Remove Doubao or custom text watermark from PNG images.')
     parser.add_argument(
         '--mask-box',
-        type=parse_box,
-        help='custom watermark box as x1,y1,x2,y2; negative values are relative to right/bottom, e.g. -330,-118,-8,-8',
+        type=parse_boxes,
+        help='custom watermark box(es) as x1,y1,x2,y2[;x1,y1,x2,y2...]; negative '
+             'values are relative to right/bottom, e.g. -330,-118,-8,-8',
     )
     parser.add_argument(
         '--root',

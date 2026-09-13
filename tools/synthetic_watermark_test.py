@@ -112,7 +112,7 @@ def iou(a, b):
 
 def layer1_detect(image, real):
     from remove_doubao_watermark import detect_watermark_boxes
-    boxes = detect_watermark_boxes(image)
+    boxes = detect_watermark_boxes(image, extended=True)
     hit = max((iou(b, real) for b in boxes), default=0.0)
     return hit, boxes
 
@@ -120,7 +120,7 @@ def layer1_detect(image, real):
 def layer2_prepare(image, w, h, real, any_position=False):
     """直接复用 prepare 的遮罩来源逻辑（不落盘原图，用合成图）"""
     from remove_doubao_watermark import detect_watermark_boxes
-    boxes = detect_watermark_boxes(image)
+    boxes = detect_watermark_boxes(image, extended=any_position)
     pw, ph = image.size
     if not any_position:
         boxes = [b for b in boxes if b[2] > pw - 40 and b[3] > ph - 40]
