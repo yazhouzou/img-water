@@ -166,15 +166,16 @@ def detect_watermark_boxes(image, extended=False):
        填充率 ≤0.6 且 x 投影列段数 ≥3（实心块如灯罩 fill 0.8+、段数 1，文字水印
        fill ~0.2、段数=字符数）；
     2) 右下角自适应阈值兜底（识别半透明/灰白粗体水印），与第 1 级合并去重。
-    extended=True（--any-position 时）：追加全图灰白多阈值扫描与深色字负片检测，
-    用于任意位置的非纯白文字水印；busy photo 误检风险由显式开启承担。"""
+    extended=True（--any-position 时）：追加全图灰白多阈值扫描、深色字负片检测、
+    彩色字色度检测与低对比亮字顶帽检测，用于任意位置的非白文字水印；
+    busy photo 误检风险由显式开启承担。"""
     full = _detect_full_white(image)
     corner = _detect_corner_faded(image)
     found = full + [b for b in corner if not any(_overlap(b, f) for f in full)]
     if extended:
-        faded = _detect_full_faded(image)
-        dark = _detect_full_dark(image)
-        for b in faded + dark:
+        extra = _detect_full_faded(image) + _detect_full_color(image)
+        extra += _detect_full_tophat(image) + _detect_full_dark(image)
+        for b in extra:
             if not any(_overlap(b, f) for f in found):
                 found.append(b)
     return found
@@ -278,10 +279,45 @@ def _detect_full_faded(image):
     img = np.array(image.convert('RGB'))
     h, w = img.shape[:2]
     boxes = []
-    for th in (230, 210, 190, 170):
+    for th in (230, 210, 190, 170, 160):
         cand = _boxes_from_mask((img >= th).all(axis=2), h, w)
         boxes.extend(cand)
     return _fuse_boxes(boxes)
+
+
+def _detect_full_color(image):
+    """全图彩色文字检测（--any-position opt-in）：色度分量（max-min 通道差）
+    显著的区域——纯色水印叠加使色度远高于灰白/低饱和背景；抗锯齿边缘色度
+    低但笔画核心密度（~20%）与文字水印相当，膨胀成行后文字性过滤可判。
+    高饱和背景（红花绿叶/彩色墙面）必误检，由 opt-in 承担。"""
+    try:
+        import numpy as np
+        import scipy.ndimage as ndi
+    except ImportError:
+        return []
+    img = np.array(image.convert('RGB'))
+    h, w = img.shape[:2]
+    sat = img.max(axis=2) - img.min(axis=2)
+    return _boxes_from_mask(sat > 60, h, w)
+
+
+def _detect_full_tophat(image):
+    """低对比亮字顶帽检测（--any-position opt-in）：亮背景上的浅灰字亮度
+    阈值不可分（如 220 字 vs 235 墙），形态学顶帽（原图-开运算）提取局部
+    高亮结构。纹理背景响应同样高（纸面/织物必误检），由 opt-in 承担。"""
+    try:
+        import numpy as np
+        import cv2
+        import scipy.ndimage as ndi
+    except ImportError:
+        return []
+    img = np.array(image.convert('RGB'))
+    h, w = img.shape[:2]
+    gray = img.max(axis=2).astype(np.uint8)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    opened = cv2.morphologyEx(gray, cv2.MORPH_OPEN, k)
+    tophat = gray.astype(np.int16) - opened.astype(np.int16)
+    return _boxes_from_mask(tophat >= 12, h, w)
 
 
 def _detect_full_dark(image):
@@ -699,6 +735,10 @@ def prepare(names, custom_box, root, emit=True, model='mat', refine=False, any_p
                         boxes = [b for b in boxes if b[2] > pw - 40 and b[3] > ph - 40]
                 if boxes:
                     print(f'{name}: auto-detected {len(boxes)} watermark box(es) {boxes} (template fallback: {tpl_info})')
+                    if len(boxes) > 6:
+                        print(f'{name}: WARNING {len(boxes)} boxes detected — busy photo '
+                              f'false positives are likely; review the candidate review '
+                              f'image carefully before overwriting')
                 else:
                     # 检测不到水印：写全空 mask 跳过修复，绝不用默认规则硬修——
                     # 对已无水印的图硬修会把真实画面重绘成模糊块
