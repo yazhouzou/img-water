@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -48,48 +49,75 @@ else:
 DEVICE = 'mps' if sys.platform == 'darwin' else 'cpu'
 
 TEMPLATE_ASSET = Path(__file__).resolve().parent / 'doubao-wm-template.png'
+TEMPLATE_ALPHA_ASSET = Path(__file__).resolve().parent / 'doubao-wm-alpha.png'
 TEMPLATE_META = TEMPLATE_ASSET.with_suffix('.json')
-# gap-score（笔画区均亮 - 间隙区均亮）实测：黑底 144 / 雪景 102-136 / 花墙 57 /
-# 沙滩 62；纸面低对比 15 回退整框检测。阈值取中间空档。
-TEMPLATE_MIN_SCORE = 40.0
-# 膨胀核按模型区分：
-# - MAT（配粗填）：7x7（±3px）。粗填（TELEA 从 mask 边界插值）已把 mask 区填成
-#   背景延续、消除字形上下文，±3px 只需盖住抗锯齿带——最小化 mask 才能最大
-#   保留字符间隙里的真实画面（6.png 红棕带/花瓣：19x11 时修改面积 14506px、
-#   阴影丢失 6047px；7x7 降至 10707/4866，花丛形态与原图高度一致）。
-#   直接 MAT（无粗填）下 ±3px 会字形复活，勿去掉粗填。
-# - LaMa（无粗填）：19x11（水平 ±9 填满字符间隙防"见字生字"，垂直 ±5 盖抗锯齿）。
-TEMPLATE_DILATE_MAT = (7, 7)
-TEMPLATE_DILATE_LAMA = (19, 11)
+# 顶帽 gap-score（笔画区均亮 - 间隙区均亮）实测：黑底 145 / 雪景 59 / 花墙 53 /
+# 沙滩 96 / 纸面 33；已去水印图（负样本）≤8.4。阈值 20 取中间空档：3.png 纸面
+# 低对比水印并入模板路径走笔画级 α mask，避免回退整框重绘抹平纸面折痕。
+TEMPLATE_MIN_SCORE = 20.0
+# 连续 α mask：水印真正污染的像素是 α>0（含抗锯齿带），二值模板（α>0.5）只覆盖
+# 笔画核心，只能靠大膨胀补抗锯齿，代价是多盖 ~30% 干净画面被模型重绘（"影响周边
+# 元素"的根因）。改用从黑底 2.png 提取的连续 α 图（tools/doubao-wm-alpha.png，
+# 已扣底噪 18）：mask = α>0.03 的像素 + 1px 缓冲，只覆盖真正被污染的像素。α 图
+# 已完整盖住抗锯齿，字符间隙无字形上下文，MAT/LaMa 实测均无字形复活（6.png 花丛、
+# 1.png 沙粒保留明显多于二值+7x7；改动面积 -10%~-30%）。
+TEMPLATE_ALPHA_THRESHOLD = 8  # 0..255，约 α>0.03
+TEMPLATE_STROKE_DILATE = (3, 3)  # ±1px，仅补偿缩放/对齐误差
+# refine（--refine 实验性框内笔画精分割）仍用较大核连接笔画碎片
+REFINE_DILATE_MAT = (7, 7)
+REFINE_DILATE_LAMA = (19, 11)
+# 逆解 stamp（默认开，--no-inverse 关）：完整水印模型 obs = α·C + (1−α)·bg，α 为覆盖度、
+# C 为逐像素颜色（含暗色描边——纯白字模型反解不掉它）。从 4 张同款水印、不同背景
+# 的图（黑底/纸面/沙滩/花墙）联立标定。逆解恢复的是**真实背景**（非生成），对复杂
+# 纹理背景（花丛类）明显优于 MAT 的平滑重绘；但对低纹理背景（暗底/沙面/纸面）会
+# 放大噪声，故用 gating 只在 scale≈1.0 且水印邻域纹理复杂时启用，其余走 MAT。
+STAMP_ASSET = Path(__file__).resolve().parent / 'doubao-wm-stamp.npz'
+STAMP_REF_SHORT = 1600.0
+INVERSE_SCALE_TOL = 0.03
+INVERSE_TEXTURE_MIN = 9.0
+INVERSE_ALPHA_GAIN_RANGE = (0.8, 1.25)
+INVERSE_MAX_GHOST = 0.12
 
 
 def load_template():
-    """加载笔画级水印模板（黑底图提取），返回 (tpl_bool, meta) 或 (None, None)。"""
+    """加载笔画级水印模板（黑底图提取），返回 (tpl_bool, alpha_float, meta)；
+    资产缺失时 alpha 为 None（调用方回退二值模板膨胀）。"""
     if not TEMPLATE_ASSET.exists() or not TEMPLATE_META.exists():
-        return None, None
+        return None, None, None
     import json
 
     import numpy as np
 
     tpl = np.array(Image.open(TEMPLATE_ASSET).convert('L')) > 127
+    alpha = None
+    if TEMPLATE_ALPHA_ASSET.exists():
+        alpha = np.array(Image.open(TEMPLATE_ALPHA_ASSET).convert('L')).astype(np.float32) / 255.0
     meta = json.loads(TEMPLATE_META.read_text())
-    return tpl, meta
+    return tpl, alpha, meta
 
 
 def template_stroke_mask(gray, width, height, model='mat'):
     """在右下角窗口内用模板做 gap-score 匹配（0/1 模板核取 S_in、全 1 核取窗口和，
     gap = S_in/N_in − S_out/N_out），返回 (mask_uint8, score, info)。
-    模板按图片短边比例缩放（豆包水印随短边等比）。膨胀核按模型区分：
-    MAT 配粗填用 7x7（最小侵入），LaMa 无粗填用 19x11（连片防字形复活）。
+    模板按图片短边比例缩放（豆包水印随短边等比）。mask 优先用连续 α 图
+    （α>0.03 的污染像素 + 1px 缓冲，最小侵入）；α 资产缺失时回退二值模板膨胀。
     分数低于阈值返回 (None, score, info) 交给整框检测回退。"""
     try:
         import cv2
         import numpy as np
     except ImportError:
         raise SystemExit('missing cv2/numpy; run ./tools/ensure-inpaint-env.sh first')
-    tpl, meta = load_template()
+    tpl, alpha, meta = load_template()
     if tpl is None:
         return None, 0.0, 'template asset missing'
+    # 顶帽（局部背景扣除）后再匹配：亮背景（纸面/花墙/雪）会压低"笔画-间隙"绝对差，
+    # 使 3.png 这类低对比水印漏判（raw max(RGB) gap 仅 15，甚至低于已去水印图的负样本）。
+    # 顶帽只保留局部高于背景的亮结构，水印笔画凸显、纹理与光照梯度被抑制，且与背景
+    # 亮度无关：实测正样本 ≥33（3.png 33）、负样本 ≤8.4，分离更干净。
+    k = max(3, (min(height, width) - 1) | 1)
+    k = min(31, k)
+    gray = gray - cv2.morphologyEx(
+        gray, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
     scale = min(height, width) / meta['ref_short_side']
     t = cv2.resize(tpl.astype(np.float32), (0, 0), fx=scale, fy=scale,
                    interpolation=cv2.INTER_NEAREST)
@@ -112,13 +140,102 @@ def template_stroke_mask(gray, width, height, model='mat'):
     score = float(response[py, px])
     if score < TEMPLATE_MIN_SCORE:
         return None, score, f'template score {score:.1f} < {TEMPLATE_MIN_SCORE}'
-    kernel = TEMPLATE_DILATE_MAT if model == 'mat' else TEMPLATE_DILATE_LAMA
-    mask = cv2.dilate((t > 0.5).astype(np.uint8),
-                      cv2.getStructuringElement(cv2.MORPH_RECT, kernel), 1)
+    if alpha is not None:
+        a = cv2.resize(alpha, (tw_t, th_t), interpolation=cv2.INTER_LINEAR)
+        core = (a * 255.0 > TEMPLATE_ALPHA_THRESHOLD).astype(np.uint8)
+        how = 'alpha'
+    else:
+        core = (t > 0.5).astype(np.uint8)
+        how = 'binary fallback'
+    mask = cv2.dilate(core,
+                      cv2.getStructuringElement(cv2.MORPH_RECT, TEMPLATE_STROKE_DILATE), 1)
     full = np.zeros((height, width), np.uint8)
     full[py:py + th_t, px:px + tw_t] = mask * 255
-    return full, score, f'template matched at ({px},{py}) score {score:.1f}'
+    return full, score, f'template matched at ({px},{py}) score {score:.1f} ({how})'
 
+
+def inverse_apply(obs_path, mat_path, model='mat'):
+    """对模板命中的图做完整 stamp 逆解（obs = α·C + (1−α)·bg），返回处理后整图；
+    不满足 gating（scale≈1.0 + 水印邻域纹理复杂）或逆解不可靠时返回 None（保持 MAT）。
+    逐图自校正 α 增益（最小化残影与 α 的相关性），饱和像素回退 MAT 结果。"""
+    import cv2
+    import numpy as np
+
+    alpha0, color0 = _load_stamp()
+    if alpha0 is None:
+        return None
+    with Image.open(obs_path) as probe:
+        obs = np.array(probe.convert('RGB')).astype(np.float32)
+    height, width = obs.shape[:2]
+    short = min(height, width)
+    if abs(short / STAMP_REF_SHORT - 1.0) > INVERSE_SCALE_TOL:
+        return None
+    gray = obs.max(axis=2)
+    mask, score, info = template_stroke_mask(gray, width, height, model)
+    if mask is None:
+        return None
+    mm = re.search(r'at \((\d+),(\d+)\)', info)
+    if not mm:
+        return None
+    px, py = int(mm.group(1)), int(mm.group(2))
+    scale = short / STAMP_REF_SHORT
+    th = int(round(alpha0.shape[0] * scale))
+    tw = int(round(alpha0.shape[1] * scale))
+    if py + th > height or px + tw > width:
+        return None
+    # 水印邻域纹理复杂度（排除背景过于平滑的场景：MAT 已足够，逆解只会放大噪声）
+    y0, x0 = max(0, py - 40), max(0, px - 60)
+    y1, x1 = min(height, py + th + 40), min(width, px + tw + 60)
+    reg = obs[y0:y1, x0:x1]
+    hf = float(np.abs(reg - cv2.GaussianBlur(reg, (0, 0), 2.0)).mean())
+    if hf < INVERSE_TEXTURE_MIN:
+        return None
+    a0 = cv2.resize(alpha0, (tw, th), interpolation=cv2.INTER_LINEAR)
+    color = cv2.resize(color0, (tw, th), interpolation=cv2.INTER_LINEAR)
+    win = obs[py:py + th, px:px + tw]
+    mat = np.array(Image.open(mat_path).convert('RGB')).astype(np.float32)[py:py + th, px:px + tw]
+    best = None
+    lo, hi = INVERSE_ALPHA_GAIN_RANGE
+    for k in np.arange(lo, hi + 1e-6, 0.05):
+        a = np.clip(a0 * k, 0, 1)
+        a3 = a[..., None]
+        inv = np.clip((win - a3 * color) / np.maximum(1 - a3, 1e-3), 0, 255)
+        g = cv2.GaussianBlur(inv, (0, 0), 2.5)
+        hfm = (inv - g).max(axis=2)
+        m = a > 0.03
+        if int(m.sum()) < 50:
+            continue
+        ghost = abs(float(np.corrcoef(hfm[m], a[m])[0, 1]))
+        if best is None or ghost < best[0]:
+            best = (ghost, inv, a, float(k))
+    if best is None or best[0] > INVERSE_MAX_GHOST:
+        return None
+    _, inv, a, gain = best
+    # ① 只改写"声明的 mask"内（stamp α 比模板 mask 略宽，放任越界会破坏
+    #    "mask 外零改动"这条场景无关的硬性保证）。
+    # ② 回退 MAT 仅在【逆解失解】时：模型不适用（raw 超出 [0,255]，obs 无法由
+    #    α·C+(1-α)·bg 解释）或全通道饱和。**关键教训**：旧策略"任一通道饱和即回退
+    #    MAT"会让 MAT 在木纹/亮背景的饱和像素上生成深色斑点（6.png 实测黑点 artifact，
+    #    原图 239→MAT 37）；改为仅在失解时回退后该黑点消失、模板残留不变（10.1→10.2）。
+    a3 = a[..., None]
+    raw = (win - a3 * color) / np.maximum(1 - a3, 1e-3)
+    ill_posed = (((raw < -0.5) | (raw > 255.5)).any(axis=2)
+                 | (win >= 252).all(axis=2))
+    m = (a > 0.03) & (mask[py:py + th, px:px + tw] > 0)
+    hyb = np.where(ill_posed[..., None], mat, inv)
+    out = obs.copy()
+    sub = out[py:py + th, px:px + tw]
+    sub[m] = hyb[m]
+    out[py:py + th, px:px + tw] = sub
+    return out.astype(np.uint8), (px, py, hf, gain, best[0])
+
+
+def _load_stamp():
+    import numpy as np
+    if not STAMP_ASSET.exists():
+        return None, None
+    data = np.load(STAMP_ASSET)
+    return data['alpha'], data['color']
 
 
 def backup_dir(root):
@@ -574,7 +691,7 @@ def refine_box_mask(image, box, model='mat'):
     # 失败判定：几乎填满整框（不可分）或过度碎化（背景细节误检）
     if stroke_px == 0 or stroke_px > box_area * 0.6 or kept > 300:
         return None
-    kernel = TEMPLATE_DILATE_MAT if model == 'mat' else TEMPLATE_DILATE_LAMA
+    kernel = REFINE_DILATE_MAT if model == 'mat' else REFINE_DILATE_LAMA
     mask = cv2.dilate(cleaned, cv2.getStructuringElement(cv2.MORPH_RECT, kernel), 1)
     full = np.zeros((h, w), np.uint8)
     # 裁剪回框内+pad（膨胀略超出候选框属正常：水印边缘本可能在框外 1-2px）
@@ -845,6 +962,125 @@ def prepare(names, custom_box, root, emit=True, model='mat', refine=False, any_p
         print(output)
     return output
 
+# ---------------------------------------------------------------------------
+# 结果级验证闭环（场景无关）：修复后客观自检 + 低置信度主动告警。
+# 核心保证：① "mask 外零改动"——任何水印、任何场景都成立，被破坏即工程 bug；
+# ② 模板残留——豆包水印修复后不应再匹配到模板字形；③ mask 面积占比（过度重绘告警）。
+# 不依赖 ground truth，故可泛化到未见过的场景：修完必须过检，否则拒绝落盘。
+# ---------------------------------------------------------------------------
+
+def verify_paths(orig_path, res_path, mask_path, outside_tol=2, warn_ratio=0.08,
+                 template_applied=None):
+    """对 (原图, 修复结果, mask) 三元组做客观验证，返回报告 dict；缺文件返回 None。
+    template_applied 为 True 时才做"豆包模板残留"检查（否则非豆包水印可能碰巧匹配模板
+    而误报）；为 None 时按 scale≈1.0 自动判断。"""
+    import numpy as np
+
+    if not (orig_path and res_path and mask_path):
+        return None
+    orig_path, res_path, mask_path = Path(orig_path), Path(res_path), Path(mask_path)
+    if not (orig_path.exists() and res_path.exists() and mask_path.exists()):
+        return None
+    with Image.open(orig_path) as im:
+        orig = np.array(im.convert('RGB')).astype(np.int16)
+    with Image.open(res_path) as im:
+        res = np.array(im.convert('RGB')).astype(np.int16)
+    if orig.shape != res.shape:
+        return None
+    with Image.open(mask_path) as im:
+        m = im.convert('L')
+        if m.size != (orig.shape[1], orig.shape[0]):
+            m = m.resize((orig.shape[1], orig.shape[0]))
+        mask = np.array(m)
+    active = mask > 0
+    area = int(active.sum())
+    total = int(mask.shape[0] * mask.shape[1])
+    diff = np.abs(orig - res).max(axis=2)
+    report = {
+        'mask_area': area,
+        'mask_ratio': area / float(total) if total else 0.0,
+        'passthrough': area == 0,
+        'inside_changed': int((diff[active] > 10).sum()) if area else 0,
+        'outside_changed': int((diff[~active] > outside_tol).sum()),
+        'outside_max': int(diff[~active].max()) if (~active).any() else 0,
+        'reasons': [],
+    }
+    # 模板残留：原图命中模板 → 修复后不应再命中（豆包水印专用判据，非豆包图自动跳过）
+    orig_score = res_score = 0.0
+    try:
+        gray_o = np.array(Image.open(orig_path).convert('RGB')).max(axis=2).astype(np.float32)
+        _, orig_score, _ = template_stroke_mask(gray_o, gray_o.shape[1], gray_o.shape[0])
+        gray_r = np.array(Image.open(res_path).convert('RGB')).max(axis=2).astype(np.float32)
+        _, res_score, _ = template_stroke_mask(gray_r, gray_r.shape[1], gray_r.shape[0])
+    except Exception:
+        pass
+    report['orig_template_score'] = round(float(orig_score), 1)
+    report['res_template_score'] = round(float(res_score), 1)
+    # 是否做模板残留检查：优先用调用方给的 template_applied；未给则要求
+    # scale≈1.0（合成/缩放图上的非豆包水印可能碰巧高分，会误报）
+    if template_applied is None:
+        scale = min(orig.shape[0], orig.shape[1]) / STAMP_REF_SHORT
+        template_applied = (orig_score >= TEMPLATE_MIN_SCORE
+                            and abs(scale - 1.0) <= INVERSE_SCALE_TOL)
+    # 结构化残留标记：供自动重试逻辑判定"是否因水印残留而不完美"
+    # （区别于 mask 外改动——那是工程 bug，重试无法修复）
+    report['residual'] = bool(template_applied and orig_score >= TEMPLATE_MIN_SCORE
+                              and res_score >= TEMPLATE_MIN_SCORE)
+    verdict = 'PASS'
+    if report['outside_changed'] > 0:
+        verdict = 'FAIL'
+        report['reasons'].append(
+            f"mask 外有 {report['outside_changed']} px 被改动 (max {report['outside_max']})")
+    if template_applied and orig_score >= TEMPLATE_MIN_SCORE and res_score >= TEMPLATE_MIN_SCORE:
+        verdict = 'FAIL'
+        report['reasons'].append(
+            f'修复后仍匹配豆包模板 (score {res_score:.1f} >= {TEMPLATE_MIN_SCORE:.0f})，疑有残留')
+    elif template_applied and orig_score >= TEMPLATE_MIN_SCORE and res_score >= TEMPLATE_MIN_SCORE * 0.6:
+        if verdict != 'FAIL':
+            verdict = 'WARN'
+        report['reasons'].append(
+            f'修复后模板分数偏高 ({res_score:.1f})，可能有残留，请放大复查')
+    if (not report['passthrough']) and report['mask_ratio'] > warn_ratio:
+        if verdict == 'PASS':
+            verdict = 'WARN'
+        report['reasons'].append(
+            f"mask 占图 {report['mask_ratio'] * 100:.1f}% (> {warn_ratio * 100:.0f}%)，可能过度重绘")
+    report['verdict'] = verdict
+    return report
+
+
+def verify_repaired(name, root):
+    """按工作目录约定验证本轮修复结果：原图取备份（无则 source），结果取 lama。
+    模板 sidecar 存在说明本轮走了豆包模板路径，则启用模板残留检查。"""
+    orig = backup_dir(root) / name
+    if not orig.exists():
+        orig = SOURCE / name
+    tpl_applied = (MASKS / f'{name}.tpl').exists()
+    return verify_paths(orig, LAMA / name, MASKS / name, template_applied=tpl_applied)
+
+
+def format_verify(report):
+    if report is None:
+        return None
+    if report['passthrough']:
+        head = 'no mask (passthrough)'
+    else:
+        head = (f"mask {report['mask_area']}px ({report['mask_ratio'] * 100:.1f}%), "
+                f"inside changed {report['inside_changed']}")
+    return (f"[{report['verdict']}] {head}, outside changed {report['outside_changed']} "
+            f"(max {report['outside_max']}), tmpl {report['orig_template_score']}"
+            f"->{report['res_template_score']}")
+
+
+def report_verify(name, report):
+    line = format_verify(report)
+    if line is None:
+        return
+    print(f'verify {name}: {line}')
+    for reason in report['reasons']:
+        print(f'verify {name}: {reason}')
+
+
 def review(input_dir, output_name, names):
     REVIEW.mkdir(parents=True, exist_ok=True)
     crops = []
@@ -876,7 +1112,88 @@ def review(input_dir, output_name, names):
     sheet.save(REVIEW / output_name)
 
 
-def inpaint(model='mat'):
+# 残留自动重试（默认开，最多 1 轮）：自校验判定"水印残留"时把 mask 逐级膨胀一级
+# 后重跑 MAT。这是"不完美就重新处理"的落点——残留来自 mask 盖不住（对齐/抗锯齿
+# 误差），小一级膨胀即可；只在明确的残留 FAIL 上触发，mask 外改动属工程 bug 不重试。
+RETRY_DILATE = (5, 5)
+
+
+def _expand_mask(mask_path, kernel=RETRY_DILATE):
+    """把笔画 mask 往外膨胀一级（仍紧贴水印，最小侵入），返回新增像素数；空 mask 返回 0。"""
+    import cv2
+    import numpy as np
+
+    m = np.array(Image.open(mask_path).convert('L'))
+    if not (m > 0).any():
+        return 0
+    grown = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_RECT, kernel), 1)
+    Image.fromarray(grown).save(mask_path)
+    return int((grown > m).sum())
+
+
+def _residual_state(name):
+    """本轮修复结果是否"因水印残留而不完美"：原图取 SOURCE（本轮未改动原图），
+    结果取 LAMA，.tpl sidecar 存在即启用豆包模板残留判据。返回 (是否残留, 报告)。"""
+    report = verify_paths(SOURCE / name, LAMA / name, MASKS / name,
+                          template_applied=(MASKS / f'{name}.tpl').exists())
+    return bool(report and report.get('residual')), report
+
+
+def _retry_inpaint(names, model):
+    """把待重试的图单独放进隔离子目录重跑一次 iopaint（避免整批重复推理），
+    结果写回 LAMA。"""
+    retry_root = WORK / 'retry'
+    sub_src = retry_root / 'source'
+    sub_msk = retry_root / 'masks'
+    sub_out = retry_root / 'lama'
+    if retry_root.exists():
+        rmtree(retry_root)
+    for path in (sub_src, sub_msk, sub_out):
+        path.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        copyfile(SOURCE / name, sub_src / name)
+        copyfile(MASKS / name, sub_msk / name)
+    subprocess.run(
+        [
+            str(IOPAINT),
+            'run',
+            '--model',
+            model,
+            '--device',
+            DEVICE,
+            '--image',
+            str(sub_src),
+            '--mask',
+            str(sub_msk),
+            '--output',
+            str(sub_out),
+        ],
+        check=True,
+    )
+    for name in names:
+        copyfile(sub_out / name, LAMA / name)
+
+
+def _residual_retry(names, model):
+    """对残留图扩 mask 并用 MAT 重跑复验；仍残留则打印 FAIL（交给 overwrite-review 拒绝落盘）。"""
+    candidates = [name for name in names if _residual_state(name)[0]]
+    if not candidates:
+        return
+    print(f'verify: watermark residual detected in {", ".join(candidates)} — '
+          f'expanding mask and retrying once (max 1 round)')
+    for name in candidates:
+        added = _expand_mask(MASKS / name)
+        print(f'{name}: retry mask +{added}px (dilate {RETRY_DILATE[0]}x{RETRY_DILATE[1]})')
+    _retry_inpaint(candidates, model)
+    for name in candidates:
+        residual, report = _residual_state(name)
+        report_verify(name, report)
+        if residual:
+            print(f'{name}: STILL residual after retry — overwrite-review will refuse '
+                  f'unless --force is used')
+
+
+def inpaint(model='mat', inverse=True, retry=True):
     if not IOPAINT.exists():
         raise SystemExit('missing project env; run tools/ensure-inpaint-env.sh (or .ps1 on Windows) first')
     try:
@@ -899,6 +1216,7 @@ def inpaint(model='mat'):
     if not any(SOURCE.iterdir()):
         print('all images passed through: no watermark to remove')
         return
+    active_names = [p.name for p in sorted(SOURCE.glob('*.png'), key=numeric_key)]
     # MAT（mask-aware transformer）对结构边界的重建显著优于 LaMa：
     # 光斑/阴影/花瓣形态保留更完整（6.png 花墙阴影、光斑锐度对比验证），
     # 代价是推理约慢 12 倍（单图 ~2 分钟 vs ~10 秒）。lama 可用 --model lama 回退。
@@ -919,17 +1237,42 @@ def inpaint(model='mat'):
         ],
         check=True,
     )
+    if inverse:
+        # inverse（默认开，逐图自动择优）：模板命中且纹理复杂的 scale≈1.0 图用
+        # 完整 stamp 逆解恢复真实背景（覆盖 MAT 结果）；其余图 gating 判定后保持
+        # MAT。见 inverse_apply gating。
+        applied = []
+        for sidecar in sorted(MASKS.glob('*.tpl')):
+            name = sidecar.stem
+            obs_path, mat_path = SOURCE / name, LAMA / name
+            if not obs_path.exists() or not mat_path.exists():
+                continue
+            res = inverse_apply(obs_path, mat_path, model)
+            if res is None:
+                print(f'{name}: inverse skipped (gating), keep MAT')
+                continue
+            out, (px, py, hf, gain, ghost) = res
+            Image.fromarray(out).save(mat_path)
+            applied.append(f'{name} (pos {px},{py} hf {hf:.1f} gain {gain:.2f} ghost {ghost:.3f})')
+        if applied:
+            print('inverse stamp applied: ' + '; '.join(applied))
+    if retry:
+        # 自校验不完美 → 重新处理（最多 1 轮）：见 _residual_retry
+        _residual_retry(active_names, model)
 
 
-def review_lama(names, emit=True):
+def review_lama(names, emit=True, root=None, verify=True):
     output = REVIEW / 'lama-corner-review.png'
     review(LAMA, output.name, names)
+    if verify:
+        for name in names:
+            report_verify(name, verify_repaired(name, root or DEFAULT_ROOT))
     if emit:
         print(output)
     return output
 
 
-def overwrite_review(names, root, emit=True):
+def overwrite_review(names, root, emit=True, verify=True, force=False):
     if not MANIFEST.exists():
         raise SystemExit(
             'overwrite-review: no prepare manifest found in workdir — refusing to '
@@ -950,6 +1293,18 @@ def overwrite_review(names, root, emit=True):
                 f'the same folder used by prepare, and that the file was not modified '
                 f'in between.')
         pending.append((src, dst))
+    # 验证闭环：落盘前客观自检，FAIL 拒绝覆盖（--force 强制），WARN 提示
+    if verify:
+        failures = []
+        for name in names:
+            report = verify_repaired(name, root)
+            report_verify(name, report)
+            if report and report['verdict'] == 'FAIL':
+                failures.append(name)
+        if failures and not force:
+            raise SystemExit(
+                'overwrite-review: verification FAILED for ' + ', '.join(failures)
+                + ' — refusing to overwrite (use --force to override, or review manually)')
     for src, dst in pending:
         copyfile(src, dst)
     output = REVIEW / 'overwritten-corner-review.png'
@@ -971,11 +1326,11 @@ def cleanup(names, root):
         rmtree(WORK)
 
 
-def run_all(names, custom_box, keep_work, root, model='mat', refine=False, any_position=False):
+def run_all(names, custom_box, keep_work, root, model='mat', refine=False, any_position=False, inverse=True, force=False, retry=True):
     prepare(names, custom_box, root, emit=False, model=model, refine=refine, any_position=any_position)
-    inpaint(model)
-    candidate_review = review_lama(names, emit=False)
-    final_review = overwrite_review(names, root, emit=False)
+    inpaint(model, inverse=inverse, retry=retry)
+    candidate_review = review_lama(names, emit=False, root=root)
+    final_review = overwrite_review(names, root, emit=False, force=force)
     print(f'processed {len(names)} file(s): {", ".join(names)}')
     print(f'candidate review: {candidate_review}')
     print(f'final review: {final_review}')
@@ -1026,6 +1381,44 @@ def main():
              'still produce false positives, so review the corner review image '
              'before overwriting.',
     )
+    parser.add_argument(
+        '--inverse',
+        dest='inverse',
+        action='store_true',
+        default=True,
+        help='DEFAULT ON: per-image auto selection. For template-matched scale~1.0 '
+             'images with complex texture (e.g. flowers), recover the real background '
+             'under the watermark via the calibrated full stamp model '
+             '(obs = a*C + (1-a)*bg) instead of MAT generation; other images '
+             '(smooth backgrounds, scaled images, saturated pixels) automatically '
+             'keep MAT. Restores real texture but can amplify noise on smooth '
+             'backgrounds, hence gated. Use --no-inverse to force MAT everywhere.',
+    )
+    parser.add_argument(
+        '--no-inverse',
+        dest='inverse',
+        action='store_false',
+        help='disable auto inverse and force MAT for every image',
+    )
+    parser.add_argument(
+        '--no-retry',
+        dest='retry',
+        action='store_false',
+        default=True,
+        help='disable the automatic residual retry. DEFAULT ON: when result-level '
+             'verification finds leftover watermark after inpainting, the mask is '
+             'expanded one level and the model is re-run once (max 1 round); if it is '
+             'still not perfect, overwrite-review refuses to write. Use this flag to '
+             'keep only the refusing gate without auto-reprocessing.',
+    )
+    parser.add_argument(
+        '--force',
+        action='store_true',
+        help='overwrite-review only: override the result-level verification gate and '
+             'overwrite even when verification FAILS (e.g. mask-outside changes or '
+             'detected residual). Use only after manual review — it disables the '
+             'scene-independent safety net.',
+    )
     parser.add_argument('command', choices=['run', 'prepare', 'inpaint', 'review-lama', 'overwrite-review', 'cleanup'])
     parser.add_argument('files', nargs='*')
     args = parser.parse_args()
@@ -1035,15 +1428,16 @@ def main():
     names = target_names(args.files, root)
 
     if args.command == 'run':
-        run_all(names, args.mask_box, args.keep_work, root, args.model, args.refine, args.any_position)
+        run_all(names, args.mask_box, args.keep_work, root, args.model, args.refine,
+                args.any_position, args.inverse, force=args.force, retry=args.retry)
     elif args.command == 'prepare':
         prepare(names, args.mask_box, root, model=args.model, refine=args.refine, any_position=args.any_position)
     elif args.command == 'inpaint':
-        inpaint(args.model)
+        inpaint(args.model, inverse=args.inverse, retry=args.retry)
     elif args.command == 'review-lama':
-        review_lama(names)
+        review_lama(names, root=root)
     elif args.command == 'overwrite-review':
-        overwrite_review(names, root)
+        overwrite_review(names, root, force=args.force)
     elif args.command == 'cleanup':
         cleanup(names, root)
 
