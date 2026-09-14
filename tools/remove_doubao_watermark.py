@@ -777,27 +777,42 @@ def prepare(names, custom_box, root, emit=True, model='mat', refine=False, any_p
                 mask = Image.fromarray(tpl_mask)
                 (MASKS / f'{name}.tpl').write_text('')
                 print(f'{name}: template mask ({tpl_info})')
-            else:
+                if not any_position:
+                    # 默认模式只处理贴右下角的豆包水印，模板命中即完成
+                    mask.save(MASKS / name)
+                    continue
+                # any_position：模板与其它位置检测叠加——DBNet 检出的右下角
+                # 豆包水印框与模板重叠时丢弃，避免重复修复
                 with Image.open(backup) as probe:
-                    boxes = detect_watermark_boxes(probe, extended=any_position)
-                    # 豆包水印必贴右下角：丢弃远离右下角的检出框，
-                    # 否则雪景白点/白墙/栏杆等画面内容会被误检硬修（毁图）。
-                    # --any-position 显式开启时保留全部文字性通过的框（处理
-                    # 任意位置的其它文字水印），误检风险由调用方承担
-                    pw, ph = probe.size
-                    if not any_position:
-                        boxes = [b for b in boxes if b[2] > pw - 40 and b[3] > ph - 40]
+                    boxes = detect_watermark_boxes(probe, extended=True)
+                boxes = [b for b in boxes if not tpl_mask[max(0, b[1]):b[3], max(0, b[0]):b[2]].any()]
                 if boxes:
-                    print(f'{name}: auto-detected {len(boxes)} watermark box(es) {boxes} (template fallback: {tpl_info})')
-                    if len(boxes) > 6:
-                        print(f'{name}: WARNING {len(boxes)} boxes detected — busy photo '
-                              f'false positives are likely; review the candidate review '
-                              f'image carefully before overwriting')
-                else:
-                    # 检测不到水印：写全空 mask 跳过修复，绝不用默认规则硬修——
-                    # 对已无水印的图硬修会把真实画面重绘成模糊块
-                    skipped = True
-                    print(f'{name}: no watermark detected, skipped (template fallback: {tpl_info})')
+                    print(f'{name}: OCR detected {len(boxes)} extra watermark box(es) {boxes}')
+                    draw = ImageDraw.Draw(mask)
+                    for box in boxes:
+                        draw.rounded_rectangle(box, radius=4, fill=255)
+                mask.save(MASKS / name)
+                continue
+            with Image.open(backup) as probe:
+                boxes = detect_watermark_boxes(probe, extended=any_position)
+                # 豆包水印必贴右下角：丢弃远离右下角的检出框，
+                # 否则雪景白点/白墙/栏杆等画面内容会被误检硬修（毁图）。
+                # --any-position 显式开启时保留全部文字性通过的框（处理
+                # 任意位置的其它文字水印），误检风险由调用方承担
+                pw, ph = probe.size
+                if not any_position:
+                    boxes = [b for b in boxes if b[2] > pw - 40 and b[3] > ph - 40]
+            if boxes:
+                print(f'{name}: auto-detected {len(boxes)} watermark box(es) {boxes} (template fallback: {tpl_info})')
+                if len(boxes) > 6:
+                    print(f'{name}: WARNING {len(boxes)} boxes detected — busy photo '
+                          f'false positives are likely; review the candidate review '
+                          f'image carefully before overwriting')
+            else:
+                # 检测不到水印：写全空 mask 跳过修复，绝不用默认规则硬修——
+                # 对已无水印的图硬修会把真实画面重绘成模糊块
+                skipped = True
+                print(f'{name}: no watermark detected, skipped (template fallback: {tpl_info})')
         else:
             boxes = [resolve_box(width, height, b) for b in custom_box]
         if not skipped and not (MASKS / f'{name}.tpl').exists() and boxes:
@@ -864,14 +879,14 @@ def review(input_dir, output_name, names):
 def inpaint(model='mat'):
     if not IOPAINT.exists():
         raise SystemExit('missing project env; run tools/ensure-inpaint-env.sh (or .ps1 on Windows) first')
-    # 粗填预处理：先把 mask 区域用周围背景插值填充（TELEA），再交给修复模型精修。
-    # 直接修复时模型会"延续"水印的白色笔画（深色背景场景生成白色伪块）；
-    # 粗填后模型看到的是中性底色，生成纹理与周围更协调。
     try:
-        import cv2
         import numpy as np
     except ImportError:
-        raise SystemExit('missing cv2/numpy in project env')
+        raise SystemExit('missing numpy in project env')
+    # 注：iopaint 推理时会把 mask 区域的 source 像素置零（MAT/LaMa 均如此，
+    # 受控实验输出逐像素相同），任何粗填/预处理都无法影响模型输入——
+    # 修复质量完全由 mask 外的上下文决定，mask 精度是唯一杠杆。
+    # 全部透传后 source 为空：无需进模型，直接结束（避免 iopaint 空目录报错）
     for mask_path in sorted(MASKS.glob('*.png')):
         name = mask_path.name
         mask = np.array(Image.open(mask_path).convert('L'))
@@ -881,21 +896,6 @@ def inpaint(model='mat'):
             (SOURCE / name).unlink()
             mask_path.unlink()
             print(f'{name}: empty mask, passed through without inpainting')
-            continue
-        img = np.array(Image.open(SOURCE / name).convert('RGB'))
-        if model == 'lama' and (MASKS / f'{name}.tpl').exists():
-            # LaMa + 模板 mask：不做 TELEA 粗填——LaMa 会把粗填的模糊底色
-            # 延续成白色伪块（深色背景场景）
-            pass
-        else:
-            # MAT：一律先粗填。TELEA 从 mask 边界真实背景插值出结构底色
-            #（如 6.png 花墙交界红棕带的走向），MAT 在底色上精修出锐利细节——
-            # 粗填+MAT 的宏观结构与原图一致性显著优于 direct MAT
-            #（6.png "AI" 附近红棕带：direct 断裂发暗，粗填后连续贯穿）。
-            # LaMa + 整框 mask 仍走粗填（均匀背景场景验证更优）。
-            coarse = cv2.inpaint(img, mask, 7, cv2.INPAINT_TELEA)
-            Image.fromarray(coarse).save(SOURCE / name)
-    # 全部透传后 source 为空：无需进模型，直接结束（避免 iopaint 空目录报错）
     if not any(SOURCE.iterdir()):
         print('all images passed through: no watermark to remove')
         return
