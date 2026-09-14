@@ -13,3 +13,4 @@ desktop/src-tauri/gen/*
 dist/
 .models/
 .synthetic-wm-test/
+!tools/models/*.onnx

@@ -166,19 +166,73 @@ def detect_watermark_boxes(image, extended=False):
        填充率 ≤0.6 且 x 投影列段数 ≥3（实心块如灯罩 fill 0.8+、段数 1，文字水印
        fill ~0.2、段数=字符数）；
     2) 右下角自适应阈值兜底（识别半透明/灰白粗体水印），与第 1 级合并去重。
-    extended=True（--any-position 时）：追加全图灰白多阈值扫描、深色字负片检测、
-    彩色字色度检测与低对比亮字顶帽检测，用于任意位置的非白文字水印；
-    busy photo 误检风险由显式开启承担。"""
+    extended=True（--any-position 时）：优先用 OCR 文字检测模型（DBNet，任意颜色/
+    低对比/复杂背景泛化，雪点/花瓣不误检）；模型命中即完全独挑（传统扫描在照片
+    上误检率高反而拖累），模型文件缺失或未检出时退回传统扫描（灰白多阈值/深色
+    负片/彩色色度/顶帽，纯背景可靠、照片误检多需复查）。"""
     full = _detect_full_white(image)
     corner = _detect_corner_faded(image)
     found = full + [b for b in corner if not any(_overlap(b, f) for f in full)]
     if extended:
+        dbnet = _detect_dbnet(image)
+        if dbnet:
+            return dbnet
         extra = _detect_full_faded(image) + _detect_full_color(image)
         extra += _detect_full_tophat(image) + _detect_full_dark(image)
         for b in extra:
             if not any(_overlap(b, f) for f in found):
                 found.append(b)
     return found
+
+
+DBNET_MODEL = ROOT / 'tools' / 'models' / 'ch_pp-ocrv4_det.onnx'
+_DBNET_SESSION = None
+
+
+def _detect_dbnet(image, thr=0.3, unclip=1.0):
+    """OCR 文字检测（DBNet/PP-OCRv4 det）：以文字为训练目标，天然过滤雪点/花瓣/
+    纹理误检，对彩色字、低对比字、复杂照片背景泛化——传统扫描确认不可分的场景
+    （真实彩色照片红字、雪景白字）由它解决。框为文本行紧贴框，按字高 unclip
+    外扩成遮罩框。模型缺失返回 []（调用方回退传统扫描）。"""
+    try:
+        import numpy as np
+        import cv2
+        import onnxruntime as ort
+    except ImportError:
+        return []
+    global _DBNET_SESSION
+    if not DBNET_MODEL.exists():
+        return []
+    if _DBNET_SESSION is None:
+        _DBNET_SESSION = ort.InferenceSession(str(DBNET_MODEL), providers=['CPUExecutionProvider'])
+    sess = _DBNET_SESSION
+    input_name = sess.get_inputs()[0].name
+    img = np.array(image.convert('RGB'))[:, :, ::-1]  # RGB→BGR
+    h, w = img.shape[:2]
+    ratio = 960 / max(h, w)
+    rw = max(32, int(w * ratio) // 32 * 32)
+    rh = max(32, int(h * ratio) // 32 * 32)
+    x = cv2.resize(img, (rw, rh)).astype(np.float32) / np.float32(255)
+    x = (x - np.array([0.485, 0.456, 0.406], np.float32)) / np.array([0.229, 0.224, 0.225], np.float32)
+    x = x.transpose(2, 0, 1)[None].astype(np.float32)
+    prob = sess.run(None, {input_name: x})[0][0, 0]
+    m = (prob > thr).astype(np.uint8)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+    pad_ratio = 10
+    boxes = []
+    for i in range(1, n):
+        x1, y1, cw, ch, area = (int(v) for v in stats[i])
+        if area < 200 or cw < ch:
+            continue
+        pad = max(6, int(ch * unclip))
+        gx1 = max(0, round(x1 / rw * w) - pad)
+        gy1 = max(0, round(y1 / rh * h) - pad)
+        gx2 = min(w - 1, round((x1 + cw) / rw * w) + pad)
+        gy2 = min(h - 1, round((y1 + ch) / rh * h) + pad)
+        if gx2 - gx1 < 30 or gy2 - gy1 < 12:
+            continue
+        boxes.append((gx1, gy1, gx2, gy2))
+    return boxes
 
 
 def _boxes_from_mask(mask, h, w):
