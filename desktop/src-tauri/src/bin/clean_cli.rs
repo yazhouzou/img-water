@@ -20,6 +20,7 @@ fn main() {
     let mut mask_box: Option<MaskBox> = None;
     let mut keep_work = false;
     let mut overwrite = false;
+    let mut any_position = false;
     let mut model: Option<String> = None;
     let mut command: Option<String> = None;
     let mut files: Vec<String> = Vec::new();
@@ -34,10 +35,12 @@ fn main() {
             })),
             "--keep-work" => keep_work = true,
             "--overwrite" | "--in-place" => overwrite = true,
+            "--any-position" => any_position = true,
             "--model" => model = args.next(),
             "-h" | "--help" => {
-                println!("usage: clean-cli [--root <dir>] [--mask-box x1,y1,x2,y2] [--keep-work] [--overwrite] [--model <onnx>] <run|prepare|inpaint|review-lama|overwrite-review|cleanup> [files...]");
+                println!("usage: clean-cli [--root <dir>] [--mask-box x1,y1,x2,y2] [--any-position] [--keep-work] [--overwrite] [--model <onnx>] <run|prepare|inpaint|review-lama|overwrite-review|cleanup> [files...]");
                 println!("默认结果另存到 <root>/watermark-cleaned/；--overwrite 直接覆盖原图（自动备份 original-watermark-backup/）");
+                println!("--any-position: 处理任意位置的文字水印（OCR 检测），默认只处理贴右下角的豆包水印");
                 return;
             }
             other => {
@@ -69,6 +72,7 @@ fn main() {
         files,
         keep_work,
         mask_box,
+        any_position,
         overwrite_original: overwrite,
     };
 

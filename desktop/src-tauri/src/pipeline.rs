@@ -178,6 +178,10 @@ pub struct PipelineOptions {
     pub files: Vec<String>,
     pub keep_work: bool,
     pub mask_box: Option<MaskBox>,
+    /// false（默认）：只保留贴右下角的检出框（防雪景/busy photo 误检毁图）；
+    /// true：启用 OCR 文字检测（DBNet）处理任意位置的文字水印，
+    /// 模型命中即完全独挑，缺失/未检出回退传统扫描（不做贴角过滤）。
+    pub any_position: bool,
     /// false（默认）：结果另存到 root/watermark-cleaned/，原图不动；
     /// true：直接覆盖原图（旧模式，需备份 + 用户显式确认）。
     pub overwrite_original: bool,
@@ -1046,30 +1050,83 @@ pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Resu
 
         let image = load_image(&origin)?;
         let (width, height) = (image.width(), image.height());
+        let mut tpl_mask: Option<GrayImage> = None;
         let boxes: Vec<(i64, i64, i64, i64)> = match options.mask_box {
             Some(box_) => vec![resolve_box(width, height, Some(box_))?],
             None => {
                 // 三级策略 ①：模板笔画 mask（复杂场景精确修复，见 template_stroke_mask）
-                if let Some((tpl_mask, info)) = template_stroke_mask(&image)? {
+                if let Some((tpl, info)) = template_stroke_mask(&image)? {
                     log(&format!("{}: {}", name, info));
-                    save_png(DynamicImage::ImageLuma8(tpl_mask), &masks.join(name))?;
+                    tpl_mask = Some(tpl);
+                }
+                let mut detected: Vec<(i64, i64, i64, i64)> = if options.any_position {
+                    // 任意位置模式：OCR 文字检测（DBNet）优先，命中即完全独挑——
+                    // 传统扫描在照片上误检率高反而拖累；未检出回退传统扫描
+                    match crate::dbnet::detect(&image)? {
+                        db if !db.is_empty() => {
+                            log(&format!("{}: OCR detected {} watermark box(es)", name, db.len()));
+                            db
+                        }
+                        _ => {
+                            let scanned = detect_watermark_boxes(&image);
+                            if scanned.is_empty() {
+                                log(&format!("{}: no watermark detected, skipped (ocr: no text)", name));
+                                Vec::new()
+                            } else {
+                                log(&format!(
+                                    "{}: auto-detected {} watermark box(es) (ocr fallback)",
+                                    name,
+                                    scanned.len()
+                                ));
+                                scanned
+                            }
+                        }
+                    }
+                } else if tpl_mask.is_some() {
+                    // 模板命中即完成（默认模式只处理贴右下角的豆包水印）
+                    save_png(DynamicImage::ImageLuma8(tpl_mask.take().unwrap()), &masks.join(name))?;
+                    continue;
+                } else {
+                    // 三级策略 ②：整框检测回退
+                    let mut scanned = detect_watermark_boxes(&image);
+                    // 豆包水印必贴右下角：丢弃远离右下角的检出框，
+                    // 否则雪景白点/白墙/栏杆等画面内容会被误检硬修（毁图）
+                    let (pw, ph) = (image.width() as i64, image.height() as i64);
+                    scanned.retain(|b| b.2 > pw - 40 && b.3 > ph - 40);
+                    if scanned.is_empty() {
+                        // 三级策略 ③：检测不到水印，写全空 mask 跳过修复，绝不用默认
+                        // 规则硬修——对已无水印的图硬修会把真实画面重绘成模糊块
+                        log(&format!("{}: no watermark detected, skipped", name));
+                        Vec::new()
+                    } else {
+                        log(&format!("{}: auto-detected {} watermark box(es)", name, scanned.len()));
+                        scanned
+                    }
+                };
+                if let Some(tpl) = &tpl_mask {
+                    // 任意位置模式下模板与其它位置检测叠加：丢弃与模板笔画重叠的
+                    // 检出框（DBNet 也会检出右下角豆包水印，避免重复修复）
+                    detected.retain(|&(x1, y1, x2, y2)| {
+                        let mut overlap = false;
+                        'outer: for y in y1.clamp(0, height as i64)..y2.clamp(0, height as i64) {
+                            for x in x1.clamp(0, width as i64)..x2.clamp(0, width as i64) {
+                                if tpl.get_pixel(x as u32, y as u32).0[0] > 0 {
+                                    overlap = true;
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        if overlap {
+                            log(&format!("{}: box ({},{},{},{}) overlaps template mask, skipped", name, x1, y1, x2, y2));
+                        }
+                        !overlap
+                    });
+                }
+                if tpl_mask.is_some() && detected.is_empty() {
+                    save_png(DynamicImage::ImageLuma8(tpl_mask.take().unwrap()), &masks.join(name))?;
                     continue;
                 }
-                // 三级策略 ②：整框检测回退
-                let mut detected = detect_watermark_boxes(&image);
-                // 豆包水印必贴右下角：丢弃远离右下角的检出框，
-                // 否则雪景白点/白墙/栏杆等画面内容会被误检硬修（毁图）
-                let (pw, ph) = (image.width() as i64, image.height() as i64);
-                detected.retain(|b| b.2 > pw - 40 && b.3 > ph - 40);
-                if detected.is_empty() {
-                    // 三级策略 ③：检测不到水印，写全空 mask 跳过修复，绝不用默认
-                    // 规则硬修——对已无水印的图硬修会把真实画面重绘成模糊块
-                    log(&format!("{}: no watermark detected, skipped", name));
-                    Vec::new()
-                } else {
-                    log(&format!("{}: auto-detected {} watermark box(es)", name, detected.len()));
-                    detected
-                }
+                detected
             }
         };
         let mut mask = GrayImage::from_pixel(width, height, image::Luma([0]));
@@ -1077,6 +1134,14 @@ pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Resu
             for y in *y1..*y2 {
                 for x in *x1..*x2 {
                     mask.put_pixel(x as u32, y as u32, image::Luma([255]));
+                }
+            }
+        }
+        // 模板命中时把模板笔画也画进 mask（与检出框叠加修复）
+        if let Some(tpl) = &tpl_mask {
+            for (x, y, p) in tpl.enumerate_pixels() {
+                if p.0[0] > 0 {
+                    mask.put_pixel(x, y, image::Luma([255]));
                 }
             }
         }
@@ -1498,6 +1563,7 @@ mod tests {
             files: vec![],
             keep_work: false,
             mask_box: None,
+            any_position: false,
             overwrite_original: true,
         };
         assert_eq!(output_dir(&options), root);
@@ -1536,7 +1602,7 @@ mod tests {
         let (x1, y1, _x2, _y2) = make_watermark_image(&root.join("b.png"), 1024, 1024, "AI");
         let _ = x1;
         let _ = y1;
-        let options = PipelineOptions { root: root.clone(), files: vec!["b.png".to_string()], keep_work: false, mask_box: None, overwrite_original: true };
+        let options = PipelineOptions { root: root.clone(), files: vec!["b.png".to_string()], keep_work: false, mask_box: None, any_position: false, overwrite_original: true };
         let names = target_names(&root, &options.files).unwrap();
         let noop_log: Logger = &|_| {};
         prepare(&options, &names, &noop_log).unwrap();
@@ -1598,6 +1664,7 @@ mod tests {
             files: vec!["case.png".to_string()],
             keep_work: false,
             mask_box: Some(MaskBox { x1: x1 - 20, y1: y1 - 20, x2: x2 + 20, y2: y2 + 20 }),
+            any_position: false,
             overwrite_original: true,
         };
         let log = |_line: &str| {};

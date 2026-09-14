@@ -17,6 +17,7 @@ const els = {
   fileList: document.getElementById('file-list'),
   fileCount: document.getElementById('file-count'),
   keepWork: document.getElementById('keep-work'),
+  anyPosition: document.getElementById('any-position'),
   log: document.getElementById('log'),
   reviewCandidate: document.getElementById('review-candidate'),
   reviewFinal: document.getElementById('review-final'),
@@ -658,6 +659,7 @@ async function init() {
         files,
         keepWork: els.keepWork.checked,
         overwriteOriginal: overwrite,
+        anyPosition: els.anyPosition.checked,
         maskBox: manualMask
           ? [manualMask.dx1, manualMask.dy1, manualMask.dx2, manualMask.dy2]
           : null,

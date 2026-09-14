@@ -1,5 +1,6 @@
 pub mod android_uri;
 pub mod app;
+pub mod dbnet;
 pub mod fetch;
 pub mod lama;
 pub mod pipeline;

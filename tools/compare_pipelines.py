@@ -77,7 +77,7 @@ def compare_case(name, size, text, xy, font_size, bg, texture, expect):
     term_dir = case_root / "term"
     shutil.copytree(case_root / "orig", term_dir)
     r = run_cmd([str(ROOT / ".img-inpaint-venv/bin/python"), str(ROOT / "tools/remove_doubao_watermark.py"),
-                 "--root", str(term_dir), "--mask-box", ",".join(map(str, box)), "run"])
+                 "--root", str(term_dir), "--mask-box", ",".join(map(str, box)), "--model", "lama", "run"])
     if r.returncode != 0:
         return ("FAIL-run", 999, 0, f"terminal pipeline failed: {r.stderr[-200:]}")
 

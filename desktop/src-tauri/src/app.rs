@@ -160,6 +160,7 @@ fn run_pipeline(
     keep_work: bool,
     overwrite_original: bool,
     mask_box: Option<Vec<i64>>,
+    any_position: Option<bool>,
 ) -> Result<(), String> {
     if storage.running.swap(true, Ordering::SeqCst) {
         return Err("已有任务在运行中，请等待完成".into());
@@ -196,6 +197,7 @@ fn run_pipeline(
             files,
             keep_work,
             mask_box: mask,
+            any_position: any_position.unwrap_or(false),
             overwrite_original,
         };
         let log = |line: &str| {
@@ -300,6 +302,7 @@ fn cleanup_pipeline(storage: State<'_, AppStorage>) -> Result<(), String> {
         files,
         keep_work: false,
         mask_box: None,
+            any_position: false,
         overwrite_original: true,
     };
     let names = pipeline::target_names(&options.root, &options.files)?;
