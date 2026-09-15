@@ -23,8 +23,8 @@
 
   async function fakeRun() {
     const lines = [
-      '[开始] 处理 ' + FAKE_PNGS.length + ' 张图片…（mock）',
-      'candidate review: /tmp/mock/candidate.png',
+      '[Start] processing ' + FAKE_PNGS.length + ' file(s)… (mock)',
+      'source review: /tmp/mock/source.png',
       'final review: /tmp/mock/final.png',
     ];
     for (let i = 0; i < FAKE_PNGS.length; i++) {
@@ -54,13 +54,13 @@
     emit('pipeline-exit', { code: 0, success: true });
   }
 
-  const invoke = (cmd) => {
+  const invoke = (cmd, args) => {
     switch (cmd) {
       case 'env_status':
         return Promise.resolve({
           ready: !noModel,
           model_path: '/mock/lama_fp32.onnx',
-          hint: noModel ? '（mock）修复模型未下载' : '',
+          hint: noModel ? '(mock) inpainting model not downloaded' : '',
         });
       case 'list_pngs':
         return Promise.resolve(FAKE_PNGS);
@@ -81,10 +81,8 @@
       case 'cancel_pipeline':
         return Promise.resolve();
       case 'open_path':
-        console.log('[mock] open_path:', arguments[1] && arguments[1].path);
+        console.log('[mock] open_path:', args && args.path);
         return Promise.resolve();
-      case 'app_version':
-        return Promise.resolve('0.0.0-mock');
       default:
         return Promise.reject('mock 未实现命令: ' + cmd);
     }

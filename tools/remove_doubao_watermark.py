@@ -79,6 +79,23 @@ INVERSE_ALPHA_GAIN_RANGE = (0.8, 1.25)
 INVERSE_MAX_GHOST = 0.12
 
 
+try:
+    import watermark_profiles as wprof
+except Exception:  # pragma: no cover - optional profile library
+    wprof = None
+
+
+def match_profile(backup, any_position=False):
+    """Match stored watermark profiles against an image; None when unavailable."""
+    if wprof is None:
+        return None
+    try:
+        with Image.open(backup) as probe:
+            return wprof.match_image(probe, any_position=any_position)
+    except SystemExit:
+        return None
+
+
 def load_template():
     """加载笔画级水印模板（黑底图提取），返回 (tpl_bool, alpha_float, meta)；
     资产缺失时 alpha 为 None（调用方回退二值模板膨胀）。"""
@@ -861,7 +878,8 @@ def _md5(path):
     return h.hexdigest()
 
 
-def prepare(names, custom_box, root, emit=True, model='mat', refine=False, any_position=False):
+def prepare(names, custom_box, root, emit=True, model='mat', refine=False,
+            any_position=False, use_profile=True):
     if WORK.exists():
         rmtree(WORK)
     ensure_work_dirs(root)
@@ -887,6 +905,22 @@ def prepare(names, custom_box, root, emit=True, model='mat', refine=False, any_p
             import numpy as np
             with Image.open(backup) as probe:
                 gray = np.array(probe.convert('RGB')).max(axis=2).astype(np.float32)
+            if use_profile:
+                # 水印档案库优先：命中已知水印时用其 α 图作为精确 mask，并标记
+                # 该图走通用逆解（恢复真实背景）。档案来自用户一次学习，比启发式
+                # 模板更可信，故排在豆包模板匹配之前，避免被误命中抢注。
+                hit = match_profile(backup, any_position=any_position)
+                if hit is not None:
+                    profile, px, py, score, scale = hit
+                    pmask = wprof.mask_for(profile, px, py, width, height, scale=scale)
+                    if pmask is not None and int((pmask > 0).sum()) >= 20:
+                        (MASKS / f'{name}.wprof').write_text(json.dumps({
+                            'profile': profile.id, 'px': int(px), 'py': int(py),
+                            'scale': float(scale), 'score': float(score)}))
+                        Image.fromarray(pmask).save(MASKS / name)
+                        print(f'{name}: profile {profile.id} matched at ({px},{py}) '
+                              f'score {score:.1f} -> alpha mask + inverse')
+                        continue
             tpl_mask, tpl_score, tpl_info = template_stroke_mask(gray, width, height, model)
             if tpl_mask is not None:
                 # 模板笔画 mask：精确贴笔画+小膨胀，复杂背景（书本/花丛）
@@ -1193,7 +1227,7 @@ def _residual_retry(names, model):
                   f'unless --force is used')
 
 
-def inpaint(model='mat', inverse=True, retry=True):
+def inpaint(model='mat', inverse=True, retry=True, use_profile=True):
     if not IOPAINT.exists():
         raise SystemExit('missing project env; run tools/ensure-inpaint-env.sh (or .ps1 on Windows) first')
     try:
@@ -1256,6 +1290,37 @@ def inpaint(model='mat', inverse=True, retry=True):
             applied.append(f'{name} (pos {px},{py} hf {hf:.1f} gain {gain:.2f} ghost {ghost:.3f})')
         if applied:
             print('inverse stamp applied: ' + '; '.join(applied))
+    if inverse and use_profile and wprof is not None:
+        # 档案库逆解：对命中档案的图用其 α/C 恢复真实背景（覆盖 MAT 结果）。
+        applied = []
+        for sidecar in sorted(MASKS.glob('*.wprof')):
+            name = sidecar.stem
+            obs_path, mat_path = SOURCE / name, LAMA / name
+            if not obs_path.exists() or not mat_path.exists():
+                continue
+            info = json.loads(sidecar.read_text())
+            try:
+                profile = wprof.load_profile(info['profile'])
+            except SystemExit:
+                print(f'{name}: profile {info["profile"]} missing, keep MAT')
+                continue
+            if profile.extra and profile.extra.get('inverse') is False:
+                # profile declares its blend model is not invertible (e.g. the
+                # watermark has a dark outline a single-colour model cannot
+                # undo): keep the stroke-level MAT result instead.
+                print(f'{name}: profile {profile.id} not invertible (outline), keep MAT')
+                continue
+            obs = np.array(Image.open(obs_path).convert('RGB'))
+            mat = np.array(Image.open(mat_path).convert('RGB'))
+            out, detail = wprof.inverse_image(obs, mat, profile,
+                                              info['px'], info['py'], scale=info['scale'])
+            if out is None:
+                print(f'{name}: profile inverse skipped ({detail}), keep MAT')
+                continue
+            Image.fromarray(out).save(mat_path)
+            applied.append(f'{name} ({detail})')
+        if applied:
+            print('profile inverse applied: ' + '; '.join(applied))
     if retry:
         # 自校验不完美 → 重新处理（最多 1 轮）：见 _residual_retry
         _residual_retry(active_names, model)
@@ -1326,9 +1391,61 @@ def cleanup(names, root):
         rmtree(WORK)
 
 
-def run_all(names, custom_box, keep_work, root, model='mat', refine=False, any_position=False, inverse=True, force=False, retry=True):
-    prepare(names, custom_box, root, emit=False, model=model, refine=refine, any_position=any_position)
-    inpaint(model, inverse=inverse, retry=retry)
+def learn_auto(names, root, label, custom_box=None, any_position=False, ref_short=None):
+    """Auto-discover a watermark profile from a set of same-watermark images.
+
+    For every input the watermark box is located with the normal detector (or a
+    manual ``--mask-box``), then the frame with the calmest background is picked
+    and its coverage solved against an inpainted background. This is what lets a
+    new AI tool (e.g. Qwen) reach Doubao-level fidelity without a hand-supplied
+    sample: just point it at a few images of that tool's watermark, ideally one
+    sitting on a plain/dark area.
+    """
+    if wprof is None:
+        raise SystemExit('profile library unavailable (missing numpy/cv2?)')
+    if not label:
+        raise SystemExit('learn-auto needs --label <name> (profile id / tool name)')
+    import numpy as np
+
+    frames = []
+    for name in names:
+        path = Path(root) / name
+        with Image.open(path) as im:
+            pil = im.convert('RGB')
+            width, height = pil.size
+            arr = np.array(pil)
+        if custom_box:
+            boxes = [resolve_box(width, height, b) for b in custom_box]
+        else:
+            boxes = detect_watermark_boxes(pil, extended=any_position)
+            if not any_position:
+                boxes = [b for b in boxes if b[2] > width - 40 and b[3] > height - 40]
+        if not boxes:
+            print(f'{name}: no watermark box detected, skipped')
+            continue
+        x1 = min(b[0] for b in boxes)
+        y1 = min(b[1] for b in boxes)
+        x2 = max(b[2] for b in boxes)
+        y2 = max(b[3] for b in boxes)
+        pad = 8
+        box = (max(0, x1 - pad), max(0, y1 - pad),
+               min(width, x2 + pad), min(height, y2 + pad))
+        frames.append((name, str(path), box))
+    if not frames:
+        raise SystemExit('learn-auto: no watermark found in any input image')
+    profile, report = wprof.auto_discover(frames, label=label,
+                                          ref_short_side=ref_short)
+    print(json.dumps(report, ensure_ascii=False, indent=1))
+    if profile is None:
+        raise SystemExit('learn-auto: could not build a reliable profile; nothing saved')
+    base = wprof.save_profile(profile)
+    print(f'saved profile {profile.id} -> {base}')
+
+
+def run_all(names, custom_box, keep_work, root, model='mat', refine=False, any_position=False, inverse=True, force=False, retry=True, use_profile=True):
+    prepare(names, custom_box, root, emit=False, model=model, refine=refine,
+            any_position=any_position, use_profile=use_profile)
+    inpaint(model, inverse=inverse, retry=retry, use_profile=use_profile)
     candidate_review = review_lama(names, emit=False, root=root)
     final_review = overwrite_review(names, root, emit=False, force=force)
     print(f'processed {len(names)} file(s): {", ".join(names)}')
@@ -1419,25 +1536,64 @@ def main():
              'detected residual). Use only after manual review — it disables the '
              'scene-independent safety net.',
     )
-    parser.add_argument('command', choices=['run', 'prepare', 'inpaint', 'review-lama', 'overwrite-review', 'cleanup'])
+    parser.add_argument(
+        '--no-profile',
+        dest='profile',
+        action='store_false',
+        default=True,
+        help='disable watermark profile library matching. DEFAULT ON: if a stored '
+             'profile (tools/watermarks/<id>) matches, its alpha map is used as an '
+             'exact mask and the watermark is removed by reversing the blend model '
+             '(obs = a*C + (1-a)*bg), restoring the true background. No profiles or '
+             'no match -> the normal generative pipeline runs unchanged.',
+    )
+    parser.add_argument(
+        '--label',
+        help='learn-auto only: human label / profile id for the discovered '
+             'watermark, e.g. "qwen" (stored under tools/watermarks/<id>).',
+    )
+    parser.add_argument(
+        '--ref-short',
+        type=float,
+        help='learn-auto only: reference short side the profile is defined at '
+             '(defaults to the selected sample image short side).',
+    )
+    parser.add_argument('command', choices=['run', 'prepare', 'inpaint', 'review-lama', 'overwrite-review', 'cleanup', 'profiles', 'learn-auto'])
     parser.add_argument('files', nargs='*')
     args = parser.parse_args()
     root = Path(args.root).resolve() if args.root else DEFAULT_ROOT
     if not root.exists():
         raise SystemExit(f'root folder not found: {root}')
+
+    if args.command == 'profiles':
+        if wprof is None:
+            raise SystemExit('profile library unavailable (missing numpy/cv2?)')
+        found = wprof.list_profiles()
+        if not found:
+            print(f'no profiles in {wprof.PROFILE_DIR}')
+        for profile in found:
+            print(f'{profile.id}: label={profile.label!r} shape={profile.shape} '
+                  f'ref_short={profile.ref_short_side:g} source={profile.source}')
+        return
+
     names = target_names(args.files, root)
 
     if args.command == 'run':
         run_all(names, args.mask_box, args.keep_work, root, args.model, args.refine,
-                args.any_position, args.inverse, force=args.force, retry=args.retry)
+                args.any_position, args.inverse, force=args.force, retry=args.retry,
+                use_profile=args.profile)
     elif args.command == 'prepare':
-        prepare(names, args.mask_box, root, model=args.model, refine=args.refine, any_position=args.any_position)
+        prepare(names, args.mask_box, root, model=args.model, refine=args.refine,
+                any_position=args.any_position, use_profile=args.profile)
     elif args.command == 'inpaint':
-        inpaint(args.model, inverse=args.inverse, retry=args.retry)
+        inpaint(args.model, inverse=args.inverse, retry=args.retry, use_profile=args.profile)
     elif args.command == 'review-lama':
         review_lama(names, root=root)
     elif args.command == 'overwrite-review':
         overwrite_review(names, root, force=args.force)
+    elif args.command == 'learn-auto':
+        learn_auto(names, root, args.label, args.mask_box, args.any_position,
+                   args.ref_short)
     elif args.command == 'cleanup':
         cleanup(names, root)
 

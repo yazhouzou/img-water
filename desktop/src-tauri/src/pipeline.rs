@@ -10,22 +10,25 @@ use crate::lama::Lama;
 
 const WINDOW: u32 = 512;
 
-// 模板笔画 mask：豆包水印字形全图固定（半透明白字 α≈0.6 叠加），从黑底图提取
-// 笔画级模板（阈值 ≥125 + 3x3 闭运算，填充率仅 ~21%）。资产编译进二进制，
-// CLI 与打包 App 均可用。
+// 模板笔画 mask：豆包水印字形全图固定（半透明白字 α≈0.6 叠加）。二值笔画模板
+// （阈值 ≥125 + 3x3 闭运算，填充率仅 ~21%）只用于 gap-score 匹配；mask 本身用
+// 连续 α 图（黑底样张提取）取 α>0.03 的真实污染像素，最小侵入。
+// 资产编译进二进制，CLI 与打包 App 均可用。
 const TEMPLATE_PNG: &[u8] = include_bytes!("../../../tools/doubao-wm-template.png");
+const TEMPLATE_ALPHA_PNG: &[u8] = include_bytes!("../../../tools/doubao-wm-alpha.png");
 const TEMPLATE_META_JSON: &str = include_str!("../../../tools/doubao-wm-template.json");
-// gap-score（笔画均亮 - 间隙均亮）实测：黑底 144 / 雪景 102-136 / 花墙 57 /
-// 沙滩 62；纸面低对比 15 回退整框检测。阈值取中间空档。
-const TEMPLATE_MIN_SCORE: f64 = 40.0;
-// 膨胀核 19x11 矩形（水平 ±9 / 垂直 ±5）：水平填满字符间距使 mask 连成片，
-// 消除间隙里的字形上下文，防止 LaMa FFT 感受野"见字生字"；垂直只需盖住
-// 抗锯齿带（±5px），少侵入 mask 上下画面——水印横跨花墙棱线等强结构边界时，
-// 全向 9px 会让 LaMa 重绘垂直宽带产生混沌（6.png 教训）。
-// mask 必须放在 gap-score 匹配位置：手工放置偏 8px 时小膨胀盖不住字形，
-// 会误判为"垂直膨胀不足"（位置对齐比膨胀参数更关键）。
-const TEMPLATE_DILATE_W: usize = 19;
-const TEMPLATE_DILATE_H: usize = 11;
+// 顶帽 gap-score（笔画区均亮 - 间隙区均亮）阈值：正样本 ≥33 / 负样本 ≤8.4，
+// 取中间空档 20（对齐 Python TEMPLATE_MIN_SCORE）。
+const TEMPLATE_MIN_SCORE: f64 = 20.0;
+// 连续 α mask 阈值 8/255 ≈ α>0.03：水印真正污染的像素是 α>0（含抗锯齿带）。
+// 二值核（α>0.5）只覆盖笔画核心，只能靠大膨胀补抗锯齿 → 多盖干净画面被模型
+// 重绘，正是"影响周边元素"的根因（Python 实测改动面积 -10%~-30%）。
+const TEMPLATE_ALPHA_THRESHOLD: u8 = 8;
+// mask 膨胀 ±1px，仅补偿缩放/对齐误差（对齐 Python TEMPLATE_STROKE_DILATE）。
+const TEMPLATE_DILATE_W: usize = 3;
+const TEMPLATE_DILATE_H: usize = 3;
+// 顶帽开运算核半径（31x31 椭圆，对齐 Python k=min(31, ...)）。
+const TOPHAT_RADIUS: usize = 15;
 
 #[derive(serde::Deserialize)]
 struct TemplateMeta {
@@ -33,30 +36,110 @@ struct TemplateMeta {
     ref_short_side: f64,
 }
 
-fn load_template() -> Result<(GrayImage, TemplateMeta), String> {
+fn load_template() -> Result<(GrayImage, GrayImage, TemplateMeta), String> {
     let tpl = image::load_from_memory_with_format(TEMPLATE_PNG, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?
+        .to_luma8();
+    let alpha = image::load_from_memory_with_format(TEMPLATE_ALPHA_PNG, image::ImageFormat::Png)
         .map_err(|e| e.to_string())?
         .to_luma8();
     let meta: TemplateMeta =
         serde_json::from_str(TEMPLATE_META_JSON).map_err(|e| e.to_string())?;
-    Ok((tpl, meta))
+    Ok((tpl, alpha, meta))
+}
+
+/// 椭圆核半径表（完全对齐 cv2.getStructuringElement(MORPH_ELLIPSE, (2r+1,2r+1))：
+/// 半宽 = round(r·√(1-(dy/r)²))，cvRound 为四舍五入，注意不是 (r+0.5)/floor）。
+/// 按 dy 给出水平半宽，用于把椭圆形态学分解成"逐行一维滑窗"的 O(r·n) 算法。
+fn ellipse_half(r: usize, dy: i64) -> usize {
+    let rf = r as f64;
+    let v = 1.0 - (dy as f64).powi(2) / (rf * rf);
+    if v <= 0.0 { 0 } else { (rf * v.sqrt()).round() as usize }
+}
+
+/// 一维居中滑窗极值（窗口 [x-half, x+half]，越界位置忽略——与 cv2 形态学
+/// 默认边界一致）。单调队列实现，O(n)。
+fn slide_center(src: &[f64], half: usize, dilate: bool) -> Vec<f64> {
+    let n = src.len();
+    let mut out = vec![0f64; n];
+    if n == 0 {
+        return out;
+    }
+    let half = half as i64;
+    let mut dq: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    let mut filled: i64 = -1;
+    for i in 0..n as i64 {
+        while let Some(&b) = dq.back() {
+            let better = if dilate { src[i as usize] >= src[b] } else { src[i as usize] <= src[b] };
+            if better { dq.pop_back(); } else { break; }
+        }
+        dq.push_back(i as usize);
+        let center = i - half;
+        if center >= 0 {
+            let left = center - half;
+            while let Some(&f) = dq.front() {
+                if (f as i64) < left { dq.pop_front(); } else { break; }
+            }
+            out[center as usize] = src[*dq.front().unwrap()];
+            filled = center;
+        }
+    }
+    // 右端收尾：窗口右缘被图界截断的中心点
+    for center in (filled + 1).max(0)..n as i64 {
+        let left = center - half;
+        while let Some(&f) = dq.front() {
+            if (f as i64) < left { dq.pop_front(); } else { break; }
+        }
+        out[center as usize] = src[*dq.front().unwrap()];
+    }
+    out
+}
+
+/// 椭圆核形态学（f64，可腐蚀/膨胀）：分解为逐行一维居中滑窗，O(r·n)。
+fn ellipse_morph(src: &[f64], w: usize, h: usize, r: usize, dilate: bool) -> Vec<f64> {
+    let ident = if dilate { f64::NEG_INFINITY } else { f64::INFINITY };
+    let mut acc = vec![ident; w * h];
+    for dy in -(r as i64)..=(r as i64) {
+        let half = ellipse_half(r, dy);
+        for y in 0..h {
+            let sy = y as i64 + dy;
+            if sy < 0 || sy >= h as i64 {
+                continue;
+            }
+            let row = &src[sy as usize * w..(sy as usize + 1) * w];
+            let ext = slide_center(row, half, dilate);
+            let base = y * w;
+            for x in 0..w {
+                let v = ext[x];
+                let slot = &mut acc[base + x];
+                *slot = if dilate { slot.max(v) } else { slot.min(v) };
+            }
+        }
+    }
+    acc
+}
+
+/// 模板命中结果：笔画 mask + 匹配描述 + gap-score + 模板左上角位置。
+pub struct TemplateHit {
+    pub mask: GrayImage,
+    pub info: String,
+    pub score: f64,
+    pub px: usize,
+    pub py: usize,
 }
 
 /// 模板笔画 mask 匹配：按图片短边比例缩放模板（水印尺寸随短边等比），在右下角
-/// 40px 余量窗口内做 gap-score 匹配（笔画区均亮 - 间隙区均亮），命中返回
-/// (mask, 描述)。分数不足返回 None 交给整框检测回退。
-fn template_stroke_mask(image: &DynamicImage) -> Result<Option<(GrayImage, String)>, String> {
-    let (tpl, meta) = load_template()?;
+/// 40px 余量窗口内做**顶帽 gap-score** 匹配（顶帽扣局部背景后笔画区均亮 - 间隙区
+/// 均亮），命中返回 TemplateHit。mask 取连续 α 图 α>0.03 的污染像素 + ±1px（最小
+/// 侵入）；分数不足返回 None 交给整框检测回退。
+fn template_stroke_mask(image: &DynamicImage) -> Result<Option<TemplateHit>, String> {
+    let (tpl, alpha, meta) = load_template()?;
     let rgb = image.to_rgb8();
     let (iw, ih) = (rgb.width() as usize, rgb.height() as usize);
-    let mut gray = vec![0f64; iw * ih];
-    for (i, p) in rgb.pixels().enumerate() {
-        gray[i] = p.0.iter().copied().fold(0u8, u8::max) as f64;
-    }
     let scale = (iw.min(ih) as f64) / meta.ref_short_side;
     let tw = ((tpl.width() as f64) * scale) as u32;
     let th = ((tpl.height() as f64) * scale) as u32;
-    if tw >= rgb.width() || th >= rgb.height() {
+    if tw == 0 || th == 0 || tw >= rgb.width() || th >= rgb.height() {
         return Ok(None);
     }
     let t = image::imageops::resize(&tpl, tw, th, FilterType::Nearest);
@@ -69,15 +152,47 @@ fn template_stroke_mask(image: &DynamicImage) -> Result<Option<(GrayImage, Strin
             }
         }
     }
+    if pts.is_empty() {
+        return Ok(None);
+    }
     let n_in = pts.len() as f64;
     let n_out = (tw as usize * th as usize) as f64 - n_in;
+    // 水印必贴右下角：模板左上角只可能在 (w-tw-40..=w-tw, h-th-40..=h-th)
+    let max_py = ih - th as usize;
+    let max_px = iw - tw as usize;
+    let min_py = max_py.saturating_sub(40);
+    let min_px = max_px.saturating_sub(40);
+
+    // 顶帽（局部背景扣除）后再匹配：亮背景（纸面/花墙/雪/沙滩）会压低"笔画-间隙"
+    // 绝对差，使低对比水印漏判并回退整框重绘；顶帽只保留局部高于背景的亮结构，
+    // 与背景亮度无关。全图朴素形态学过慢，只算搜索窗 + 核半径范围，窗口内数值与
+    // 全图计算一致。
+    let r = TOPHAT_RADIUS;
+    let rx0 = min_px.saturating_sub(r);
+    let ry0 = min_py.saturating_sub(r);
+    let rx1 = (max_px + tw as usize + r).min(iw);
+    let ry1 = (max_py + th as usize + r).min(ih);
+    let (rw, rh) = (rx1 - rx0, ry1 - ry0);
+    if rw == 0 || rh == 0 {
+        return Ok(None);
+    }
+    let mut g = vec![0f64; rw * rh];
+    for y in 0..rh {
+        for x in 0..rw {
+            let p = rgb.get_pixel((rx0 + x) as u32, (ry0 + y) as u32);
+            g[y * rw + x] = p.0.iter().copied().max().unwrap_or(0) as f64;
+        }
+    }
+    let opened = ellipse_morph(&ellipse_morph(&g, rw, rh, r, false), rw, rh, r, true);
+    let tophat: Vec<f64> = g.iter().zip(opened.iter()).map(|(&o, &op)| o - op).collect();
+
     // 积分图（前缀和）求任意矩形和：S_all 与匹配窗口内的 S_out
-    let iw1 = iw + 1;
-    let mut integral = vec![0f64; iw1 * (ih + 1)];
-    for y in 0..ih {
+    let iw1 = rw + 1;
+    let mut integral = vec![0f64; iw1 * (rh + 1)];
+    for y in 0..rh {
         let mut row_acc = 0f64;
-        for x in 0..iw {
-            row_acc += gray[y * iw + x];
+        for x in 0..rw {
+            row_acc += tophat[y * rw + x];
             integral[(y + 1) * iw1 + (x + 1)] = integral[y * iw1 + (x + 1)] + row_acc;
         }
     }
@@ -85,19 +200,15 @@ fn template_stroke_mask(image: &DynamicImage) -> Result<Option<(GrayImage, Strin
         integral[y2 * iw1 + x2] + integral[y1 * iw1 + x1] - integral[y1 * iw1 + x2]
             - integral[y2 * iw1 + x1]
     };
-    // 水印必贴右下角：模板左上角只可能在 (w-tw-40..=w-tw, h-th-40..=h-th)
-    let max_py = ih - th as usize;
-    let max_px = iw - tw as usize;
-    let min_py = max_py.saturating_sub(40);
-    let min_px = max_px.saturating_sub(40);
     let mut best = (f64::MIN, 0usize, 0usize);
     for py in min_py..=max_py {
         for px in min_px..=max_px {
+            let (lx, ly) = (px - rx0, py - ry0);
             let mut s_in = 0f64;
             for &(dx, dy) in &pts {
-                s_in += gray[(py + dy) * iw + px + dx];
+                s_in += tophat[(ly + dy) * rw + lx + dx];
             }
-            let s_all = rect_sum(px, py, px + tw as usize, py + th as usize);
+            let s_all = rect_sum(lx, ly, lx + tw as usize, ly + th as usize);
             let gap = s_in / n_in - (s_all - s_in) / n_out;
             if gap > best.0 {
                 best = (gap, px, py);
@@ -108,10 +219,16 @@ fn template_stroke_mask(image: &DynamicImage) -> Result<Option<(GrayImage, Strin
     if score < TEMPLATE_MIN_SCORE {
         return Ok(None);
     }
-    // 膨胀矩形核（水平 ±9 / 垂直 ±5）：方形核可分解，横向 19 + 纵向 11 两次一维扩展
+    // 连续 α mask（α>0.03 的真实污染像素，含抗锯齿带）+ ±1px 膨胀：只覆盖真正被
+    // 水印污染的像素，不再靠大膨胀补抗锯齿（后者会多盖干净画面被模型重绘）。
+    let a = image::imageops::resize(&alpha, tw, th, FilterType::Triangle);
     let mut bin = vec![false; (tw as usize) * (th as usize)];
-    for &(dx, dy) in &pts {
-        bin[dy * tw as usize + dx] = true;
+    for y in 0..th as usize {
+        for x in 0..tw as usize {
+            if a.get_pixel(x as u32, y as u32).0[0] > TEMPLATE_ALPHA_THRESHOLD {
+                bin[y * tw as usize + x] = true;
+            }
+        }
     }
     let dilate_1d = |src: &[bool], w: usize, h: usize, horizontal: bool| -> Vec<bool> {
         let (rx, ry) = if horizontal {
@@ -158,8 +275,8 @@ fn template_stroke_mask(image: &DynamicImage) -> Result<Option<(GrayImage, Strin
             }
         }
     }
-    let info = format!("template mask matched at ({px},{py}) score {score:.1}");
-    Ok(Some((mask, info)))
+    let info = format!("template alpha mask at ({px},{py}) score {score:.1}");
+    Ok(Some(TemplateHit { mask, info, score, px, py }))
 }
 
 
@@ -185,6 +302,21 @@ pub struct PipelineOptions {
     /// false（默认）：结果另存到 root/watermark-cleaned/，原图不动；
     /// true：直接覆盖原图（旧模式，需备份 + 用户显式确认）。
     pub overwrite_original: bool,
+    /// true（默认）：先尝试水印档案库（`tools/watermarks/` + 内置档案）做逐像素
+    /// 解析逆解；命中即精确去除且周边零改动。false 完全跳过档案路径。
+    pub use_profile: bool,
+    /// false（默认）：结果级验证 FAIL（如 mask 外被改动）时拒绝落盘。
+    /// true：跳过拒绝，强制写入（对应 CLI `--force`）。
+    pub force: bool,
+    /// true（默认）：模板命中后做豆包 stamp 逐像素解析逆解（还原真实背景）；
+    /// false 只用生成式结果（对应 CLI `--no-inverse`）。
+    pub inverse: bool,
+    /// true（默认）：结果残留时膨胀 mask 隔离重跑一轮（对应 CLI `--no-retry`）。
+    pub retry: bool,
+    /// 实验性：手动框选（mask_box）时把框内做笔画精分割（顶帽局部对比 + 低饱和过滤 +
+    /// 局部自适应阈值 + 行带约束），只重绘笔画而非整框；失败自动退回整框
+    /// （对应 CLI `--refine`，App 侧默认勾选）。
+    pub refine: bool,
 }
 
 pub const SUPPORTED_EXTS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
@@ -1029,6 +1161,9 @@ pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Resu
     }
     let (source, masks, _lama, review_dir) = ensure_dirs(&options.root, options.overwrite_original)?;
     let backup_root = backup_dir(&options.root);
+    if options.refine && options.mask_box.is_none() {
+        log("--refine only applies to a manual mask box (--mask-box); ignored");
+    }
     for (index, name) in names.iter().enumerate() {
         log(&format!(
             "prepare {}/{}: {}",
@@ -1054,10 +1189,43 @@ pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Resu
         let boxes: Vec<(i64, i64, i64, i64)> = match options.mask_box {
             Some(box_) => vec![resolve_box(width, height, Some(box_))?],
             None => {
+                // 档案库优先（对齐 Python）：命中即逐像素解析逆解，写 .wprof sidecar；
+                // 未命中回落到豆包模板/整框检测，原有行为不变。
+                if options.use_profile {
+                    if let Some((profile, px, py, score, scale)) =
+                        crate::watermark_profiles::match_image(&image)
+                    {
+                        if let Some(mask) = crate::watermark_profiles::mask_for(
+                            &profile,
+                            px,
+                            py,
+                            width as usize,
+                            height as usize,
+                            scale,
+                        ) {
+                            let sidecar = masks.join(format!("{}.wprof", name));
+                            let info = serde_json::json!({
+                                "profile": profile.id,
+                                "px": px,
+                                "py": py,
+                                "scale": scale,
+                            });
+                            fs::write(&sidecar, info.to_string()).map_err(|e| e.to_string())?;
+                            log(&format!(
+                                "{}: profile {} matched at ({},{}) score {:.1} -> alpha mask + inverse",
+                                name, profile.id, px, py, score
+                            ));
+                            save_png(DynamicImage::ImageLuma8(mask), &masks.join(name))?;
+                            continue;
+                        }
+                    }
+                }
                 // 三级策略 ①：模板笔画 mask（复杂场景精确修复，见 template_stroke_mask）
-                if let Some((tpl, info)) = template_stroke_mask(&image)? {
-                    log(&format!("{}: {}", name, info));
-                    tpl_mask = Some(tpl);
+                if let Some(hit) = template_stroke_mask(&image)? {
+                    log(&format!("{}: {}", name, hit.info));
+                    // 标记本轮走了豆包模板路径，供结果级验证做"模板残留"检查
+                    let _ = fs::write(masks.join(format!("{}.tpl", name)), "");
+                    tpl_mask = Some(hit.mask);
                 }
                 let mut detected: Vec<(i64, i64, i64, i64)> = if options.any_position {
                     // 任意位置模式：OCR 文字检测（DBNet）优先，命中即完全独挑——
@@ -1130,10 +1298,58 @@ pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Resu
             }
         };
         let mut mask = GrayImage::from_pixel(width, height, image::Luma([0]));
-        for (x1, y1, x2, y2) in &boxes {
-            for y in *y1..*y2 {
-                for x in *x1..*x2 {
-                    mask.put_pixel(x as u32, y as u32, image::Luma([255]));
+        // 手动框选 + refine：框内笔画精分割（框大也不整块重绘），失败退回整框
+        let mut refine_mask: Option<GrayImage> = None;
+        if options.mask_box.is_some() && options.refine {
+            for box_ in &boxes {
+                if let Some(m) = refine_box_mask(&image, *box_) {
+                    refine_mask = Some(match refine_mask {
+                        Some(prev) => {
+                            let mut merged = prev;
+                            for (x, y, p) in m.enumerate_pixels() {
+                                if p.0[0] > 0 {
+                                    merged.put_pixel(x, y, image::Luma([255]));
+                                }
+                            }
+                            merged
+                        }
+                        None => m,
+                    });
+                }
+            }
+            match &refine_mask {
+                Some(m) => {
+                    // 不写 .tpl（避免强制启用豆包模板残留检查误伤非豆包水印：
+                    // 千问等水印可能碰巧拿高分）；只用 .refinebox 标记精分割来源，
+                    // verify_paths 会按 scale≈1.0 + 原图得分自动决定是否查模板残留。
+                    let box_lines: Vec<String> =
+                        boxes.iter().map(|(a, b, c, d)| format!("{a},{b},{c},{d}")).collect();
+                    let _ = fs::write(
+                        masks.join(format!("{}.refinebox", name)),
+                        box_lines.join("\n"),
+                    );
+                    log(&format!(
+                        "{}: box-refined stroke mask ({}px from {} box(es))",
+                        name,
+                        m.iter().filter(|&&v| v > 0).count(),
+                        boxes.len()
+                    ))
+                }
+                None => log(&format!("{}: refine failed, fallback to full box mask", name)),
+            }
+        }
+        if let Some(rm) = &refine_mask {
+            for (x, y, p) in rm.enumerate_pixels() {
+                if p.0[0] > 0 {
+                    mask.put_pixel(x, y, image::Luma([255]));
+                }
+            }
+        } else {
+            for (x1, y1, x2, y2) in &boxes {
+                for y in *y1..*y2 {
+                    for x in *x1..*x2 {
+                        mask.put_pixel(x as u32, y as u32, image::Luma([255]));
+                    }
                 }
             }
         }
@@ -1157,14 +1373,146 @@ pub const CANCELLED: &str = "\u{0}cancelled";
 
 pub type ProgressFn<'a> = &'a dyn Fn(&str, usize, usize, &str);
 
+/// 对命中档案的图应用逐像素解析逆解（在生成式结果之上）。
+/// 返回 Ok(None) 表示档案声明不可逆解（如带暗描边的水印）。
+fn apply_profile_inverse(
+    obs: &DynamicImage,
+    mat: &RgbImage,
+    sidecar: &Path,
+    log: Logger,
+    name: &str,
+) -> Result<Option<RgbImage>, String> {
+    let text = fs::read_to_string(sidecar).map_err(|e| e.to_string())?;
+    let info: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let id = info.get("profile").and_then(|v| v.as_str()).ok_or("sidecar missing profile id")?;
+    let px = info.get("px").and_then(|v| v.as_u64()).ok_or("sidecar missing px")? as usize;
+    let py = info.get("py").and_then(|v| v.as_u64()).ok_or("sidecar missing py")? as usize;
+    let scale = info.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
+    let profile = crate::watermark_profiles::load_profile(id)?;
+    if profile.extra.get("inverse").and_then(|v| v.as_bool()) == Some(false) {
+        log(&format!("{}: profile {} not invertible (outline), keep generative result", name, id));
+        return Ok(None);
+    }
+    let obs_rgb = obs.to_rgb8();
+    let (out, detail) =
+        crate::watermark_profiles::inverse_image(&obs_rgb, mat, &profile, px, py, scale)?;
+    log(&format!("{}: {}", name, detail));
+    Ok(Some(out))
+}
+
+// 豆包 stamp 逆解门控（对齐 Python）：scale 只在 ≈1.0 标定；低纹理背景逆解只会
+// 放大噪声；stamp 的残影阈值远严于档案默认（0.6）。
+const STAMP_SCALE_TOL: f64 = 0.03;
+const STAMP_TEXTURE_MIN: f64 = 9.0;
+const STAMP_MAX_GHOST: f64 = 0.12;
+
+/// 豆包 stamp 逐像素解析逆解（对齐 Python inverse_apply）：obs = α·C + (1−α)·bg，
+/// 用完整水印模型（含暗描边）恢复**真实背景**，覆盖生成式结果。门控不通过/未命中
+/// 返回 None（保持生成式结果）；写入限定在模板 mask ∩ α>0.03，保住"mask 外零改动"。
+fn apply_stamp_inverse(
+    obs: &DynamicImage,
+    mat: &RgbImage,
+    template_mask: &GrayImage,
+    name: &str,
+    log: Logger,
+) -> Option<RgbImage> {
+    let stamp = match crate::watermark_profiles::doubao_stamp() {
+        Ok(p) => p,
+        Err(e) => {
+            log(&format!("{}: stamp unavailable ({}), keep generative result", name, e));
+            return None;
+        }
+    };
+    // 与 prepare 同一把尺子：gap-score 模板匹配给出位置
+    let hit = match template_stroke_mask(obs) {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            log(&format!("{}: stamp inverse skipped (template not matched), keep generative result", name));
+            return None;
+        }
+        Err(e) => {
+            log(&format!("{}: stamp inverse skipped ({}), keep generative result", name, e));
+            return None;
+        }
+    };
+    let rgb = obs.to_rgb8();
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    let scale = (w.min(h) as f64) / stamp.ref_short_side;
+    let params = crate::watermark_profiles::InverseParams {
+        scale_tol: Some(STAMP_SCALE_TOL),
+        texture_min: Some(STAMP_TEXTURE_MIN),
+        ghost_max: Some(STAMP_MAX_GHOST),
+        write_mask: Some(template_mask),
+    };
+    match crate::watermark_profiles::inverse_image_gated(
+        &rgb, mat, &stamp, hit.px, hit.py, scale, &params,
+    ) {
+        Ok(Some((out, detail))) => {
+            log(&format!("{}: stamp inverse {}", name, detail));
+            Some(out)
+        }
+        Ok(None) => {
+            log(&format!("{}: stamp inverse skipped (gating), keep generative result", name));
+            None
+        }
+        Err(e) => {
+            log(&format!("{}: stamp inverse skipped ({}), keep generative result", name, e));
+            None
+        }
+    }
+}
+
+/// 单图修复：空 mask 透传 → 生成式修复 → 逆解（档案优先；否则豆包 stamp，默认开）。
+fn inpaint_one(
+    engine: &mut Lama,
+    path: &Path,
+    masks: &Path,
+    lama_dir: &Path,
+    inverse: bool,
+    log: Logger,
+) -> Result<(), String> {
+    let name = path.file_name().unwrap().to_string_lossy().to_string();
+    let image = load_image(path)?;
+    let mask = load_image(&masks.join(&name))?.to_luma8();
+    // 空 mask（未检测到水印）的图直接原样通过，不进模型
+    if mask.iter().all(|&v| v == 0) {
+        fs::copy(path, lama_dir.join(&name)).map_err(|e| e.to_string())?;
+        log(&format!("{}: empty mask, passed through without inpainting", name));
+        return Ok(());
+    }
+    log(&format!("inpainting {}...", name));
+    let mut result = engine.inpaint_image(&image, &mask, log)?;
+    // 逆解：命中档案（.wprof）走档案逆解；否则豆包模板命中（.tpl）或框选精分割
+    // （.refinebox，内部仍靠模板自定位）走 stamp 逆解。
+    // 都在生成式结果之上做逐像素解析还原真实背景，门控不过则保留生成式结果。
+    let sidecar = masks.join(format!("{}.wprof", name));
+    if sidecar.exists() {
+        match apply_profile_inverse(&image, &result, &sidecar, log, &name) {
+            Ok(Some(inv)) => result = inv,
+            Ok(None) => {}
+            Err(err) => log(&format!("{}: profile inverse skipped ({}), keep generative result", name, err)),
+        }
+    } else if inverse
+        && (masks.join(format!("{}.tpl", name)).exists()
+            || masks.join(format!("{}.refinebox", name)).exists())
+    {
+        if let Some(inv) = apply_stamp_inverse(&image, &result, &mask, &name, log) {
+            result = inv;
+        }
+    }
+    save_png(DynamicImage::ImageRgb8(result), &lama_dir.join(&name))?;
+    log(&format!("done {}", name));
+    Ok(())
+}
+
 pub fn inpaint(
     model_path: &Path,
+    inverse: bool,
     log: Logger,
     progress: ProgressFn,
     is_cancelled: &dyn Fn() -> bool,
 ) -> Result<(), String> {
     let (source, masks, lama_dir, _) = work_dirs();
-    let mut engine = Lama::load(model_path)?;
     let mut entries: Vec<PathBuf> = fs::read_dir(&source)
         .map_err(|e| e.to_string())?
         .filter_map(|entry| entry.ok())
@@ -1176,32 +1524,577 @@ pub fn inpaint(
         return Err("workdir has no prepared source images; run prepare first".into());
     }
     let total = entries.len();
+    let mut engine = Lama::load(model_path)?;
     for (index, path) in entries.iter().enumerate() {
         if is_cancelled() {
             return Err(CANCELLED.to_string());
         }
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        let image = load_image(path)?;
-        let mask = load_image(&masks.join(&name))?.to_luma8();
-        // 空 mask（未检测到水印）的图直接原样通过，不进模型
-        if mask.iter().all(|&v| v == 0) {
-            fs::copy(path, lama_dir.join(&name)).map_err(|e| e.to_string())?;
-            log(&format!("{}: empty mask, passed through without inpainting", name));
-            progress("inpaint", index + 1, total, &name);
-            continue;
-        }
-        log(&format!("inpainting {}...", name));
         progress("inpaint", index, total, &name);
-        let result = engine.inpaint_image(&image, &mask, log)?;
-        save_png(DynamicImage::ImageRgb8(result), &lama_dir.join(&name))?;
-        log(&format!("done {}", name));
+        inpaint_one(&mut engine, path, &masks, &lama_dir, inverse, log)?;
         progress("inpaint", index + 1, total, &name);
     }
     Ok(())
 }
 
-pub fn review_lama(names: &[String]) -> Result<PathBuf, String> {
+/// 只对指定图重跑推理（残留重试用）——单独加载一次模型，不影响整批。
+fn inpaint_subset(
+    model_path: &Path,
+    names: &[String],
+    inverse: bool,
+    log: Logger,
+) -> Result<(), String> {
+    let (source, masks, lama_dir, _) = work_dirs();
+    let mut engine = Lama::load(model_path)?;
+    for name in names {
+        let path = source.join(name);
+        if path.exists() {
+            inpaint_one(&mut engine, &path, &masks, &lama_dir, inverse, log)?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 结果级验证闭环（场景无关，对齐 Python verify_paths）：修复后客观自检 + 低置信度
+// 告警。核心保证：① mask 外零改动——任何水印/场景都成立，被破坏即工程 bug；
+// ② 模板残留——豆包水印修复后不应再匹配到模板字形；③ mask 面积占比（过度重绘）。
+// 不依赖 ground truth，可泛化到未见场景：修完必须过检，否则拒绝落盘。
+// ---------------------------------------------------------------------------
+
+pub struct VerifyReport {
+    pub mask_area: usize,
+    pub mask_ratio: f64,
+    pub passthrough: bool,
+    pub inside_changed: usize,
+    pub outside_changed: usize,
+    pub outside_max: i32,
+    pub orig_score: f64,
+    pub res_score: f64,
+    /// 结构化残留标记：修复后仍匹配豆包模板 → 供残留重试判定（区别于 mask 外改动，
+    /// 那是工程 bug，重试无法修复）。
+    pub residual: bool,
+    pub verdict: &'static str,
+    pub reasons: Vec<String>,
+}
+
+/// 对 (原图, 修复结果, mask) 三元组做客观验证；缺文件/尺寸不一致返回 None。
+/// template_applied 为 true 时才做"豆包模板残留"检查（否则非豆包水印可能碰巧
+/// 匹配模板而误报）。
+pub fn verify_paths(
+    orig_path: &Path,
+    res_path: &Path,
+    mask_path: &Path,
+    template_applied: Option<bool>,
+) -> Option<VerifyReport> {
+    if !(orig_path.exists() && res_path.exists() && mask_path.exists()) {
+        return None;
+    }
+    let orig_img = image::open(orig_path).ok()?;
+    let res_img = image::open(res_path).ok()?;
+    let orig = orig_img.to_rgb8();
+    let res = res_img.to_rgb8();
+    if orig.dimensions() != res.dimensions() {
+        return None;
+    }
+    let (w, h) = orig.dimensions();
+    let m = image::open(mask_path).ok()?.to_luma8();
+    let m = if m.dimensions() != (w, h) {
+        image::imageops::resize(&m, w, h, FilterType::Nearest)
+    } else {
+        m
+    };
+    let mut area = 0usize;
+    let mut inside_changed = 0usize;
+    let mut outside_changed = 0usize;
+    let mut outside_max = 0i32;
+    for y in 0..h {
+        for x in 0..w {
+            let a = orig.get_pixel(x, y).0;
+            let b = res.get_pixel(x, y).0;
+            let mut d = 0i32;
+            for c in 0..3 {
+                d = d.max((a[c] as i32 - b[c] as i32).abs());
+            }
+            if m.get_pixel(x, y).0[0] > 0 {
+                area += 1;
+                if d > 10 {
+                    inside_changed += 1;
+                }
+            } else if d > 2 {
+                outside_changed += 1;
+                outside_max = outside_max.max(d);
+            }
+        }
+    }
+    let total = (w as usize) * (h as usize);
+    let orig_score = template_stroke_mask(&orig_img)
+        .ok()
+        .flatten()
+        .map(|h| h.score)
+        .unwrap_or(0.0);
+    let res_score = template_stroke_mask(&res_img)
+        .ok()
+        .flatten()
+        .map(|h| h.score)
+        .unwrap_or(0.0);
+    let passthrough = area == 0;
+    // template_applied 未显式给出时自动判定（对齐 Python）：原图命中模板且 scale≈1.0
+    // 才做模板残留检查——否则非豆包水印（如千问）碰巧高分会被误判成残留。
+    let template_applied = template_applied.unwrap_or_else(|| {
+        let ref_short = load_template()
+            .map(|(_, _, m)| m.ref_short_side)
+            .unwrap_or(1600.0);
+        let scale = (w.min(h) as f64) / ref_short;
+        orig_score >= TEMPLATE_MIN_SCORE && (scale - 1.0).abs() <= STAMP_SCALE_TOL
+    });
+    let residual =
+        template_applied && orig_score >= TEMPLATE_MIN_SCORE && res_score >= TEMPLATE_MIN_SCORE;
+    let mask_ratio = if total > 0 { area as f64 / total as f64 } else { 0.0 };
+    let mut reasons: Vec<String> = Vec::new();
+    let mut verdict: &'static str = "PASS";
+    if outside_changed > 0 {
+        verdict = "FAIL";
+        reasons.push(format!(
+            "mask 外有 {} px 被改动 (max {})",
+            outside_changed, outside_max
+        ));
+    }
+    if template_applied && orig_score >= TEMPLATE_MIN_SCORE && res_score >= TEMPLATE_MIN_SCORE {
+        verdict = "FAIL";
+        reasons.push(format!(
+            "修复后仍匹配豆包模板 (score {:.1} >= {:.0})，疑有残留",
+            res_score, TEMPLATE_MIN_SCORE
+        ));
+    } else if template_applied
+        && orig_score >= TEMPLATE_MIN_SCORE
+        && res_score >= TEMPLATE_MIN_SCORE * 0.6
+    {
+        if verdict != "FAIL" {
+            verdict = "WARN";
+        }
+        reasons.push(format!(
+            "修复后模板分数偏高 ({:.1})，可能有残留，请放大复查",
+            res_score
+        ));
+    }
+    if !passthrough && mask_ratio > 0.08 {
+        if verdict == "PASS" {
+            verdict = "WARN";
+        }
+        reasons.push(format!(
+            "mask 占图 {:.1}% (> 8%)，可能过度重绘",
+            mask_ratio * 100.0
+        ));
+    }
+    Some(VerifyReport {
+        mask_area: area,
+        mask_ratio,
+        passthrough,
+        inside_changed,
+        outside_changed,
+        outside_max,
+        orig_score,
+        res_score,
+        residual,
+        verdict,
+        reasons,
+    })
+}
+
+pub fn format_verify(report: &VerifyReport) -> String {
+    let head = if report.passthrough {
+        "no mask (passthrough)".to_string()
+    } else {
+        format!(
+            "mask {}px ({:.1}%), inside changed {}",
+            report.mask_area,
+            report.mask_ratio * 100.0,
+            report.inside_changed
+        )
+    };
+    format!(
+        "[{}] {}, outside changed {} (max {}), tmpl {:.1}->{:.1}",
+        report.verdict,
+        head,
+        report.outside_changed,
+        report.outside_max,
+        report.orig_score,
+        report.res_score
+    )
+}
+
+/// 按工作目录约定验证本轮修复结果：原图取备份（无则 source），结果取 lama。
+/// `.tpl` sidecar 存在说明本轮确实命中豆包模板，则强制启用模板残留检查；
+/// 框选精分割只写 `.refinebox`（不强制），交由 verify_paths 按 scale/分数自动判定。
+fn verify_repaired(name: &str, root: &Path) -> Option<VerifyReport> {
+    let (source, masks, lama, _) = work_dirs();
+    let backup = backup_dir(root).join(name);
+    let orig = if backup.exists() { backup } else { source.join(name) };
+    let applied = masks.join(format!("{}.tpl", name)).exists().then_some(true);
+    verify_paths(&orig, &lama.join(name), &masks.join(name), applied)
+}
+
+/// 打印验证结果（仅报告，不拒绝）。返回是否有 FAIL。
+fn report_verify(names: &[String], root: &Path, log: Logger) -> bool {
+    let mut failed = false;
+    for name in names {
+        if let Some(report) = verify_repaired(name, root) {
+            log(&format!("verify {}: {}", name, format_verify(&report)));
+            for reason in &report.reasons {
+                log(&format!("verify {}: {}", name, reason));
+            }
+            if report.verdict == "FAIL" {
+                failed = true;
+            }
+        }
+    }
+    failed
+}
+
+// ---------------------------------------------------------------------------
+// 残留自动重试（对齐 Python _residual_retry）：结果残留来自 mask 盖不住（对齐/
+// 抗锯齿误差），把 mask 膨胀一级隔离重跑一轮；mask 外改动属工程 bug，不重试。
+// ---------------------------------------------------------------------------
+
+const RETRY_DILATE: (usize, usize) = (5, 5);
+
+/// 灰度图矩形核（kw x kh）膨胀：横向 + 纵向两次一维最大。
+fn dilate_gray_rect(src: &GrayImage, kw: usize, kh: usize) -> GrayImage {
+    let (w, h) = (src.width() as usize, src.height() as usize);
+    let rx = kw / 2;
+    let ry = kh / 2;
+    let px: Vec<u8> = src.pixels().map(|p| p.0[0]).collect();
+    let mut tmp = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let lo = x.saturating_sub(rx);
+            let hi = (x + rx).min(w - 1);
+            let mut m = 0u8;
+            for xx in lo..=hi {
+                m = m.max(px[y * w + xx]);
+            }
+            tmp[y * w + x] = m;
+        }
+    }
+    let mut out = GrayImage::new(src.width(), src.height());
+    for y in 0..h {
+        for x in 0..w {
+            let lo = y.saturating_sub(ry);
+            let hi = (y + ry).min(h - 1);
+            let mut m = 0u8;
+            for yy in lo..=hi {
+                m = m.max(tmp[yy * w + x]);
+            }
+            out.put_pixel(x as u32, y as u32, image::Luma([m]));
+        }
+    }
+    out
+}
+
+/// 线性插值分位（对齐 numpy.percentile）。
+fn percentile(values: &[f64], p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut v = values.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let rank = (p / 100.0) * (v.len() as f64 - 1.0);
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    if lo == hi {
+        v[lo]
+    } else {
+        v[lo] + (v[hi] - v[lo]) * (rank - lo as f64)
+    }
+}
+
+/// BORDER_REFLECT_101 索引映射（gfedcb|abcdefgh|gfedcba，边界像素不重复）。
+fn reflect101(i: i64, n: i64) -> i64 {
+    if n <= 1 {
+        return 0;
+    }
+    let mut i = i;
+    loop {
+        if i < 0 {
+            i = -i;
+        } else if i >= n {
+            i = 2 * (n - 1) - i;
+        } else {
+            return i;
+        }
+    }
+}
+
+/// 盒滤波的局部均值与标准差（96x96 窗口，对齐 cv2.boxFilter 默认 BORDER_REFLECT_101；
+/// 偶数核锚点在 ksize/2，窗口为 [x-48, x+47] 共 96 项，面积恒为 win*win）。
+fn box_mean_std(src: &[f64], w: usize, h: usize, win: usize) -> (Vec<f64>, Vec<f64>) {
+    let lo = (win / 2) as i64;
+    let hi = (win - win / 2 - 1) as i64;
+    // 水平方向滑窗和（reflect-101），再做垂直方向
+    let mut hs = vec![0f64; w * h];
+    let mut hsq = vec![0f64; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (mut s, mut sq) = (0f64, 0f64);
+            for k in -lo..=hi {
+                let xx = reflect101(x as i64 + k, w as i64) as usize;
+                let v = src[y * w + xx];
+                s += v;
+                sq += v * v;
+            }
+            hs[y * w + x] = s;
+            hsq[y * w + x] = sq;
+        }
+    }
+    let area = ((lo + hi + 1) * (lo + hi + 1)) as f64;
+    let mut mean = vec![0f64; w * h];
+    let mut std = vec![0f64; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (mut s, mut sq) = (0f64, 0f64);
+            for k in -lo..=hi {
+                let yy = reflect101(y as i64 + k, h as i64) as usize;
+                s += hs[yy * w + x];
+                sq += hsq[yy * w + x];
+            }
+            let m = s / area;
+            let m2 = sq / area;
+            mean[y * w + x] = m;
+            std[y * w + x] = (m2 - m * m).max(0.0).sqrt();
+        }
+    }
+    (mean, std)
+}
+
+/// 8 连通标记：返回 (labels 1-based, 各连通域面积, 各连通域 y 质心)。
+fn label_components(active: &[bool], w: usize, h: usize) -> (Vec<u32>, Vec<usize>, Vec<f64>) {
+    let mut labels = vec![0u32; w * h];
+    let mut areas: Vec<usize> = Vec::new();
+    let mut cy: Vec<f64> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut cur = 0u32;
+    for sy in 0..h {
+        for sx in 0..w {
+            let idx = sy * w + sx;
+            if !active[idx] || labels[idx] != 0 {
+                continue;
+            }
+            cur += 1;
+            labels[idx] = cur;
+            stack.push(idx);
+            let (mut area, mut ysum) = (0usize, 0f64);
+            while let Some(c) = stack.pop() {
+                area += 1;
+                let (cxx, cyy) = (c % w, c / w);
+                ysum += cyy as f64;
+                for dy in -1i64..=1 {
+                    for dx in -1i64..=1 {
+                        let nx = cxx as i64 + dx;
+                        let ny = cyy as i64 + dy;
+                        if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
+                            continue;
+                        }
+                        let ni = ny as usize * w + nx as usize;
+                        if active[ni] && labels[ni] == 0 {
+                            labels[ni] = cur;
+                            stack.push(ni);
+                        }
+                    }
+                }
+            }
+            areas.push(area);
+            cy.push(ysum / area as f64);
+        }
+    }
+    (labels, areas, cy)
+}
+
+/// 框内笔画精分割（对齐 Python refine_box_mask）：把任意来源的候选框（检测框/手动框）
+/// 缩小到笔画级 mask——框内顶帽局部对比度分割（亮/暗水印自适应）+ 低饱和过滤 +
+/// 局部自适应阈值（96x96 的 mean+1.8σ）+ 连通域面积≥9 与"单行文字行带"约束。
+/// 失败（空 / 几乎填满整框 / 过度碎化）返回 None，调用方退回整框。
+pub fn refine_box_mask(image: &DynamicImage, box_: (i64, i64, i64, i64)) -> Option<GrayImage> {
+    const PAD: i64 = 16;
+    const WIN: usize = 96;
+    const LOW_SAT: i32 = 60;
+    let rgb = image.to_rgb8();
+    let (iw, ih) = (rgb.width() as i64, rgb.height() as i64);
+    let (x1, y1, x2, y2) = box_;
+    let rx1 = (x1 - PAD).max(0);
+    let ry1 = (y1 - PAD).max(0);
+    let rx2 = (x2 + PAD).min(iw);
+    let ry2 = (y2 + PAD).min(ih);
+    if rx2 <= rx1 || ry2 <= ry1 {
+        return None;
+    }
+    let (rw, rh) = ((rx2 - rx1) as usize, (ry2 - ry1) as usize);
+    if rw < 8 || rh < 8 {
+        return None;
+    }
+    let mut gray = vec![0f64; rw * rh];
+    let mut low_sat = vec![false; rw * rh];
+    for y in 0..rh {
+        for x in 0..rw {
+            let p = rgb
+                .get_pixel((rx1 + x as i64) as u32, (ry1 + y as i64) as u32)
+                .0;
+            let mx = *p.iter().max().unwrap() as i32;
+            let mn = *p.iter().min().unwrap() as i32;
+            gray[y * rw + x] = mx as f64;
+            low_sat[y * rw + x] = (mx - mn) <= LOW_SAT;
+        }
+    }
+    // 31x31 椭圆开运算估局部背景；亮/暗水印自适应：哪侧局部对比度响应强用哪侧
+    let opened = ellipse_morph(&ellipse_morph(&gray, rw, rh, 15, false), rw, rh, 15, true);
+    let bright: Vec<f64> = gray.iter().zip(opened.iter()).map(|(&g, &o)| g - o).collect();
+    let dark: Vec<f64> = gray.iter().zip(opened.iter()).map(|(&g, &o)| o - g).collect();
+    let abs99 = |v: &[f64]| percentile(&v.iter().map(|x| x.abs()).collect::<Vec<f64>>(), 99.0);
+    let diff = if abs99(&bright) >= abs99(&dark) { bright } else { dark };
+    // 局部自适应阈值：背景非均匀（同时含亮墙与暗花丛）时全局阈值顾此失彼
+    let (mean, std) = box_mean_std(&diff, rw, rh, WIN);
+    let mut active = vec![false; rw * rh];
+    for i in 0..rw * rh {
+        let th = (mean[i] + 1.8 * std[i]).max(10.0);
+        active[i] = diff[i] >= th && low_sat[i];
+    }
+    let (labels, areas, cy) = label_components(&active, rw, rh);
+    let keep: Vec<usize> = (1..=areas.len()).filter(|&i| areas[i - 1] >= 9).collect();
+    if keep.is_empty() {
+        return None;
+    }
+    // 行带约束：水印是单行文字，组件 y 质心应聚在一条行带；远离的判为背景纹理误检
+    let ys: Vec<f64> = keep.iter().map(|&i| cy[i - 1]).collect();
+    let band_center = percentile(&ys, 50.0);
+    let dev: Vec<f64> = ys.iter().map(|y| (y - band_center).abs()).collect();
+    let band_half = (percentile(&dev, 80.0) * 1.5).max(15.0);
+    let mut keep_flag = vec![false; areas.len() + 1];
+    let mut kept = 0usize;
+    for &i in &keep {
+        if (cy[i - 1] - band_center).abs() <= band_half {
+            keep_flag[i] = true;
+            kept += 1;
+        }
+    }
+    let mut cleaned = vec![false; rw * rh];
+    let mut stroke_px = 0usize;
+    for k in 0..rw * rh {
+        let l = labels[k] as usize;
+        if l > 0 && keep_flag[l] {
+            cleaned[k] = true;
+            stroke_px += 1;
+        }
+    }
+    let box_area = ((x2 - x1) * (y2 - y1)) as f64;
+    // 失败判定：几乎填满整框（背景与水印不可分）或过度碎化（背景细节误检）
+    if stroke_px == 0 || stroke_px as f64 > box_area * 0.6 || kept > 300 {
+        return None;
+    }
+    let mut strokes = GrayImage::new(rw as u32, rh as u32);
+    for k in 0..rw * rh {
+        if cleaned[k] {
+            strokes.put_pixel((k % rw) as u32, (k / rw) as u32, image::Luma([255]));
+        }
+    }
+    // Rust 内核固定 LaMa → 用 Python 的 REFINE_DILATE_LAMA(19,11) 连接笔画碎片
+    let strokes = dilate_gray_rect(&strokes, 19, 11);
+    let mut full = GrayImage::from_pixel(rgb.width(), rgb.height(), image::Luma([0]));
+    for y in 0..rh {
+        for x in 0..rw {
+            if strokes.get_pixel(x as u32, y as u32).0[0] > 0 {
+                full.put_pixel((rx1 + x as i64) as u32, (ry1 + y as i64) as u32, image::Luma([255]));
+            }
+        }
+    }
+    if full.iter().all(|&v| v == 0) {
+        return None;
+    }
+    Some(full)
+}
+
+/// 对残留图扩 mask 并重跑复验（最多 1 轮）；仍残留则打印 FAIL（交给 finalize 拒绝落盘）。
+pub fn residual_retry(
+    options: &PipelineOptions,
+    names: &[String],
+    model_path: &Path,
+    log: Logger,
+) -> Result<(), String> {
+    let masks = work_dirs().1;
+    let candidates: Vec<String> = names
+        .iter()
+        .filter(|name| {
+            verify_repaired(name, &options.root)
+                .map(|r| r.residual)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    log(&format!(
+        "verify: watermark residual detected in {} — expanding mask and retrying once (max 1 round)",
+        candidates.join(", ")
+    ));
+    for name in &candidates {
+        let mask_path = masks.join(name);
+        let m = load_image(&mask_path)?.to_luma8();
+        // 框选精分割留残留 → 退化为用户框选的整框（旧行为，保证必然去除）；否则膨胀一级。
+        let refined_box = masks.join(format!("{}.refinebox", name));
+        let grown = if let Ok(text) = fs::read_to_string(&refined_box) {
+            let mut full = GrayImage::from_pixel(m.width(), m.height(), image::Luma([0]));
+            let mut n = 0usize;
+            for line in text.lines() {
+                let parts: Vec<i64> = line.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+                if parts.len() != 4 {
+                    continue;
+                }
+                let (x1, y1, x2, y2) = (parts[0], parts[1], parts[2], parts[3]);
+                for y in y1.max(0)..y2.min(m.height() as i64) {
+                    for x in x1.max(0)..x2.min(m.width() as i64) {
+                        full.put_pixel(x as u32, y as u32, image::Luma([255]));
+                    }
+                }
+                n += 1;
+            }
+            let added = full.iter().zip(m.iter()).filter(|(a, b)| a > b).count();
+            log(&format!(
+                "{}: refine left residual -> fallback to full box mask ({} box(es), +{}px)",
+                name, n, added
+            ));
+            full
+        } else {
+            let grown = dilate_gray_rect(&m, RETRY_DILATE.0, RETRY_DILATE.1);
+            let added = grown.iter().zip(m.iter()).filter(|(a, b)| a > b).count();
+            log(&format!(
+                "{}: retry mask +{}px (dilate {}x{})",
+                name, added, RETRY_DILATE.0, RETRY_DILATE.1
+            ));
+            grown
+        };
+        save_png(DynamicImage::ImageLuma8(grown), &mask_path)?;
+    }
+    inpaint_subset(model_path, &candidates, options.inverse, log)?;
+    for name in &candidates {
+        if let Some(report) = verify_repaired(name, &options.root) {
+            log(&format!("verify {}: {}", name, format_verify(&report)));
+            for reason in &report.reasons {
+                log(&format!("verify {}: {}", name, reason));
+            }
+            if report.residual {
+                log(&format!(
+                    "{}: STILL residual after retry — finalize will refuse unless --force is used",
+                    name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn review_lama(names: &[String], root: &Path) -> Result<PathBuf, String> {
     let (_, _, lama_dir, review_dir) = work_dirs();
+    report_verify(names, root, &|line| println!("{}", line));
     let output = review(&lama_dir, &review_dir, "lama-corner-review.png", names)?;
     println!("{}", output.display());
     Ok(output)
@@ -1213,6 +2106,31 @@ pub fn finalize_outputs(options: &PipelineOptions, names: &[String], log: Logger
     let dest_dir = output_dir(options);
     if !options.overwrite_original {
         fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
+    }
+    // 验证闭环：落盘前客观自检，FAIL 拒绝写入（--force 强制），WARN 提示
+    if !options.force {
+        let mut failures: Vec<&String> = Vec::new();
+        for name in names {
+            if let Some(report) = verify_repaired(name, &options.root) {
+                log(&format!("verify {}: {}", name, format_verify(&report)));
+                for reason in &report.reasons {
+                    log(&format!("verify {}: {}", name, reason));
+                }
+                if report.verdict == "FAIL" {
+                    failures.push(name);
+                }
+            }
+        }
+        if !failures.is_empty() {
+            let list = failures
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "verification FAILED for {list} — refusing to write output (use --force to override, or review manually)"
+            ));
+        }
     }
     for name in names {
         let result = load_image(&lama_dir.join(name))?;
@@ -1308,8 +2226,11 @@ pub fn run(
     prepare(options, &names, log)?;
     let (_, _, _, review_dir) = work_dirs();
     let source_review = review_dir.join("source-corner-review.png");
-    inpaint(model_path, log, progress, is_cancelled)?;
-    let candidate_review = review_lama(&names)?;
+    inpaint(model_path, options.inverse, log, progress, is_cancelled)?;
+    if options.retry && !is_cancelled() {
+        residual_retry(options, &names, model_path, log)?;
+    }
+    let candidate_review = review_lama(&names, &options.root)?;
     let final_review = finalize_outputs(options, &names, log)?;
     let output_dir_path = output_dir(options);
     if options.keep_work {
@@ -1410,9 +2331,10 @@ mod tests {
 
     #[test]
     fn template_assets_embedded() {
-        let (tpl, meta) = load_template().expect("template assets must compile into binary");
+        let (tpl, alpha, meta) = load_template().expect("template assets must compile into binary");
         assert_eq!(meta.ref_short_side, 1600.0);
         assert!(tpl.width() > 200 && tpl.height() > 60);
+        assert_eq!(alpha.dimensions(), tpl.dimensions(), "alpha asset must match template");
         let filled = tpl.pixels().filter(|p| p.0[0] > 127).count();
         // 笔画填充率 ~21%（远小于整框）
         let ratio = filled as f64 / (tpl.width() as f64 * tpl.height() as f64);
@@ -1423,7 +2345,7 @@ mod tests {
     fn template_stroke_mask_hits_real_style_watermark() {
         // 用真实模板字形以 α=0.6 白色叠加合成水印（同豆包混合模型），
         // template_stroke_mask 应命中且 mask 覆盖笔画区
-        let (tpl, _meta) = load_template().unwrap();
+        let (tpl, _alpha, _meta) = load_template().unwrap();
         let (w, h) = (1728u32, 2304u32);
         let scale = 1728.0 / 1600.0;
         let t = image::imageops::resize(&tpl, (tpl.width() as f64 * scale) as u32, (tpl.height() as f64 * scale) as u32, FilterType::Nearest);
@@ -1442,15 +2364,18 @@ mod tests {
         }
         let hit = template_stroke_mask(&DynamicImage::ImageRgb8(img)).unwrap();
         assert!(hit.is_some(), "template should match real-style watermark");
-        let (mask, info) = hit.unwrap();
+        let TemplateHit { mask, info, .. } = hit.unwrap();
         let whites = mask.pixels().filter(|p| p.0[0] > 0).count();
+        // 连续 α mask（α>0.03）覆盖全部污染像素（含抗锯齿），面积应显著小于整框
         assert!(whites > 10000, "mask should cover strokes ({whites}px): {info}");
+        let box_area = (t.width() as usize) * (t.height() as usize);
+        assert!(whites < box_area, "stroke mask must be smaller than the full box");
         // mask 必须集中在右下角（水印贴角）
-        let bbox = maskPixels(&mask);
+        let bbox = mask_pixels(&mask);
         assert!(bbox.2 >= (w as i64 - 60) && bbox.3 >= (h as i64 - 60), "mask should hug bottom-right: {bbox:?}");
     }
 
-    fn maskPixels(mask: &GrayImage) -> (i64, i64, i64, i64) {
+    fn mask_pixels(mask: &GrayImage) -> (i64, i64, i64, i64) {
         let mut b = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
         for (x, y, p) in mask.enumerate_pixels() {
             if p.0[0] > 0 {
@@ -1467,6 +2392,47 @@ mod tests {
     fn template_stroke_mask_misses_clean_image() {
         let img = RgbImage::from_pixel(1600, 900, Rgb([240, 240, 233]));
         assert!(template_stroke_mask(&DynamicImage::ImageRgb8(img)).unwrap().is_none());
+    }
+
+    #[test]
+    fn verify_paths_flags_outside_changes() {
+        let root = temp_root("verify");
+        let orig = RgbImage::from_pixel(400, 300, Rgb([100, 110, 120]));
+        let orig_p = root.join("o.png");
+        save_png(DynamicImage::ImageRgb8(orig.clone()), &orig_p).unwrap();
+        let mut mask = GrayImage::from_pixel(400, 300, image::Luma([0]));
+        for y in 100..140 {
+            for x in 100..160 {
+                mask.put_pixel(x, y, image::Luma([255]));
+            }
+        }
+        let mask_p = root.join("m.png");
+        save_png(DynamicImage::ImageLuma8(mask), &mask_p).unwrap();
+
+        // 只改 mask 内 → PASS，mask 外零改动
+        let mut ok = orig.clone();
+        for y in 100..140 {
+            for x in 100..160 {
+                ok.put_pixel(x, y, Rgb([10, 10, 10]));
+            }
+        }
+        let ok_p = root.join("ok.png");
+        save_png(DynamicImage::ImageRgb8(ok), &ok_p).unwrap();
+        let rep = verify_paths(&orig_p, &ok_p, &mask_p, Some(false)).unwrap();
+        assert_eq!(rep.verdict, "PASS", "{:?}", rep.reasons);
+        assert_eq!(rep.outside_changed, 0);
+        assert_eq!(rep.mask_area, 40 * 60);
+
+        // 改 mask 外 1px → FAIL（mask 外零改动是硬保证）
+        let mut bad = orig.clone();
+        bad.put_pixel(10, 10, Rgb([200, 200, 200]));
+        let bad_p = root.join("bad.png");
+        save_png(DynamicImage::ImageRgb8(bad), &bad_p).unwrap();
+        let rep = verify_paths(&orig_p, &bad_p, &mask_p, Some(false)).unwrap();
+        assert_eq!(rep.verdict, "FAIL");
+        assert_eq!(rep.outside_changed, 1);
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -1555,6 +2521,65 @@ mod tests {
         assert!(resolve_box(1000, 800, Some(MaskBox { x1: 50, y1: 50, x2: 40, y2: 60 })).is_err());
     }
 
+    /// 与 Python `refine_box_mask` 的逐像素一致性（固定 LaMa 膨胀核）。先用
+    /// `python tools/refine_parity_dump.py` 生成 /tmp/refine-parity（`REFINE_PARITY_DIR`
+    /// 可覆盖），产物缺失时自动跳过。
+    #[test]
+    #[ignore]
+    fn refine_box_mask_matches_python() {
+        let dir = match std::env::var("REFINE_PARITY_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => PathBuf::from("/tmp/refine-parity"),
+        };
+        let manifest = match fs::read_to_string(dir.join("manifest.json")) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let cases: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        let mut fails: Vec<String> = Vec::new();
+        for case in cases.as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let box_ = case["box"].as_array().unwrap();
+            let b = (
+                box_[0].as_i64().unwrap(),
+                box_[1].as_i64().unwrap(),
+                box_[2].as_i64().unwrap(),
+                box_[3].as_i64().unwrap(),
+            );
+            let image = load_image(&PathBuf::from("../../dist").join(name)).unwrap();
+            let got = refine_box_mask(&image, b);
+            if let Some(m) = &got {
+                let _ = m.save(dir.join(format!("rust-{name}.png")));
+            }
+            let expected_path = case.get("mask").and_then(|v| v.as_str());
+            match (got, expected_path) {
+                (None, None) => {}
+                (None, Some(p)) => fails.push(format!("{name}: rust refine None, python {p}")),
+                (Some(_), None) => fails.push(format!("{name}: rust refine Some, python None")),
+                (Some(m), Some(p)) => {
+                    let exp = image::open(p).unwrap().to_luma8();
+                    assert_eq!(m.dimensions(), exp.dimensions(), "{name}: size mismatch");
+                    let (mut inter, mut union) = (0f64, 0f64);
+                    for (a, b) in m.pixels().zip(exp.pixels()) {
+                        let (a, b) = (a.0[0] > 0, b.0[0] > 0);
+                        if a || b {
+                            union += 1.0;
+                        }
+                        if a && b {
+                            inter += 1.0;
+                        }
+                    }
+                    let iou = if union == 0.0 { 1.0 } else { inter / union };
+                    println!("{name}: IOU {iou:.4}");
+                    if iou < 0.995 {
+                        fails.push(format!("{name}: IOU {iou:.4}"));
+                    }
+                }
+            }
+        }
+        assert!(fails.is_empty(), "refine parity failures: {fails:?}");
+    }
+
     #[test]
     fn output_dir_modes() {
         let root = temp_root("outdir");
@@ -1565,6 +2590,11 @@ mod tests {
             mask_box: None,
             any_position: false,
             overwrite_original: true,
+            use_profile: true,
+            force: false,
+            inverse: true,
+            retry: true,
+            refine: false,
         };
         assert_eq!(output_dir(&options), root);
         let options = PipelineOptions { overwrite_original: false, ..options };
@@ -1602,7 +2632,7 @@ mod tests {
         let (x1, y1, _x2, _y2) = make_watermark_image(&root.join("b.png"), 1024, 1024, "AI");
         let _ = x1;
         let _ = y1;
-        let options = PipelineOptions { root: root.clone(), files: vec!["b.png".to_string()], keep_work: false, mask_box: None, any_position: false, overwrite_original: true };
+        let options = PipelineOptions { root: root.clone(), files: vec!["b.png".to_string()], keep_work: false, mask_box: None, any_position: false, overwrite_original: true, use_profile: true, force: false, inverse: true, retry: false, refine: false };
         let names = target_names(&root, &options.files).unwrap();
         let noop_log: Logger = &|_| {};
         prepare(&options, &names, &noop_log).unwrap();
@@ -1614,18 +2644,18 @@ mod tests {
         assert!(masks.join("b.png").exists());
         assert!(review.join("source-corner-review.png").exists());
 
-        // 伪造推理输出（遮罩外的内容保持，遮罩内填背景色）
+        // 伪造推理输出：只改遮罩内像素（验证闭环要求 mask 外零改动）
         let img = image::open(&backup).unwrap().to_rgb8();
         let mut fake = img.clone();
-        let (bx1, by1, bx2, by2) = resolve_box(1024, 1024, None).unwrap();
-        for y in by1..by2 {
-            for x in bx1..bx2 {
-                fake.put_pixel(x as u32, y as u32, Rgb([240, 240, 233]));
+        let pattern = image::open(masks.join("b.png")).unwrap().to_luma8();
+        for (x, y, p) in pattern.enumerate_pixels() {
+            if p.0[0] > 0 {
+                fake.put_pixel(x, y, Rgb([240, 240, 233]));
             }
         }
         save_png(DynamicImage::ImageRgb8(fake), &_lama.join("b.png")).unwrap();
 
-        let candidate = review_lama(&names).unwrap();
+        let candidate = review_lama(&names, &root).unwrap();
         assert!(candidate.exists());
         let final_ = overwrite_review(&options, &names).unwrap();
         assert!(final_.exists());
@@ -1666,6 +2696,11 @@ mod tests {
             mask_box: Some(MaskBox { x1: x1 - 20, y1: y1 - 20, x2: x2 + 20, y2: y2 + 20 }),
             any_position: false,
             overwrite_original: true,
+            use_profile: true,
+            force: false,
+            inverse: true,
+            retry: true,
+            refine: false,
         };
         let log = |_line: &str| {};
         let summary = run(&options, &model, &log, &|_, _, _, _| {}, &|| false).expect("pipeline run failed");

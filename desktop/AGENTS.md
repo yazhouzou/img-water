@@ -1,45 +1,64 @@
 # desktop/AGENTS.md — 桌面端/App 细节（按需加载）
 
-本文件只在改 `desktop/`（Tauri 应用、Rust 内核、CI、打包）时才需要读。根 `AGENTS.md` 保持精简并指向这里。
+只在改 `desktop/` 时读；根 `AGENTS.md` 精简并指向这里。CI/发版见 `docs/ci.md`，Android 见 `docs/android.md`。
 
 ## 定位
-项目提供 Tauri 桌面应用（`desktop/`），内置 Rust + ONNX Runtime 修复内核（v0.2 起，无需 Python）。旧 Python 流水线（`tools/remove_doubao_watermark.py` + `.img-inpaint-venv/`）保留作终端回退方案，不再被桌面端依赖。
+Tauri 桌面应用，内置 Rust + ONNX Runtime 修复内核（v0.2 起，无需 Python）；旧 Python 流水线（`tools/remove_doubao_watermark.py` + `.img-inpaint-venv/`）仅作终端回退。
 
-## Rust 内核（`desktop/src-tauri/src/lama.rs`）
-- 用 `ort` 推理 LaMa ONNX 模型（`.models/lama_fp32.onnx`，约 200MB）；输入固定 [batch,3,512,512]（ONNX 导出时 H/W 静态，实测与 JIT big-lama 输出逐像素一致、无质量阉割；输入 0..1、输出 0..255、mask 二值不敏感）。
-- v0.5.1 起推理策略对齐 iopaint CROP：每个遮罩连通块 crop bbox+128px margin（`crop_box()` 贴边补偿同 iopaint）；crop ≤512 原分辨率居中 pad 到 512 推理，更大时等比缩放到 512 推理后 Lanczos 还原写回。取代 v0.3.9 的 tile 分块（tile 每块只看半截水印导致接缝与模糊，是"App 端部分图模糊"根因之一）；图像源函数内 clone 自当前已修复结果（级联）。
-- **pad 区必须用图像均值色常数填充，禁止反射 pad**：反射会把贴近 crop 边缘的水印文字镜像进模型上下文，模型照字形延续产生残影（v0.5.3 排查结论；水印贴图底时 mask 必然贴 crop 边，此坑必现；iopaint 原分辨率推理 pad 仅 ≤7px 故无此问题）。
-- FFT 算子不可导出 ONNX（`aten::fft_rfftn` 不支持），Carve 固定 512 正因 FFT 在固定尺寸下可预计算为矩阵乘——动态尺寸 ONNX 导出已验证不可行。
+## Rust 内核（`src/lama.rs`）
+- `ort` 推理 LaMa ONNX（`.models/lama_fp32.onnx`，~200MB）；输入固定 `[b,3,512,512]`（ONNX 静态 H/W，与 JIT big-lama 逐像素一致；输入 0..1、输出 0..255、mask 二值不敏感）。
+- 对齐 iopaint CROP：每遮罩连通块 crop bbox+128px（`crop_box()` 贴边补偿同 iopaint）；crop ≤512 原分辨率居中 pad 到 512，更大则等比缩到 512 推理后 Lanczos 还原。
+- **pad 必须用图像均值色常数填充，禁止反射 pad**：反射会把贴边水印镜像进上下文 → 残影（水印贴图底时必现）。
+- FFT 不可导出 ONNX（`aten::fft_rfftn` 不支持）；Carve 固定 512 正因 FFT 可预计算为矩阵乘。
+- 演进史与教训（tile→crop 等）见 `docs/lessons.md` §11。
 
 ## 流水线 / CLI
-- `desktop/src-tauri/src/pipeline.rs` 是 `tools/remove_doubao_watermark.py` 的 Rust 移植（备份/遮罩/修复/复查/覆盖/清理），进程内调用；`run` 模式清理前会把两张复查拼图复制到系统临时目录 `doubao-watermark-review/` 再输出路径，避免被清理后失效。
-- CLI `clean-cli`（`cargo build --bin clean-cli`），参数与 Python 脚本一致（`--root`/`--mask-box`/`--keep-work` + `run|prepare|inpaint|review-lama|overwrite-review|cleanup`）。
-- 模型下载：启动检测到缺失即自动下载（多连接分段+分段重试+源回退 hf-mirror→huggingface），顶栏进度条；`LAMA_ONNX_URL` 覆盖下载源，`LAMA_ONNX_PATH` 覆盖模型位置。
+- `pipeline.rs` 是 Python 脚本的 Rust 移植（备份/遮罩/修复/复查/覆盖/清理）；`run` 清理前把两张复查拼图复制到系统临时目录 `doubao-watermark-review/` 再输出路径。
+- CLI `clean-cli`（`cargo build --bin clean-cli`），参数同 Python（`--root`/`--mask-box`/`--keep-work`/`--force`（验证 FAIL 时强制落盘） + `run|prepare|inpaint|review-lama|overwrite-review|cleanup`）。
+- 模型下载：启动缺失即自动下载（多连接分段+重试+源回退 hf-mirror→huggingface），顶栏进度条；`LAMA_ONNX_URL` 覆盖源，`LAMA_ONNX_PATH` 覆盖位置。
 
-## 开发 / 打包
-- `cd desktop && pnpm install && pnpm tauri dev`。直接跑 `cargo build`/`cargo check` 必须先 `env -u CFLAGS -u CXXFLAGS -u CCFLAGS -u LDFLAGS -u MACOSX_DEPLOYMENT_TARGET`（`.zshrc` 旧 MacPorts 变量会破坏 `objc2-exception-helper` 编译），或统一用 `desktop/build.sh`。
-- Windows 安装包无法在 macOS 交叉编译；一键打包 `tools/package-app.sh`：`mac`（本机 DMG）、`win`（Windows Git Bash 本机构建，或 macOS 上 `--remote user@host --win-repo C:/path` 经 SSH 触发远程 Windows 构建并拉回）、`both`；产物统一在根 `dist/`。
+## 水印档案库（Rust 侧）
+概念/建档案流程/阈值见 `docs/non-doubao-watermarks.md`；这里只记 Rust 侧差异与踩坑。
+- `watermark_profiles.rs`：α/C 档案读写、NCC ±35% 两级定位（`NCC_SCALE_SPAN`）、`inverse_image`、学习（pair/solid/batch/auto）。`pipeline.rs` 加 `use_profile`（默认 true）：prepare 匹配写 `.wprof`，inpaint 后 `apply_profile_inverse`。qwen 档案 `include_bytes!` 内嵌；目录 `WATERMARK_PROFILES_DIR` 可覆盖，默认 `project_root/tools/watermarks`。
+- CLI：`profiles`、`match <img>`、`learn-pair/learn-solid/learn-auto/learn-batch`（参数同 Python）、`--no-profile`。
+- **踩坑**：连通域筛选（`labels_areas`）必须跳过背景 label 0，否则 `areas[0] >= min_area` 把全图判成前景（`stroke_mask` 全屏 mask、`clean_alpha` 残留微 α 使裁剪不收缩）。
+- 自实现替代 imageproc：`CrossCorrelationNormalized` 是 CCORR 不减均值 → 自写 zero-mean NCC；形态学太慢 → 自写 O(n) 滑窗方形核（`rect_morph`/`slide_extreme`）。
 
-## Android
-- 代码层适配已就绪（路径重定向到应用目录、相册 `content://` URI 经 JNI/ContentResolver 拷贝导入见 `android_uri.rs`、移动端状态驱动单列 UI）；APK 由 CI 出（debug 签名，约 70MB）；运行时问题优先真机复现 + 截图报错定位。
-- v0.3.5 起 `gen/android` 已入库（根 `.gitignore` 用 `gen/*` + `!gen/android/`），`MainActivity.kt` 用 `WindowInsetsCompat` 给 content 加四边避让 padding——targetSdk 36 强制 edge-to-edge 且 Android WebView 不支持 CSS `env(safe-area-inset-*)`，去掉 `enableEdgeToEdge()` 无效；本地 `pnpm tauri android build` 的 gradle rustBuild 任务有 WebSocket 环境问题（CI 正常），本地验证 Kotlin 用 `./gradlew :app:compileUniversalDebugKotlin`。
-- 本机 Android 工具链（2026-09 已装）：brew `android-commandlinetools`（`/opt/homebrew/share/android-commandlinetools`）+ `openjdk@17`（`/opt/homebrew/opt/openjdk@17`）+ NDK 26.3.11579264；环境变量已写入 `~/.zshrc`（JAVA_HOME/ANDROID_HOME/NDK_HOME）。推送前预检 `./tools/android-check.sh`（cargo check + 测试编译，--target aarch64-linux-android，NDK 工具链、`tools/android-test-stubs.c` bionic 符号桩均在脚本内处理）。真机调试：`adb devices` 确认后 `cd desktop && pnpm tauri android dev` 部署热重载。
-- 本机访问 GitHub：`github.com:443` 常被阻断，SSH 走 `ssh.github.com:443`（已写入 `~/.ssh/config` 的 `Host github.com`）；`api.github.com` 可直连，匿名 API 可查 CI 状态/产物（日志需登录）。
+## 开发 / 打包 / 测试
+- `cd desktop && pnpm install && pnpm tauri dev`。
+- 跑 `cargo build`/`check` 必须先 `env -u CFLAGS -u CXXFLAGS -u CCFLAGS -u LDFLAGS -u MACOSX_DEPLOYMENT_TARGET`（`.zshrc` 旧 MacPorts 变量破坏 `objc2-exception-helper`），或用 `desktop/build.sh`。
+- Windows 包无法在 macOS 交叉编译；`tools/package-app.sh`：`mac`（本机 DMG）/`win`（Windows Git Bash 本机，或 macOS `--remote user@host --win-repo C:/path` 经 SSH 远程构建拉回）/`both`；产物在根 `dist/`。
+- `cargo test --lib`（常规 18）+ `cargo test --lib -- --ignored --nocapture`（含 `detect_box_on_qwen_samples`/`qwen_profile_matches_real_images`/`qwen_pair_learning_residual_is_tiny`/`full_run_with_lama_e2e`）。
+- 推送前预检、CI 工作流、本地 E2E 与发版：见 `docs/ci.md`。
 
 ## UI 本地联调（零 SDK）
-`./tools/ui-preview.sh` 起 http 服务并打开 `desktop/ui/index.html`；`ui/mock.js` 在浏览器环境 mock 全部 Tauri API（打包应用内自动失效），`?mobile=1/0` 强制移动/桌面视图、`?nomodel=1` 模拟未下载模型；改 ui 下 HTML/CSS/JS 后浏览器刷新即可，不依赖 CI。
+`./tools/ui-preview.sh` 起 http 服务打开 `desktop/ui/index.html`；`ui/mock.js` 在浏览器 mock 全部 Tauri API（打包内自动失效），`?mobile=1/0` 强制移动/桌面、`?nomodel=1` 模拟未下载；改 ui 下文件刷新即可，不依赖 CI；Windows: PowerShell 需 `chcp 65001`。
 
-## 测试 / CI / 发版
-- 自动化测试（三端）：`pipeline.rs` 内置单元测试（遮罩规则/负数坐标/文件名排序/无模型全流程）+ `#[ignore]` E2E（真实 LaMa 推理，断言水印白像素下降与自动清理）。本地跑 E2E：模型放 `desktop/src-tauri/.models/lama_fp32.onnx` 后 `LAMA_MODEL=.models/lama_fp32.onnx cargo test --quiet -- --ignored`（清 MacPorts 变量，cd src-tauri）；CI `desktop-build.yml` 跑单测 + 模型缓存 + E2E。已修复 `numeric_key` 大写 `.PNG` 排序 bug。
-- CI：GitHub Actions（仓库 `github.com/yazhouzou/img-water`，remote 名 `github`；origin 仍是 Codeup，双远端都推）；产物自动附加到 Release（免登录）。注意：x86_64 macOS 已从矩阵移除（ort-sys 无该平台预编译库）；构建步骤必须 `shell: bash`（Windows runner 默认 pwsh）；Windows 产物路径含 `target/<triple>/`。
-- 发版：`./tools/release.sh <x.y.z>`（本地预检 cargo check → 改版本号 → 提交推送双远端 → 打 tag 触发 CI），产物自动附加到 GitHub Release（免登录，`releases/latest` 永久地址）。执行后立即结束回复并标注"CI 后台构建中"，不轮询；若构建成功但 Release 缺产物，让用户在 Actions run 页面点 Re-run failed jobs（仅重跑附加步骤约 1 分钟）。踩坑：matrix 内并发 softprops 附加同一 Release 会竞态失败（须独立 release job）；release job 无 checkout，gh 命令必须设 `GH_REPO`；APK artifact 解压带嵌套目录，需拍平后 `find dist -type f` 上传；删 tag 会把已发布 Release 转为 draft，release job 启动时自动清理同 tag draft。不要删 tag 重推来修 release 问题，除非同时改了构建代码。v0.3.2 已发布；v0.2.0 含新图标；v0.1.0 为旧图标版。
+## 双端同步
+Python（终端）与 Rust 口径**除修复模型外已对齐**：
 
-## 双端一致性回归测试
-`tools/compare_pipelines.py` 生成多场景合成图（小水印/828 大水印/贴边/400 小图/多位置），同一遮罩框分别跑终端 iopaint 与 clean-cli，量化对比修复区 MAD。改 `lama.rs`/`pipeline.rs` 推理链路后必须跑：
+| 能力 | Python | Rust/App |
+|---|---|---|
+| 模板笔画 mask（连续 α>0.03 + 1px 膨胀） | ✓ | ✓ |
+| 顶帽 gap-score + 阈值 20 | ✓ | ✓ |
+| 结果级验证（mask 外零改动，FAIL 拒绝落盘） | ✓ | ✓（`--force` 强制） |
+| 豆包 stamp 逆解（默认开） | ✓ | ✓（`--no-inverse` 关） |
+| 残留自动重试（1 轮，默认开） | ✓ | ✓（`--no-retry` 关） |
+| 框选/检测框内笔画精分割（`--refine`，实验性） | ✓ | ✓（`--refine`；App 默认勾选；残留自动退化整框，见下） |
+| `--any-position` / DBNet | ✓ | ✓（macOS v0.5.4） |
+| 水印档案库（α/C + 逆解 + NCC ±35%） | ✓ | ✓（macOS） |
+| 修复模型 | 默认 MAT | LaMa ONNX |
 
-```bash
-cd desktop/src-tauri && cargo build --release --bin clean-cli
-.img-inpaint-venv/bin/python tools/compare_pipelines.py
-```
+**唯一残余差异**：修复模型（MAT vs LaMa ONNX）——两者都是生成式路线，复杂纹理（花墙/花丛）MAT 更稳；`scale≈1.0 + 邻域纹理复杂` 的图会被 stamp 逆解接管，此时模型差异不重要。
 
-无缩放场景阈值 MAD<8（双端同为原分辨率推理应高度一致），缩放场景 <25（App 侧 resize 策略差异，视觉等价）；未处理区 PSNR>100dB。历史结论：ONNX 与 JIT 模型逐像素一致（输入 0..1/输出 0..255/mask 二值不敏感），差异只可能出在工程链路。**compare_pipelines.py 必须用 `--model lama` 对齐双端**（Python 端默认 MAT，MAT 与 LaMa 是不同模型，不指定会 MAD 翻倍误报 FAIL）。
+**框选精分割（`--refine` / App「框选区域精细处理」）**：框内顶帽局部对比 + 低饱和过滤 + 局部自适应阈值 + 行带约束 → 笔画级 mask（实测千问 7.png：12083px vs 整框 53592px，少重绘 4.4 倍）。关键设计：
+- 精分割**不写 `.tpl`**（写了会强制启用豆包模板残留检查，非豆包水印碰巧高分 → 假残留），只写 `{name}.refinebox`（记录了原始框）；
+- `verify_paths` 的 `template_applied` 支持 `None`＝自动判定（原图模板分 ≥20 且 `min(w,h)/ref_short≈1.0`）才查模板残留——千问图 scale=1.1 自动跳过，豆包图 scale=1.0 生效；
+- 精分割留残留时 `residual_retry` **退化用 `.refinebox` 整框**重跑（豆包 1/6.png 实测：精分割残留 → 整框 → PASS、tmpl→0.0），保证「必然去除」，代价只是这一次多一次 inpaint。
+- **与 Python 的有意分歧**：Python 的精分割也写 `.tpl`（会在非豆包图误报残留）；Rust 已改为只写 `.refinebox`。故"双端同步"此格仅指能力对齐，不是逐字节行为一致。精分割本身逐像素一致：`python tools/refine_parity_dump.py` + `cargo test --lib -- --ignored refine_box_mask_matches_python`（IoU=1.0000）。
+
+**"App 影响周边元素"根因（v0.5.5 已修）**：旧 Rust 模板 mask 用「二值核(α>0.5) + 19x11 膨胀」（19/11 本是 Python `REFINE_DILATE_LAMA` 给退化框精分割用的），靠大膨胀补抗锯齿 → 比 Python 的「连续 α>0.03 + 1px」多盖约 38% 干净画面被模型重绘；且无顶帽 + 阈值 40 使亮背景（纸面/花墙/雪/沙滩）分数跌破阈值 → 回退整框 mask（面积再涨 3~5 倍）。修复后 Rust mask 与 Python **逐像素一致**（实测 IoU=1.0000，dist/1、3、6）。
+
+**验证基线（v0.5.5）**：dist/1、3、6 双端 `mask 10172px`、`outside changed 0`；6.png 双端 stamp 逆解同取 `gain 1.05`（水印区 MAD 0.46、P95=2，此前 1.85/P95=16）；1、3.png 双端均按门控跳过逆解。`cargo test --lib` 19+4 passed；`compare_pipelines.py` 5/5 PASS。
+
+一致性回归：`tools/compare_pipelines.py` 生成多场景合成图（小水印/828 大水印/贴边/400 小图/多位置），同遮罩框分别跑终端 iopaint 与 clean-cli，对比修复区 MAD。改 `lama.rs`/`pipeline.rs` 推理链路后必跑，**必须加 `--model lama`**（Python 默认 MAT，模型不同会误报 FAIL）。阈值：无缩放 MAD<8、缩放 <25；未处理区 PSNR>100dB。

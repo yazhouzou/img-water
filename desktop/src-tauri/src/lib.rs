@@ -2,8 +2,10 @@ pub mod android_uri;
 pub mod app;
 pub mod dbnet;
 pub mod fetch;
+pub mod i18n;
 pub mod lama;
 pub mod pipeline;
+pub mod watermark_profiles;
 
 pub use app::run_tauri_app;
 

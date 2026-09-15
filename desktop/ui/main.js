@@ -18,6 +18,7 @@ const els = {
   fileCount: document.getElementById('file-count'),
   keepWork: document.getElementById('keep-work'),
   anyPosition: document.getElementById('any-position'),
+  refine: document.getElementById('refine'),
   log: document.getElementById('log'),
   reviewCandidate: document.getElementById('review-candidate'),
   reviewFinal: document.getElementById('review-final'),
@@ -42,6 +43,7 @@ const els = {
   runProgressBar: document.getElementById('run-progress-bar'),
   runProgressText: document.getElementById('run-progress-text'),
   outputRow: document.getElementById('output-row'),
+  outputHint: document.getElementById('output-hint'),
   disclaimerOverlay: document.getElementById('disclaimer-overlay'),
   btnDisclaimerOk: document.getElementById('btn-disclaimer-ok'),
   setupHint: document.getElementById('setup-hint'),
@@ -58,6 +60,7 @@ let targetRoot = null;
 let running = false;
 let taskKind = null;
 let lastRunCount = 0;
+let lastModelPath = null;
 let manualMask = null; // 相对右下角偏移 { dx1, dy1, dx2, dy2 }
 const mobileParam = new URLSearchParams(location.search).get('mobile');
 const isMobile =
@@ -91,6 +94,11 @@ function overwriteMode() {
   return checked && checked.value === 'overwrite';
 }
 
+function renderOutputHint() {
+  els.outputHint.innerHTML = overwriteMode() ? t('outputHintOverwrite') : t('outputHintSave');
+  els.outputHint.classList.toggle('warn', overwriteMode());
+}
+
 const STAGE_LABEL = () => ({ prepare: t('stagePrepare'), inpaint: t('stageInpaint'), save: t('stageSave') });
 
 function setRunProgress(stage, done, total, name) {
@@ -98,7 +106,7 @@ function setRunProgress(stage, done, total, name) {
   els.runProgressBar.style.width = pct + '%';
   const labels = STAGE_LABEL();
   const stageText = labels[stage] || stage;
-  els.runProgressText.textContent = `${stageText} ${done}/${total}：${name}`;
+  els.runProgressText.textContent = t('progressLine')(stageText, done, total, name);
 }
 
 function logLine(text) {
@@ -107,18 +115,18 @@ function logLine(text) {
 }
 
 function showReview(container, path) {
-  invoke('read_image_base64', { path })
+  invoke('read_image_base64', { path, lang: window.i18n.lang })
     .then((dataUrl) => {
       container.innerHTML = '';
       const img = document.createElement('img');
       img.src = dataUrl;
-      img.title = '点击查看大图';
+      img.title = t('viewLarge');
       img.addEventListener('click', () => openLightbox(dataUrl));
       container.appendChild(img);
       container.classList.add('has-image');
     })
     .catch((err) => {
-      container.innerHTML = `<div class="placeholder">预览失败：${escapeHtml(String(err))}</div>`;
+      container.innerHTML = `<div class="placeholder">${escapeHtml(t('previewFailed')(String(err)))}</div>`;
     });
 }
 
@@ -145,8 +153,8 @@ function escapeHtml(text) {
 async function setupCompare(sourcePath, finalPath) {
   try {
     const [sourceUrl, finalUrl] = await Promise.all([
-      invoke('read_image_base64', { path: sourcePath }),
-      invoke('read_image_base64', { path: finalPath }),
+      invoke('read_image_base64', { path: sourcePath, lang: window.i18n.lang }),
+      invoke('read_image_base64', { path: finalPath, lang: window.i18n.lang }),
     ]);
     els.compareSource.src = sourceUrl;
     els.compareFinal.src = finalUrl;
@@ -166,35 +174,40 @@ function setComparePos(pct) {
 async function refreshEnv() {
   try {
     const status = await invoke('env_status');
-    els.envBadge.textContent = status.ready ? '修复环境就绪' : '修复环境未就绪';
+    // Keep data-i18n in sync so a later applyI18n() (e.g. language toggle)
+    // preserves the real state instead of resetting to "检查环境中…".
+    els.envBadge.dataset.i18n = status.ready ? 'envReady' : 'envNotReady';
+    els.envBadge.textContent = t(status.ready ? 'envReady' : 'envNotReady');
     els.envBadge.className = 'badge ' + (status.ready ? 'ok' : 'bad');
     els.envBadge.hidden = isMobile && status.ready;
     els.setupHint.hidden = status.ready;
     els.btnSetup.hidden = status.ready;
     els.btnSetupInline.hidden = status.ready;
     if (!status.ready) {
-      els.setupHintPath.textContent = '保存位置：' + status.model_path;
+      lastModelPath = status.model_path;
+      els.setupHintPath.textContent = t('modelSavePath')(status.model_path);
       els.setupHintWifi.hidden = !isMobile;
-      logLine('[环境] ' + status.hint);
+      logLine(t('logEnv')(status.hint));
     }
     return status.ready;
   } catch (err) {
-    els.envBadge.textContent = '环境检查失败';
+    els.envBadge.dataset.i18n = 'envFailed';
+    els.envBadge.textContent = t('envFailed');
     els.envBadge.className = 'badge bad';
     els.envBadge.hidden = false;
-    logLine('[环境] ' + String(err));
+    logLine(t('logEnv')(String(err)));
     return false;
   }
 }
 
 async function refreshFiles() {
   if (!targetRoot) return;
-  els.folderPath.textContent = targetRoot;
+  renderFolderPath();
   try {
-    const names = await invoke('list_pngs', { root: targetRoot });
+    const names = await invoke('list_pngs', { root: targetRoot, lang: window.i18n.lang });
     renderFiles(names);
   } catch (err) {
-    els.fileList.innerHTML = `<div class="placeholder">读取失败：${escapeHtml(String(err))}</div>`;
+    els.fileList.innerHTML = `<div class="placeholder">${escapeHtml(t('readFailed')(String(err)))}</div>`;
   }
 }
 
@@ -203,29 +216,33 @@ const PICK_ICON =
   '<rect x="6" y="10" width="36" height="28" rx="4"/><circle cx="17" cy="20" r="3.5"/>' +
   '<path d="M6 33l10-9 7 6 8-8 11 11"/></svg>';
 
-function renderEmptyState(message) {
+let lastEmptyKey = null;
+
+function renderEmptyState(messageKey) {
+  lastEmptyKey = messageKey || (isMobile ? 'emptyMobile' : 'emptyDesktop');
+  const title = t(lastEmptyKey);
   if (isMobile) {
     els.fileList.innerHTML =
       '<div class="empty-state">' +
       '<div class="empty-icon">' + PICK_ICON + '</div>' +
-      '<p class="empty-title">' + (message || '还没有选择图片') + '</p>' +
-      '<p class="empty-sub">支持批量选择 PNG，自动去除右下角“豆包AI生成”水印</p>' +
-      '<button class="btn primary" data-action="pick" type="button">选择图片</button>' +
+      '<p class="empty-title">' + title + '</p>' +
+      '<p class="empty-sub">' + t('emptyMobileSub') + '</p>' +
+      '<button class="btn primary" data-action="pick" type="button">' + t('pickPhotos') + '</button>' +
       '</div>';
   } else {
-    els.fileList.innerHTML = '<div class="placeholder">' + (message || '先选择图片或文件夹') + '</div>';
+    els.fileList.innerHTML = '<div class="placeholder">' + title + '</div>';
   }
 }
 
 function renderFiles(names) {
   els.fileList.innerHTML = '';
   setState(names.length > 0 ? 'picked' : 'empty');
-  els.fileCount.textContent = `${names.length} 张`;
+  els.fileCount.textContent = t('fileCount')(names.length);
   els.btnSelectAll.disabled = names.length === 0;
   els.btnSelectNone.disabled = names.length === 0;
   els.btnRun.disabled = running || names.length === 0;
   if (names.length === 0) {
-    renderEmptyState(isMobile ? '没有找到 PNG 图片' : '该文件夹没有 PNG 图片');
+    renderEmptyState(isMobile ? 'emptyNoPngMobile' : 'emptyNoPngDesktop');
     updateRunButton();
     return;
   }
@@ -261,6 +278,28 @@ function updateRunButton() {
 function clearMaskSelection() {
   manualMask = null;
   updateMaskUi();
+}
+
+function setPickLabel() {
+  els.btnPick.textContent = isMobile ? t('pickPhotos') : t('pickFolder');
+}
+
+function renderFolderPath() {
+  els.folderPath.textContent = targetRoot || t('noFolder');
+}
+
+// Re-apply text owned by JS (elements without static data-i18n), so a language
+// switch never clobbers dynamic state back to a default label.
+function applyDynamicLabels() {
+  setPickLabel();
+  renderFolderPath();
+  setMaskButtons();
+  renderOutputHint();
+  els.fileCount.textContent = t('fileCount')(els.fileList.querySelectorAll('input[type=checkbox]').length);
+  if (lastModelPath) els.setupHintPath.textContent = t('modelSavePath')(lastModelPath);
+  updateRunButton();
+  if (document.body.classList.contains('state-empty')) renderEmptyState(lastEmptyKey);
+  if (lastExitPayload) renderExitBanner(lastExitPayload);
 }
 
 function updateMaskUi() {
@@ -305,9 +344,13 @@ function renderMaskRect() {
 function setMaskButtons() {
   els.btnMaskOk.disabled = !maskSel;
   els.btnMaskReset.disabled = !maskSel;
-  els.maskHint.textContent = maskSel
-    ? `已框选 ${Math.round(Math.abs(maskSel.x2 - maskSel.x1))}×${Math.round(Math.abs(maskSel.y2 - maskSel.y1))} 像素，确认或重画`
-    : '按住鼠标拖出一个矩形，覆盖住水印文字即可';
+  if (maskSel) {
+    const w = Math.round(Math.abs(maskSel.x2 - maskSel.x1));
+    const h = Math.round(Math.abs(maskSel.y2 - maskSel.y1));
+    els.maskHint.textContent = t('maskHintSelected')(w, h);
+  } else {
+    els.maskHint.textContent = t('maskHint');
+  }
 }
 
 async function openMaskEditor() {
@@ -320,10 +363,10 @@ async function openMaskEditor() {
   els.maskImg.src = '';
   els.maskOverlay.hidden = false;
   try {
-    els.maskImg.src = await invoke('read_image_base64', { path });
+    els.maskImg.src = await invoke('read_image_base64', { path, lang: window.i18n.lang });
   } catch (err) {
     els.maskOverlay.hidden = true;
-    logLine('[框选失败] ' + String(err));
+    logLine(t('logMaskFailed')(String(err)));
   }
 }
 
@@ -348,15 +391,15 @@ function confirmMaskSelection() {
 
 function resetReviews() {
   els.resultBanner.hidden = true;
-  els.reviewCandidate.innerHTML = '<div class="placeholder"><span class="spinner"></span>正在处理，请稍候…</div>';
-  els.reviewFinal.innerHTML = '<div class="placeholder"><span class="spinner"></span>正在处理，请稍候…</div>';
+  els.reviewCandidate.innerHTML = `<div class="placeholder"><span class="spinner"></span>${t('processingHint')}</div>`;
+  els.reviewFinal.innerHTML = `<div class="placeholder"><span class="spinner"></span>${t('processingHint')}</div>`;
 }
 
 // 选新文件夹/导入后清空旧预览，不显示"正在处理"
 function clearReviews() {
   els.resultBanner.hidden = true;
-  els.reviewCandidate.innerHTML = '<div class="placeholder">开始处理后，这里显示修复前预览</div>';
-  els.reviewFinal.innerHTML = '<div class="placeholder">开始处理后，这里显示修复后预览</div>';
+  els.reviewCandidate.innerHTML = `<div class="placeholder">${t('placeholderBefore')}</div>`;
+  els.reviewFinal.innerHTML = `<div class="placeholder">${t('placeholderAfter')}</div>`;
 }
 
 function setModelProgress(done, total) {
@@ -373,13 +416,49 @@ function startModelDownload(auto) {
   if (running) return;
   setRunning(true);
   taskKind = 'model';
-  logLine(auto ? '[模型] 未检测到修复模型，开始自动下载（约 200MB，多连接加速）…' : '[模型] 开始下载修复模型…');
-  invoke('setup_model').catch((err) => {
-    logLine('[错误] ' + String(err));
+  logLine(auto ? t('logModelAuto') : t('logModelStart'));
+  invoke('setup_model', { lang: window.i18n.lang }).catch((err) => {
+    logLine(t('logError')(String(err)));
     taskKind = null;
     els.modelProgress.hidden = true;
     setRunning(false);
   });
+}
+
+let lastExitPayload = null;
+
+function renderExitBanner(payload) {
+  els.resultBanner.hidden = false;
+  els.resultBanner.className = 'result-banner ' + (payload.success ? 'ok' : 'err');
+  els.resultBanner.innerHTML = '';
+  if (payload.success) {
+    const dir = payload.outputDir || 'watermark-cleaned/';
+    const main = document.createElement('div');
+    main.className = 'banner-main';
+    const title = document.createElement('div');
+    title.className = 'banner-title';
+    title.textContent = `✓ ${t('doneBanner')} · ${t('fileCount')(lastRunCount)}`;
+    const sub = document.createElement('div');
+    sub.className = 'banner-sub';
+    sub.textContent = payload.overwritten ? t('doneSubOverwrite') : t('doneSubSave')(dir);
+    main.appendChild(title);
+    main.appendChild(sub);
+    els.resultBanner.appendChild(main);
+    if (!isMobile && payload.outputDir) {
+      const btn = document.createElement('button');
+      btn.className = 'btn small';
+      btn.type = 'button';
+      btn.textContent = t('openFolder');
+      btn.addEventListener('click', () => {
+        invoke('open_path', { path: payload.outputDir, lang: window.i18n.lang }).catch((err) => logLine(t('logError')(String(err))));
+      });
+      els.resultBanner.appendChild(btn);
+    }
+  } else if (payload.cancelled) {
+    els.resultBanner.textContent = t('cancelledBanner');
+  } else {
+    els.resultBanner.textContent = `${t('failedBanner')}：${payload.error || 'exit ' + payload.code}`;
+  }
 }
 
 function handleExit(payload) {
@@ -389,38 +468,17 @@ function handleExit(payload) {
   setRunning(false);
   if (kind === 'model') {
     if (payload.success) {
-      logLine('[模型] 修复模型下载完成，已就绪');
+      logLine(t('logModelDone'));
     } else {
-      logLine('[模型] 下载失败：' + (payload.error || '') + '，可点击右上角按钮重试');
+      logLine(t('logModelFailed')(payload.error || ''));
     }
     refreshEnv();
     return;
   }
-  logLine(payload.success ? '[完成] 流水线执行成功' : `[失败] 退出码 ${payload.code}`);
+  logLine(payload.success ? t('logRunDone') : t('logRunFailed')(payload.code));
   if (!payload.success) els.logBox.open = true;
-  els.resultBanner.hidden = false;
-  els.resultBanner.className = 'result-banner ' + (payload.success ? 'ok' : 'err');
-  if (payload.success) {
-    const where = payload.overwritten ? t('doneOverwritten') : `${t('doneSavedTo')} ${payload.outputDir || 'watermark-cleaned/'}`;
-    els.resultBanner.innerHTML = '';
-    const text = document.createElement('span');
-    text.textContent = `${t('doneBanner')}，${lastRunCount} · ${where}`;
-    els.resultBanner.appendChild(text);
-    if (!isMobile && payload.outputDir) {
-      const btn = document.createElement('button');
-      btn.className = 'btn small';
-      btn.type = 'button';
-      btn.textContent = t('openFolder');
-      btn.addEventListener('click', () => {
-        invoke('open_path', { path: payload.outputDir }).catch((err) => logLine('[错误] ' + String(err)));
-      });
-      els.resultBanner.appendChild(btn);
-    }
-  } else if (payload.cancelled) {
-    els.resultBanner.textContent = t('cancelledBanner');
-  } else {
-    els.resultBanner.textContent = `${t('failedBanner')}：${payload.error || 'exit ' + payload.code}`;
-  }
+  lastExitPayload = payload;
+  renderExitBanner(payload);
   setState('done');
   const logText = els.log.textContent;
   const lastMatch = (re) => [...logText.matchAll(re)].pop();
@@ -460,7 +518,7 @@ async function init() {
   const applyLang = () => {
     btnLang.textContent = window.i18n.lang === 'zh' ? 'EN' : '中';
     window.i18n.applyI18n();
-    updateRunButton();
+    applyDynamicLabels();
   };
   applyLang();
   btnLang.addEventListener('click', () => {
@@ -505,7 +563,7 @@ async function init() {
   });
 
   if (isMobile) {
-    els.btnPick.textContent = '选择图片';
+    setPickLabel();
     els.keepWork.parentElement.style.display = 'none';
     document.body.classList.add('mobile');
   } else {
@@ -571,7 +629,7 @@ async function init() {
 
   async function importPaths(paths) {
     try {
-      const imported = await invoke('import_files', { paths });
+      const imported = await invoke('import_files', { paths, lang: window.i18n.lang });
       targetRoot = imported.dir;
       els.btnRefresh.disabled = false;
       els.btnCleanup.disabled = running;
@@ -589,8 +647,8 @@ async function init() {
     if (isMobile) {
       const picked = await open({
         multiple: true,
-        filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
-        title: '选择要处理的图片',
+        filters: [{ name: t('imageFilter'), extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+        title: t('pickPhotosTitle'),
       });
       if (!picked) return;
       const paths = Array.isArray(picked) ? picked : [picked];
@@ -598,7 +656,7 @@ async function init() {
       await importPaths(paths);
       return;
     }
-    const picked = await open({ directory: true, multiple: false, title: '选择包含图片的文件夹' });
+    const picked = await open({ directory: true, multiple: false, title: t('pickFolderTitle') });
     if (!picked) return;
     targetRoot = picked;
     els.btnRefresh.disabled = false;
@@ -637,6 +695,8 @@ async function init() {
     if (!running) startModelDownload(false);
   });
 
+  els.outputRow.addEventListener('change', renderOutputHint);
+
   els.btnRun.addEventListener('click', async () => {
     const files = selectedFiles();
     if (files.length === 0 || running) return;
@@ -660,12 +720,14 @@ async function init() {
         keepWork: els.keepWork.checked,
         overwriteOriginal: overwrite,
         anyPosition: els.anyPosition.checked,
+        refine: els.refine.checked,
+        lang: window.i18n.lang,
         maskBox: manualMask
           ? [manualMask.dx1, manualMask.dy1, manualMask.dx2, manualMask.dy2]
           : null,
       });
     } catch (err) {
-      logLine('[错误] ' + String(err));
+      logLine(t('logError')(String(err)));
       setRunning(false);
     }
   });
@@ -676,44 +738,19 @@ async function init() {
     try {
       await invoke('cancel_pipeline');
     } catch (err) {
-      logLine('[取消失败] ' + String(err));
+      logLine(t('logCancelFailed')(String(err)));
     } finally {
       els.btnCancel.disabled = false;
-    }
-  });
-
-  const btnCheckUpdate = document.getElementById('btn-check-update');
-  btnCheckUpdate.addEventListener('click', async () => {
-    btnCheckUpdate.disabled = true;
-    btnCheckUpdate.textContent = '检查中…';
-    try {
-      const [current, res] = await Promise.all([
-        invoke('app_version'),
-        fetch('https://api.github.com/repos/yazhouzou/img-water/releases/latest'),
-      ]);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const data = await res.json();
-      const latest = String(data.tag_name || '').replace(/^v/, '');
-      if (latest && latest !== current) {
-        await message(t('updateFound')(latest, current), { title: t('updateTitle') }).catch(() => {});
-      } else {
-        await message(t('updateNone')(current), { title: t('updateTitle') }).catch(() => {});
-      }
-    } catch (err) {
-      logLine(t('updateCheckFailed') + String(err));
-    } finally {
-      btnCheckUpdate.disabled = false;
-      btnCheckUpdate.textContent = '检查更新';
     }
   });
 
   els.btnCleanup.addEventListener('click', async () => {
     els.btnCleanup.disabled = true;
     try {
-      await invoke('cleanup_pipeline');
-      logLine('[清理] 已删除 original-watermark-backup 和临时复查产物');
+      await invoke('cleanup_pipeline', { lang: window.i18n.lang });
+      logLine(t('logCleanupDone'));
     } catch (err) {
-      logLine('[清理] ' + String(err));
+      logLine(t('logCleanupFailed')(String(err)));
     } finally {
       els.btnCleanup.disabled = running;
     }

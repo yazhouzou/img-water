@@ -1,0 +1,51 @@
+{
+ "id": "qwen",
+ "label": "qwen",
+ "ref_short_side": 1760.0,
+ "source": "pair: qwen-black.png + qwen-white.png box=[1269, 2223, 1711, 2319]",
+ "created": "2026-09-15 02:21:02",
+ "extra": {
+  "stroke_box": [
+   7,
+   7,
+   435,
+   89
+  ],
+  "learn_report": {
+   "reason": "ok",
+   "residual_black": 0.091,
+   "residual_white": 0.268,
+   "coverage": 0.3701,
+   "box": [
+    1269,
+    2223,
+    1711,
+    2319
+   ],
+   "bg_black": [
+    1,
+    1,
+    1
+   ],
+   "bg_white": [
+    255,
+    254,
+    255
+   ],
+   "shift": [
+    0.23,
+    -0.28
+   ]
+  },
+  "bg_median": [
+   1,
+   1,
+   1
+  ],
+  "place": {
+   "ref": 1760,
+   "right": 0.031818181818181815,
+   "bottom": 0.031818181818181815
+  }
+ }
+}

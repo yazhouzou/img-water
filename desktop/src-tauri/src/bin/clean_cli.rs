@@ -1,7 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::exit;
 
 use doubao_clean::pipeline::{self, MaskBox, PipelineOptions};
+use doubao_clean::watermark_profiles as wp;
 
 fn parse_box(value: &str) -> MaskBox {
     let parts: Vec<i64> = value.split(',').map(|p| p.trim().parse::<i64>().unwrap_or_else(|_| {
@@ -15,32 +16,73 @@ fn parse_box(value: &str) -> MaskBox {
     MaskBox { x1: parts[0], y1: parts[1], x2: parts[2], y2: parts[3] }
 }
 
+fn parse_triple(value: &str) -> [f32; 3] {
+    let parts: Vec<f32> = value.split(',').filter_map(|p| p.trim().parse().ok()).collect();
+    if parts.len() != 3 {
+        eprintln!("expected three comma-separated numbers (r,g,b): {value}");
+        exit(1);
+    }
+    [parts[0], parts[1], parts[2]]
+}
+
+fn opt_box(value: Option<MaskBox>) -> Option<(i64, i64, i64, i64)> {
+    value.map(|b| (b.x1, b.y1, b.x2, b.y2))
+}
+
 fn main() {
     let mut root: Option<String> = None;
     let mut mask_box: Option<MaskBox> = None;
+    let mut box_raw: Option<MaskBox> = None;
     let mut keep_work = false;
     let mut overwrite = false;
     let mut any_position = false;
+    let mut use_profile = true;
+    let mut force = false;
+    let mut no_inverse = false;
+    let mut no_retry = false;
+    let mut refine = false;
     let mut model: Option<String> = None;
     let mut command: Option<String> = None;
     let mut files: Vec<String> = Vec::new();
+    let mut label: Option<String> = None;
+    let mut ref_short: Option<f64> = None;
+    let mut bg = [0f32, 0f32, 0f32];
+    let mut color = [255f32, 255f32, 255f32];
 
     let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
+    while let Some(raw) = args.next() {
+        // 支持 `--opt value` 与 `--opt=value` 两种形式（后者与 argparse 对齐，
+        // 便于传负数 --mask-box=-120,-90,-10,-10）
+        let (arg, inline): (String, Option<String>) = match raw.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (raw.clone(), None),
+        };
+        let take = |args: &mut std::iter::Skip<std::env::Args>| inline.clone().or_else(|| args.next());
         match arg.as_str() {
-            "--root" => root = args.next(),
-            "--mask-box" => mask_box = Some(args.next().map(|v| parse_box(&v)).unwrap_or_else(|| {
+            "--root" => root = take(&mut args),
+            "--mask-box" => mask_box = Some(take(&mut args).map(|v| parse_box(&v)).unwrap_or_else(|| {
                 eprintln!("--mask-box needs a value");
                 exit(1);
             })),
+            "--box" => box_raw = Some(take(&mut args).map(|v| parse_box(&v)).unwrap_or_else(|| {
+                eprintln!("--box needs a value");
+                exit(1);
+            })),
+            "--label" => label = take(&mut args),
+            "--ref-short" => ref_short = take(&mut args).and_then(|v| v.parse().ok()),
+            "--bg" => bg = take(&mut args).map(|v| parse_triple(&v)).unwrap_or(bg),
+            "--color" => color = take(&mut args).map(|v| parse_triple(&v)).unwrap_or(color),
             "--keep-work" => keep_work = true,
             "--overwrite" | "--in-place" => overwrite = true,
             "--any-position" => any_position = true,
-            "--model" => model = args.next(),
+            "--no-profile" | "--no-profiles" => use_profile = false,
+            "--force" => force = true,
+            "--no-inverse" => no_inverse = true,
+            "--no-retry" => no_retry = true,
+            "--refine" => refine = true,
+            "--model" => model = take(&mut args),
             "-h" | "--help" => {
-                println!("usage: clean-cli [--root <dir>] [--mask-box x1,y1,x2,y2] [--any-position] [--keep-work] [--overwrite] [--model <onnx>] <run|prepare|inpaint|review-lama|overwrite-review|cleanup> [files...]");
-                println!("默认结果另存到 <root>/watermark-cleaned/；--overwrite 直接覆盖原图（自动备份 original-watermark-backup/）");
-                println!("--any-position: 处理任意位置的文字水印（OCR 检测），默认只处理贴右下角的豆包水印");
+                print_help();
                 return;
             }
             other => {
@@ -54,9 +96,14 @@ fn main() {
     }
 
     let command = command.unwrap_or_else(|| {
-        eprintln!("missing command; use run|prepare|inpaint|review-lama|overwrite-review|cleanup");
+        eprintln!("missing command; use run|prepare|inpaint|review-lama|overwrite-review|cleanup|profiles|match|learn-pair|learn-solid|learn-auto|learn-batch");
         exit(1);
     });
+
+    // 档案库子命令（不依赖 root/model）
+    if let Some(code) = run_profile_command(&command, &files, label.as_deref(), ref_short, box_raw, bg, color) {
+        exit(code);
+    }
 
     let root_path: PathBuf = root
         .map(PathBuf::from)
@@ -74,6 +121,11 @@ fn main() {
         mask_box,
         any_position,
         overwrite_original: overwrite,
+        use_profile,
+        force,
+        inverse: !no_inverse,
+        retry: !no_retry,
+        refine,
     };
 
     let log = |line: &str| println!("{}", line);
@@ -93,10 +145,10 @@ fn main() {
             let names = pipeline::target_names(&options.root, &options.files).unwrap_or_else(|e| exit_with(&e));
             pipeline::prepare(&options, &names, &log)
         }
-        "inpaint" => pipeline::inpaint(&model_path, &log, &no_progress, &not_cancelled),
+        "inpaint" => pipeline::inpaint(&model_path, !no_inverse, &log, &no_progress, &not_cancelled),
         "review-lama" => {
             let names = pipeline::target_names(&options.root, &options.files).unwrap_or_else(|e| exit_with(&e));
-            pipeline::review_lama(&names).map(|_| ())
+            pipeline::review_lama(&names, &root_path).map(|_| ())
         }
         "overwrite-review" => {
             let names = pipeline::target_names(&options.root, &options.files).unwrap_or_else(|e| exit_with(&e));
@@ -117,10 +169,215 @@ fn main() {
     }
 }
 
+/// 返回 Some(exit_code) 表示这是档案库子命令，已处理完毕。
+fn run_profile_command(
+    command: &str,
+    files: &[String],
+    label: Option<&str>,
+    ref_short: Option<f64>,
+    box_raw: Option<MaskBox>,
+    bg: [f32; 3],
+    color: [f32; 3],
+) -> Option<i32> {
+    match command {
+        "profiles" | "list-profiles" => {
+            let list = wp::list_profiles();
+            if list.is_empty() {
+                println!("no profiles in {}", wp::profiles_dir().display());
+            }
+            for p in list {
+                println!(
+                    "{}: label={:?} shape=({},{}) ref_short={} source={}",
+                    p.id, p.label, p.ah, p.aw, p.ref_short_side, p.source
+                );
+            }
+            Some(0)
+        }
+        "match" => {
+            let path = files.first().unwrap_or_else(|| {
+                eprintln!("match needs an image path");
+                exit(1);
+            });
+            match image::open(path) {
+                Ok(img) => match wp::match_image(&img) {
+                    Some((p, px, py, score, scale)) => {
+                        println!("matched {} at ({},{}) score {:.3} scale {:.3}", p.id, px, py, score, scale);
+                    }
+                    None => println!("no profile matched"),
+                },
+                Err(e) => {
+                    eprintln!("failed to open {path}: {e}");
+                    return Some(1);
+                }
+            }
+            Some(0)
+        }
+        "learn-pair" => {
+            if files.len() < 2 {
+                eprintln!("learn-pair needs <black.png> <white.png> [--label X]");
+                return Some(1);
+            }
+            let label = label.unwrap_or("learned");
+            let (profile, report) = match wp::extract_from_pair(
+                std::path::Path::new(&files[0]),
+                std::path::Path::new(&files[1]),
+                opt_box(box_raw),
+                ref_short,
+                label,
+                24,
+                6.0,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("pair learning failed: {e}");
+                    return Some(1);
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+            match profile {
+                None => {
+                    eprintln!("pair learning failed; not saving a profile");
+                    Some(1)
+                }
+                Some(p) => match wp::save_profile(&p, true) {
+                    Ok(base) => {
+                        println!("saved profile {} -> {}", p.id, base.display());
+                        Some(0)
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        Some(1)
+                    }
+                },
+            }
+        }
+        "learn-solid" => {
+            if files.is_empty() {
+                eprintln!("learn-solid needs <image> --label X [--bg r,g,b] [--color r,g,b]");
+                return Some(1);
+            }
+            let label = label.unwrap_or("learned");
+            match wp::extract_from_solid(
+                std::path::Path::new(&files[0]),
+                opt_box(box_raw),
+                bg,
+                color,
+                ref_short,
+                label,
+                24,
+            ) {
+                Ok(p) => match wp::save_profile(&p, true) {
+                    Ok(base) => {
+                        println!("saved profile {} -> {}", p.id, base.display());
+                        Some(0)
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        Some(1)
+                    }
+                },
+                Err(e) => {
+                    eprintln!("{e}");
+                    Some(1)
+                }
+            }
+        }
+        "learn-auto" => {
+            if files.is_empty() {
+                eprintln!("learn-auto needs <images...> --label X");
+                return Some(1);
+            }
+            let label = label.unwrap_or("learned");
+            let frames: Vec<(String, PathBuf, Option<(i64, i64, i64, i64)>)> = files
+                .iter()
+                .map(|f| {
+                    let path = PathBuf::from(f);
+                    let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    (name, path, opt_box(box_raw))
+                })
+                .collect();
+            match wp::auto_discover(&frames, label, color, ref_short, 24, 12.0, 0.01, 60.0) {
+                Ok((Some(p), report)) => {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                    match wp::save_profile(&p, true) {
+                        Ok(base) => {
+                            println!("saved profile {} -> {}", p.id, base.display());
+                            Some(0)
+                        }
+                        Err(e) => {
+                            eprintln!("{e}");
+                            Some(1)
+                        }
+                    }
+                }
+                Ok((None, report)) => {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                    eprintln!("auto learning failed; not saving a profile");
+                    Some(1)
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    Some(1)
+                }
+            }
+        }
+        "learn-batch" => {
+            if files.is_empty() {
+                eprintln!("learn-batch needs <images...> --label X");
+                return Some(1);
+            }
+            let label = label.unwrap_or("learned");
+            let paths: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+            match wp::learn_from_batch(&paths, opt_box(box_raw), ref_short, label, 24, 12.0) {
+                Ok((Some(p), report)) => {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                    match wp::save_profile(&p, true) {
+                        Ok(base) => {
+                            println!("saved profile {} -> {}", p.id, base.display());
+                            Some(0)
+                        }
+                        Err(e) => {
+                            eprintln!("{e}");
+                            Some(1)
+                        }
+                    }
+                }
+                Ok((None, report)) => {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                    eprintln!("batch learning failed; not saving a profile");
+                    Some(1)
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    Some(1)
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+fn print_help() {
+    println!("usage: clean-cli [--root <dir>] [--mask-box x1,y1,x2,y2] [--any-position] [--refine] [--no-profile] [--no-inverse] [--no-retry] [--force] [--keep-work] [--overwrite] [--model <onnx>] <command> [files...]");
+    println!("  run|prepare|inpaint|review-lama|overwrite-review|cleanup");
+    println!("默认结果另存到 <root>/watermark-cleaned/；--overwrite 直接覆盖原图（自动备份 original-watermark-backup/）");
+    println!("--any-position: 处理任意位置的文字水印（OCR 检测），默认只处理贴右下角的豆包水印");
+    println!("--no-profile: 跳过水印档案库（逐像素逆解），只用模板/检测 + 生成式修复");
+    println!("--no-inverse: 关闭豆包 stamp 逐像素逆解（默认开）");
+    println!("--no-retry: 关闭残留自动重试（默认开，最多 1 轮）");
+    println!("--refine: 实验性：手动框选时框内笔画精分割（只重绘笔画，失败退回整框）");
+    println!();
+    println!("水印档案库（逐像素逆解，去水印且不改周边元素）:");
+    println!("  profiles                                  列出已装档案（含内置）");
+    println!("  match <image>                             对图片匹配档案");
+    println!("  learn-pair <black.png> <white.png> --label <name> [--ref-short N] [--box x1,y1,x2,y2]");
+    println!("  learn-solid <image> --label <name> [--bg r,g,b] [--color r,g,b] [--ref-short N]");
+    println!("  learn-auto <images...> --label <name> [--color r,g,b] [--ref-short N]");
+    println!("  learn-batch <images...> --label <name> [--ref-short N]");
+    println!("档案目录：{}（可用 WATERMARK_PROFILES_DIR 覆盖）", wp::profiles_dir().display());
+}
+
 fn exit_with(message: &str) -> ! {
     eprintln!("{}", message);
     exit(1);
 }
-
-#[allow(dead_code)]
-fn _unused(_p: &Path) {}

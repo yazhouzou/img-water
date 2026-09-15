@@ -44,6 +44,9 @@ if _VENV_PY.exists() and Path(sys.prefix).resolve() != VENV.resolve():
 from PIL import Image  # noqa: E402
 
 DIST = ROOT / 'dist'
+# dist/ 现在混装两种工具的原图：1-6 是豆包，7-10 是千问。豆包模板正样本只对
+# 1-6 断言；千问图会偶然触发模板（7/8 高分）或低于阈值（9/10），都不是豆包语义。
+NON_DOUBAO_DIST = {'7.png', '8.png', '9.png', '10.png'}
 
 
 def md5(path):
@@ -85,7 +88,7 @@ def build_cases(rdw, swt):
     cases = []
     # A. 真实豆包正样本（dist 带水印原图）：应命中模板
     for path in sorted(DIST.glob('*.png')):
-        if 'backup' in path.parts:
+        if 'backup' in path.parts or path.name in NON_DOUBAO_DIST:
             continue
         cases.append({'group': 'doubao', 'name': f'dist/{path.name}', 'path': path,
                       'layer': 1, 'expect': 'hit'})
@@ -155,6 +158,71 @@ def run_layer1(rdw, swt, cases, only):
             hit = iou > 0.3
             detail = f'max IoU {iou:.2f}'
         rows.append((c, hit == (c['expect'] == 'hit'), detail))
+    return rows
+
+
+def run_auto_profile_checks(rdw, swt, only):
+    """自动挑帧建档案（learn-auto）：同款水印×多背景，应自动选中对比度最高+最均匀
+    的黑底帧，且用其 α 逆解其它背景时能把水印误差压到接近 0。"""
+    import numpy as np
+    import cv2
+    from shutil import rmtree
+    rows = []
+    if only and 'autoprofile' not in only:
+        return rows
+    wprof = getattr(rdw, 'wprof', None)
+    if wprof is None:
+        return rows
+    tmp = Path(tempfile.mkdtemp(prefix='wm-autoprof-'))
+    old_dir = wprof.PROFILE_DIR
+    wprof.PROFILE_DIR = tmp / 'profiles'
+    try:
+        w, h = 1600, 900
+        clean = {}
+        for kind in ['black', 'gradient', 'whitebg', 'photo:2']:
+            clean[kind] = swt.make_background(kind, w, h)
+            img, _ = swt.stamp_text(clean[kind], 'translucent', 'bottomright', 0.5)
+            img.save(tmp / f'{kind.replace(":", "_")}.png')
+        names = sorted(p.name for p in tmp.glob('*.png'))
+        rdw.learn_auto(names, tmp, 'synthauto')
+        prof = wprof.load_profile('synthauto')
+        base = {'group': 'autoprofile', 'expect': 'ok'}
+        bg = prof.extra.get('learn_report', {}).get('bg_median', [255, 255, 255])
+        rows.append(({**base, 'name': 'picks dark/uniform frame'},
+                     max(bg) < 80, f'bg_median={bg}'))
+
+        gray_obs = np.array(Image.open(tmp / 'gradient.png').convert('RGB')).astype(np.float32)
+        truth = np.array(clean['gradient']).astype(np.float32)
+        gray = gray_obs.max(2)
+        kk = max(3, min(31, (min(h, w) - 1) | 1))
+        top = gray - cv2.morphologyEx(gray.astype(np.uint8), cv2.MORPH_OPEN,
+                                      cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kk, kk))).astype(np.float32)
+        top = (top - top.mean()) / (top.std() + 1e-6)
+        best = None
+        for sc in np.arange(0.97, 1.04, 0.005):
+            a = wprof.scaled_layers(prof, sc)[0]
+            th, tw = a.shape
+            t = (a - a.mean()).astype(np.float32)
+            t /= (t.std() + 1e-6)
+            r = cv2.matchTemplate(top, t, cv2.TM_CCOEFF_NORMED)
+            _, mx, _, loc = cv2.minMaxLoc(r)
+            if best is None or mx > best[0]:
+                best = (mx, sc, int(loc[0]), int(loc[1]))
+        mx, sc, px, py = best
+        a = wprof.scaled_layers(prof, sc)[0]
+        th, tw = a.shape
+        win = gray_obs[py:py + th, px:px + tw]
+        ref = truth[py:py + th, px:px + tw]
+        inv = np.clip((win - (a * 255.0)[..., None]) / np.maximum(1 - a[..., None], 1e-3), 0, 255)
+        m = a > 0.05
+        err_inv = float(np.abs(inv - ref).mean(2)[m].mean())
+        err_obs = float(np.abs(win - ref).mean(2)[m].mean())
+        rows.append(({**base, 'name': 'inverse generalizes (gradient)'},
+                     err_inv < 5.0 and err_inv < err_obs * 0.4,
+                     f'err {err_obs:.1f}->{err_inv:.1f} NCC {mx:.2f}'))
+        rmtree(tmp, ignore_errors=True)
+    finally:
+        wprof.PROFILE_DIR = old_dir
     return rows
 
 
@@ -234,7 +302,7 @@ def e2e_cases(rdw, swt):
     合成泛化场景的检测能力已在 L1 覆盖，不重复进模型。"""
     cases = []
     for path in sorted(DIST.glob('*.png')):
-        if 'backup' in path.parts:
+        if 'backup' in path.parts or path.name in NON_DOUBAO_DIST:
             continue
         cases.append({'name': path.name, 'img': Image.open(path).convert('RGB'), 'real': None})
     return cases
@@ -305,6 +373,7 @@ def main():
     cases = build_cases(rdw, swt)
     rows = run_layer1(rdw, swt, cases, args.only)
     rows += run_verify_checks(rdw, args.only)
+    rows += run_auto_profile_checks(rdw, swt, args.only)
 
     print(f'{"layer":5s} {"case":40s} {"expect":6s} {"mark":5s} detail')
     fails = 0

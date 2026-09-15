@@ -2,6 +2,10 @@
 !desktop/src-tauri/icons/**/*.png
 !desktop/icon-source.png
 !tools/doubao-wm-template.png
+!tools/doubao-wm-alpha.png
+!tools/doubao-wm-stamp-alpha.png
+!tools/doubao-wm-stamp-color.png
+!tools/watermarks/**/*.png
 .img-inpaint-venv/
 original-watermark-backup/
 __pycache__/

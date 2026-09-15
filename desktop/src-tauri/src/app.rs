@@ -12,6 +12,8 @@ const EVENT_EXIT: &str = "pipeline-exit";
 const EVENT_MODEL_PROGRESS: &str = "model-progress";
 const EVENT_PROGRESS: &str = "pipeline-progress";
 
+use crate::i18n::{load as lang_of, tr};
+
 #[derive(Default)]
 struct AppStorage {
     target_root: std::sync::Mutex<Option<PathBuf>>,
@@ -44,15 +46,16 @@ fn env_status() -> EnvStatus {
         hint: if ready {
             String::new()
         } else {
-            "修复模型未下载：点击“一键下载修复模型”在线获取（约 200MB，无需 Python）".into()
+            "Inpainting model not downloaded yet: click \"Download Model\" to fetch it online (~200MB, no Python required)".to_string()
         },
     }
 }
 
 #[tauri::command]
-fn setup_model(app: AppHandle, storage: State<'_, AppStorage>) -> Result<(), String> {
+fn setup_model(app: AppHandle, storage: State<'_, AppStorage>, lang: Option<String>) -> Result<(), String> {
+    let lang = lang_of(lang);
     if storage.running.swap(true, Ordering::SeqCst) {
-        return Err("已有任务在运行中，请等待完成".into());
+        return Err(tr(&lang, "已有任务在运行中，请等待完成", "A task is already running, please wait"));
     }
     let dest = crate::model_path();
     if dest.exists() {
@@ -68,7 +71,7 @@ fn setup_model(app: AppHandle, storage: State<'_, AppStorage>) -> Result<(), Str
         let log = |line: &str| {
             let _ = app_handle.emit(EVENT_LOG, line);
         };
-        log(&format!("[模型] 开始下载（{} 个下载源，多连接分段）", urls.len()));
+        log(&format!("[Model] Downloading ({} sources, multi-connection)", urls.len()));
         let app_progress = app_handle.clone();
         // 每 10% 记一条日志，避免刷屏
         let last_milestone = std::sync::atomic::AtomicU64::new(0);
@@ -85,7 +88,7 @@ fn setup_model(app: AppHandle, storage: State<'_, AppStorage>) -> Result<(), Str
                     let _ = app_progress.emit(
                         EVENT_LOG,
                         format!(
-                            "[模型] {:.1} / {:.1} MB ({}%)",
+                            "[Model] {:.1} / {:.1} MB ({}%)",
                             done as f64 / 1048576.0,
                             total as f64 / 1048576.0,
                             percent
@@ -96,14 +99,14 @@ fn setup_model(app: AppHandle, storage: State<'_, AppStorage>) -> Result<(), Str
         });
         match result {
             Ok(()) => {
-                log(&format!("[模型] 下载完成: {}", dest.display()));
+                log(&format!("[Model] Download complete: {}", dest.display()));
                 finish(
                     &app_handle,
                     serde_json::json!({ "code": 0, "success": true }),
                 );
             }
             Err(err) => {
-                log(&format!("[模型] 下载失败: {}", err));
+                log(&format!("[Model] Download failed: {}", err));
                 finish(
                     &app_handle,
                     serde_json::json!({ "code": -1, "success": false, "error": err }),
@@ -115,10 +118,11 @@ fn setup_model(app: AppHandle, storage: State<'_, AppStorage>) -> Result<(), Str
 }
 
 #[tauri::command]
-fn list_pngs(root: String) -> Result<Vec<String>, String> {
+fn list_pngs(root: String, lang: Option<String>) -> Result<Vec<String>, String> {
+    let lang = lang_of(lang);
     let dir = PathBuf::from(&root);
     if !dir.is_dir() {
-        return Err(format!("文件夹不存在: {}", root));
+        return Err(tr(&lang, &format!("文件夹不存在: {}", root), &format!("Folder not found: {}", root)));
     }
     let mut names: Vec<String> = std::fs::read_dir(&dir)
         .map_err(|e| e.to_string())?
@@ -161,14 +165,21 @@ fn run_pipeline(
     overwrite_original: bool,
     mask_box: Option<Vec<i64>>,
     any_position: Option<bool>,
+    refine: Option<bool>,
+    lang: Option<String>,
 ) -> Result<(), String> {
+    let lang = lang_of(lang);
     if storage.running.swap(true, Ordering::SeqCst) {
-        return Err("已有任务在运行中，请等待完成".into());
+        return Err(tr(&lang, "已有任务在运行中，请等待完成", "A task is already running, please wait"));
     }
     let model_path = crate::model_path();
     if !model_path.exists() {
         storage.running.store(false, Ordering::SeqCst);
-        return Err("修复模型未下载，请先点击“一键下载修复模型”".into());
+        return Err(tr(
+            &lang,
+            "修复模型未下载，请先点击“一键下载修复模型”",
+            "Inpainting model not downloaded yet; click \"Download Model\" first",
+        ));
     }
     storage.cancel.store(false, Ordering::SeqCst);
 
@@ -199,6 +210,11 @@ fn run_pipeline(
             mask_box: mask,
             any_position: any_position.unwrap_or(false),
             overwrite_original,
+            use_profile: true,
+            force: false,
+            inverse: true,
+            retry: true,
+            refine: refine.unwrap_or(true),
         };
         let log = |line: &str| {
             let _ = app_handle.emit(EVENT_LOG, line);
@@ -240,18 +256,32 @@ fn run_pipeline(
                 );
             }
             Err(err) if err == pipeline::CANCELLED => {
-                let _ = app_handle.emit(EVENT_LOG, "[取消] 任务已取消，已处理的图片保持有效");
+                let _ = app_handle.emit(EVENT_LOG, "[Cancel] Task cancelled; already-processed images remain valid");
                 finish(
                     &app_handle,
                     serde_json::json!({ "code": 2, "success": false, "cancelled": true }),
                 );
             }
             Err(err) => {
-                let _ = app_handle.emit(EVENT_LOG, format!("[错误] {}", err));
-                finish(
-                    &app_handle,
-                    serde_json::json!({ "code": -1, "success": false, "error": err }),
-                );
+                // 结果级验证 FAIL：落盘被拒（保护原图，避免"影响周边元素"的坏结果写出）
+                if err.contains("verification FAILED") {
+                    let msg = tr(
+                        &lang,
+                        "去水印结果未通过自检（水印外像素被改动或仍有残留），已拒绝写入以免损坏图片。请查看候选复查图后重试。",
+                        "The result failed self-check (pixels outside the watermark changed or residue remains); writing was refused to avoid damaging the image. Review the candidate image and try again.",
+                    );
+                    let _ = app_handle.emit(EVENT_LOG, format!("[Error] {}", msg));
+                    finish(
+                        &app_handle,
+                        serde_json::json!({ "code": -1, "success": false, "error": msg }),
+                    );
+                } else {
+                    let _ = app_handle.emit(EVENT_LOG, format!("[Error] {}", err));
+                    finish(
+                        &app_handle,
+                        serde_json::json!({ "code": -1, "success": false, "error": err }),
+                    );
+                }
             }
         }
     });
@@ -264,14 +294,10 @@ fn cancel_pipeline(storage: State<'_, AppStorage>) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn app_version() -> String {
-    env!("CARGO_PKG_VERSION").to_string()
-}
-
 /// 用系统文件管理器打开目录（结果文件夹）。
 #[tauri::command]
-fn open_path(path: String) -> Result<(), String> {
+fn open_path(path: String, lang: Option<String>) -> Result<(), String> {
+    let lang = lang_of(lang);
     #[cfg(target_os = "macos")]
     let program = "open";
     #[cfg(target_os = "windows")]
@@ -281,29 +307,35 @@ fn open_path(path: String) -> Result<(), String> {
     std::process::Command::new(program)
         .arg(&path)
         .spawn()
-        .map_err(|e| format!("打开失败: {}", e))?;
+        .map_err(|e| tr(&lang, &format!("打开失败: {}", e), &format!("Failed to open: {}", e)))?;
     Ok(())
 }
 
 #[tauri::command]
-fn cleanup_pipeline(storage: State<'_, AppStorage>) -> Result<(), String> {
+fn cleanup_pipeline(storage: State<'_, AppStorage>, lang: Option<String>) -> Result<(), String> {
+    let lang = lang_of(lang);
     let root: PathBuf = storage
         .target_root
         .lock()
         .map_err(|e| e.to_string())?
         .clone()
-        .ok_or("还没有处理记录")?;
+        .ok_or_else(|| tr(&lang, "还没有处理记录", "No processing record yet"))?;
     let files: Vec<String> = storage.last_files.lock().map_err(|e| e.to_string())?.clone();
     if files.is_empty() {
-        return Err("没有可清理的记录".into());
+        return Err(tr(&lang, "没有可清理的记录", "Nothing to clean up"));
     }
     let options = pipeline::PipelineOptions {
         root,
         files,
         keep_work: false,
         mask_box: None,
-            any_position: false,
+        any_position: false,
         overwrite_original: true,
+        use_profile: true,
+        force: false,
+        inverse: true,
+        retry: true,
+        refine: false,
     };
     let names = pipeline::target_names(&options.root, &options.files)?;
     pipeline::cleanup(&options, &names)?;
@@ -311,7 +343,8 @@ fn cleanup_pipeline(storage: State<'_, AppStorage>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn import_files(app: AppHandle, window: tauri::WebviewWindow, paths: Vec<String>) -> Result<ImportResult, String> {
+fn import_files(app: AppHandle, window: tauri::WebviewWindow, paths: Vec<String>, lang: Option<String>) -> Result<ImportResult, String> {
+    let lang = lang_of(lang);
     let base = app
         .path()
         .app_data_dir()
@@ -325,11 +358,11 @@ fn import_files(app: AppHandle, window: tauri::WebviewWindow, paths: Vec<String>
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let mut names: Vec<String> = Vec::new();
     for (index, raw) in paths.iter().enumerate() {
-        let name = copy_one(&window, raw, &dir, index, &names)?;
+        let name = copy_one(&window, raw, &dir, index, &names, &lang)?;
         names.push(name);
     }
     if names.is_empty() {
-        return Err("未选择图片".into());
+        return Err(tr(&lang, "未选择图片", "No images selected"));
     }
     Ok(ImportResult { dir: dir.display().to_string(), names })
 }
@@ -341,6 +374,7 @@ fn copy_one(
     dir: &std::path::Path,
     index: usize,
     existing: &[String],
+    lang: &str,
 ) -> Result<String, String> {
     #[cfg(target_os = "android")]
     if raw.starts_with("content://") {
@@ -348,7 +382,7 @@ fn copy_one(
     }
     let source = PathBuf::from(raw);
     if !source.is_file() {
-        return Err(format!("文件不存在: {}", raw));
+        return Err(tr(lang, &format!("文件不存在: {}", raw), &format!("File not found: {}", raw)));
     }
     let mut name = source
         .file_name()
@@ -367,7 +401,13 @@ fn copy_one(
         }
         final_name
     };
-    std::fs::copy(&source, dir.join(&final_name)).map_err(|e| format!("拷贝 {} 失败: {}", final_name, e))?;
+    std::fs::copy(&source, dir.join(&final_name)).map_err(|e| {
+        tr(
+            lang,
+            &format!("拷贝 {} 失败: {}", final_name, e),
+            &format!("Failed to copy {}: {}", final_name, e),
+        )
+    })?;
     Ok(final_name)
 }
 
@@ -378,21 +418,22 @@ struct ImportResult {
 }
 
 #[tauri::command]
-fn read_image_base64(path: String) -> Result<String, String> {
+fn read_image_base64(path: String, lang: Option<String>) -> Result<String, String> {
+    let lang = lang_of(lang);
     let file = PathBuf::from(&path);
     if !file.is_file() {
-        return Err(format!("文件不存在: {}", path));
+        return Err(tr(&lang, &format!("文件不存在: {}", path), &format!("File not found: {}", path)));
     }
     if file
         .file_name()
         .map(|name| !pipeline::is_supported_image(&name.to_string_lossy()))
         .unwrap_or(true)
     {
-        return Err("只支持预览 png/jpg/webp 图片".into());
+        return Err(tr(&lang, "只支持预览 png/jpg/webp 图片", "Only png/jpg/webp images can be previewed"));
     }
     let bytes = std::fs::read(&file).map_err(|e| e.to_string())?;
     if bytes.len() > 10 * 1024 * 1024 {
-        return Err("图片过大，无法预览".into());
+        return Err(tr(&lang, "图片过大，无法预览", "Image too large to preview"));
     }
     let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     Ok(format!("data:image/png;base64,{}", encoded))
@@ -426,7 +467,6 @@ pub fn run_tauri_app() {
             run_pipeline,
             cancel_pipeline,
             open_path,
-            app_version,
             cleanup_pipeline,
             read_image_base64
         ])

@@ -11,7 +11,7 @@
     <div class="brand">
       <span class="logo">去</span>
       <div>
-        <h1>图片水印清理助手</h1>
+        <h1 data-i18n="appName"></h1>
         <p class="subtitle" data-i18n="subtitle"></p>
       </div>
     </div>
@@ -23,8 +23,7 @@
         <span id="model-progress-text" class="model-progress-text"></span>
       </div>
       <button id="btn-setup" class="btn primary small" hidden data-i18n="setupModel"></button>
-      <button id="btn-check-update" class="btn small ghost" data-i18n="checkUpdate"></button>
-      <button id="btn-theme" class="btn small ghost" title="切换深浅色">🌙</button>
+      <button id="btn-theme" class="btn small ghost" data-i18n-title="themeToggle">🌙</button>
       <button id="btn-lang" class="btn small ghost">EN</button>
       <div id="env-badge" class="badge" data-i18n="envChecking"></div>
     </div>
@@ -35,11 +34,11 @@
       <div class="panel-head">
         <h2 data-i18n="filesTitle"></h2>
         <div class="actions">
-          <button id="btn-pick" class="btn" data-i18n="pickFolder"></button>
+          <button id="btn-pick" class="btn">选择文件夹</button>
           <button id="btn-refresh" class="btn ghost" disabled data-i18n="refresh"></button>
         </div>
       </div>
-      <div id="folder-path" class="folder-path" data-i18n="noFolder"></div>
+      <div id="folder-path" class="folder-path">未选择文件夹</div>
       <div id="setup-hint" class="setup-hint" hidden>
         <p data-i18n="setupHintTitle"></p>
         <ul>
@@ -60,24 +59,34 @@
       <div class="run-area">
         <div class="mask-row">
           <button id="btn-mask" class="btn small" disabled data-i18n="pickMask"></button>
-          <span id="mask-status" class="muted" data-i18n="maskAuto"></span>
+          <span id="mask-status" class="muted">未框选，自动检测水印</span>
           <button id="btn-mask-clear" class="btn small ghost" hidden data-i18n="maskClear"></button>
         </div>
         <div class="output-row" id="output-row">
           <span class="output-label" data-i18n="outputLabel"></span>
-          <label class="radio"><input type="radio" name="output-mode" value="save" checked /><span data-i18n="outputSave"></span></label>
-          <label class="radio"><input type="radio" name="output-mode" value="overwrite" /><span data-i18n="outputOverwrite"></span></label>
+          <div class="radio-group">
+            <label class="radio"><input type="radio" name="output-mode" value="save" checked /><span data-i18n="outputSave"></span></label>
+            <label class="radio"><input type="radio" name="output-mode" value="overwrite" /><span data-i18n="outputOverwrite"></span></label>
+          </div>
         </div>
-        <label class="checkbox">
-          <input type="checkbox" id="keep-work" />
-          <span data-i18n="keepWork"></span>
-        </label>
-        <label class="checkbox">
-          <input type="checkbox" id="any-position" />
-          <span data-i18n="anyPosition"></span>
-        </label>
+        <div id="output-hint" class="output-hint"></div>
+        <details class="advanced-options">
+          <summary data-i18n="advanced"></summary>
+          <label class="checkbox">
+            <input type="checkbox" id="keep-work" />
+            <span data-i18n="keepWork"></span>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="any-position" />
+            <span data-i18n="anyPosition"></span>
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" id="refine" checked />
+            <span data-i18n="refine"></span>
+          </label>
+        </details>
         <div class="run-buttons">
-          <button id="btn-run" class="btn primary" disabled data-i18n="run"></button>
+          <button id="btn-run" class="btn primary" disabled>开始处理</button>
           <button id="btn-cancel" class="btn danger" hidden data-i18n="cancel"></button>
           <button id="btn-cleanup" class="btn danger ghost" disabled data-i18n="cleanup"></button>
         </div>
@@ -147,7 +156,7 @@
         <div id="mask-rect" class="mask-rect" hidden></div>
       </div>
       <div class="mask-foot">
-        <span id="mask-hint" class="muted" data-i18n="maskHint"></span>
+        <span id="mask-hint" class="muted">按住鼠标拖出一个矩形，覆盖住水印文字即可</span>
         <div>
           <button id="btn-mask-reset" class="btn small ghost" type="button" disabled data-i18n="maskReset"></button>
           <button id="btn-mask-ok" class="btn primary small" type="button" disabled data-i18n="maskOk"></button>
