@@ -39,7 +39,33 @@ pub const NCC_FINE_STEP: f64 = 0.0125;
 pub const NCC_MIN_SCORE: f64 = 0.5;
 /// 用户显式指定档案（精确模式）时的放宽阈值。
 pub const FORCED_MIN_SCORE: f64 = 0.35;
+/// 学习档案用顶帽 gap-score 定位时的最小分数（单位是顶帽亮度差，不是 NCC 的 0..1）。
+/// 实测：含该水印 17.8~45.5，不含水印的图 1.1~7.3 —— 取 12 两侧都有充足裕度。
+pub const PROFILE_GAP_MIN_SCORE: f64 = 12.0;
+/// 定位模板把档案 α 二值化的阈值（与内置豆包模板 `TEMPLATE_ALPHA_THRESHOLD` 同口径）。
+const LEARN_TEMPLATE_BIN: f32 = 0.15;
 const NCC_PYRAMID: usize = 4;
+/// 跨样本中位数顶帽的笔画判据（0..255）。水印是各图共性结构，取中位数可压掉各图
+/// 背景的高频伪结构；阈值偏低是有意的——漏检会在 α 上留下缺口、逆解不干净，而
+/// 误检只扩大框内重绘面积（回归门限与 clean_alpha 会再收敛）。可用环境变量微调。
+const LEARN_BATCH_TOPHAT_MIN: f32 = 2.0;
+/// 逆解 α 的最低保留值：低于此值的像素不参与求 C、不计残差、逆解时当纯背景。
+/// 豆包水印实测 α≈0.53，0.15 能覆盖抗锯齿边与淡笔画。
+const LEARN_CORE_ALPHA: f32 = 0.15;
+
+fn learn_batch_tophat_min() -> f32 {
+    std::env::var("LEARN_BATCH_TOPHAT_MIN")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(LEARN_BATCH_TOPHAT_MIN)
+}
+
+fn learn_core_alpha() -> f32 {
+    std::env::var("LEARN_CORE_ALPHA")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(LEARN_CORE_ALPHA)
+}
 
 const ALPHA_FILENAME: &str = "alpha.png";
 const COLOR_FILENAME: &str = "color.png";
@@ -1156,7 +1182,9 @@ pub fn learn_from_batch(
     let (x1, y1, x2, y2) = resolve_box(box_, w, h);
     let (rw, rh) = (x2 - x1, y2 - y1);
     let k = (rh / 3).clamp(15, 31) | 1;
-    let mut mask = vec![false; rw * rh];
+    // 逐样本顶帽 → 跨样本取中位数：水印是各图共性结构，各图背景高频互不相关，
+    // 中位数保留水印结构、抑制背景伪结构（实测同召回下精确率 0.55→0.81、IoU 0.42→0.57）。
+    let mut hf_stack: Vec<Vec<f32>> = Vec::with_capacity(obs_list.len());
     for obs in &obs_list {
         let mut lum = vec![0f32; rw * rh];
         for y in 0..rh {
@@ -1166,10 +1194,28 @@ pub fn learn_from_batch(
             }
         }
         let bgm = median_blur_gray(&lum, rw, rh, k);
-        for i in 0..rw * rh {
-            if lum[i] - bgm[i] > 12.0 {
-                mask[i] = true;
-            }
+        hf_stack.push((0..rw * rh).map(|i| lum[i] - bgm[i]).collect());
+    }
+    let n_samples = hf_stack.len();
+    let mut med_hf = vec![0f32; rw * rh];
+    let mut buf: Vec<f32> = Vec::with_capacity(n_samples);
+    for i in 0..rw * rh {
+        buf.clear();
+        for s in &hf_stack {
+            buf.push(s[i]);
+        }
+        buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        med_hf[i] = if n_samples % 2 == 1 {
+            buf[n_samples / 2]
+        } else {
+            0.5 * (buf[n_samples / 2 - 1] + buf[n_samples / 2])
+        };
+    }
+    let tophat_min = learn_batch_tophat_min();
+    let mut mask = vec![false; rw * rh];
+    for i in 0..rw * rh {
+        if med_hf[i] > tophat_min {
+            mask[i] = true;
         }
     }
     // dilate 3x3
@@ -1208,6 +1254,7 @@ pub fn learn_from_batch(
         obs_box.push(win);
     }
     let n = obs_list.len();
+    let core_alpha = learn_core_alpha();
     let mut alpha = vec![0f32; rw * rh];
     let mut mb = vec![0f32; rw * rh];
     let mut mo = vec![0f32; rw * rh];
@@ -1233,18 +1280,18 @@ pub fn learn_from_batch(
         var /= n as f32;
         cov /= n as f32;
         let a = (1.0 - cov / var.max(1e-3)).clamp(0.0, 1.0);
-        if var > 4.0 && dil[i] && a > 0.3 {
+        if var > 4.0 && dil[i] && a > core_alpha {
             alpha[i] = a;
         }
     }
-    let core_count = alpha.iter().filter(|&&a| a > 0.35).count();
+    let core_count = alpha.iter().filter(|&&a| a > core_alpha).count();
     if core_count < 50 {
         return Ok((None, serde_json::json!({"reason": "not enough separable watermark coverage across batch"})));
     }
     let mut color = vec![0f32; rw * rh * 3];
     for c in 0..3 {
         for i in 0..rw * rh {
-            if alpha[i] <= 0.35 {
+            if alpha[i] <= core_alpha {
                 continue;
             }
             let mut num = 0f32;
@@ -1258,7 +1305,7 @@ pub fn learn_from_batch(
     let mut cnt = 0f64;
     for j in 0..n {
         for i in 0..rw * rh {
-            if alpha[i] <= 0.35 {
+            if alpha[i] <= core_alpha {
                 continue;
             }
             for c in 0..3 {
@@ -1292,6 +1339,17 @@ pub fn learn_from_batch(
     let mut extra = Map::new();
     extra.insert("stroke_box".into(), serde_json::json!([x1 + sx0, y1 + sy0, x1 + sx0 + acw, y1 + sy0 + ach]));
     extra.insert("learn_report".into(), report.clone());
+    // 水印相对右下角的偏移（按短边归一），定位时据此锚定搜索窗：
+    // 只靠"贴右下角"假设会在水印离角有距离时（如千问距右/下各 ~0.032）搜错位置。
+    let short = w.min(h) as f64;
+    extra.insert(
+        "place".into(),
+        serde_json::json!({
+            "ref": short,
+            "right": (w - (x1 + sx0) - acw) as f64 / short,
+            "bottom": (h - (y1 + sy0) - ach) as f64 / short,
+        }),
+    );
     Ok((Some(Profile {
         id: slug(label),
         label: label.to_string(),
@@ -1489,19 +1547,16 @@ pub fn locate_ncc(
     profile: &Profile,
     any_position: bool,
 ) -> Option<(usize, usize, f64, f64)> {
-    locate_ncc_impl(gray, w, h, profile, any_position, false)
+    locate_ncc_impl(gray, w, h, profile, any_position)
 }
 
-/// `densify=true` 时用 `location_template`（稀疏 α 膨胀后）做定位模板：
-/// 仅用于**用户显式指定档案**（精确模式）与学习自检——自动路径保持真实 α，
-/// 避免影响到此为止都正常的稠密档案匹配。
+/// 自动路径的档案定位（NCC）。不用于精确模式/学习自检——那两处走 `locate_gap_impl`。
 pub fn locate_ncc_impl(
     gray: &[f32],
     w: usize,
     h: usize,
     profile: &Profile,
     any_position: bool,
-    densify: bool,
 ) -> Option<(usize, usize, f64, f64)> {
     let short = w.min(h) as f64;
     let base = short / profile.ref_short_side;
@@ -1571,11 +1626,7 @@ pub fn locate_ncc_impl(
         if ctw < 2 || cth < 2 || ctw >= coarse_cw || cth >= coarse_ch {
             continue;
         }
-        let mut t = if densify {
-            location_template(&profile.alpha, profile.aw, profile.ah, ctw, cth)
-        } else {
-            resize_f32(&profile.alpha, profile.aw, profile.ah, 1, ctw, cth)
-        };
+        let mut t = resize_f32(&profile.alpha, profile.aw, profile.ah, 1, ctw, cth);
         normalize_unit(&mut t);
         for (data, cw, ch2) in coarse.iter() {
             if let Some((s, cx, cy)) = cosine_scan(data, *cw, *ch2, &t, ctw, cth, 0, *cw - ctw, 0, *ch2 - cth) {
@@ -1603,11 +1654,7 @@ pub fn locate_ncc_impl(
         if tw >= rw || th >= rh {
             continue;
         }
-        let mut t = if densify {
-            location_template(&profile.alpha, profile.aw, profile.ah, tw, th)
-        } else {
-            resize_f32(&profile.alpha, profile.aw, profile.ah, 1, tw, th)
-        };
+        let mut t = resize_f32(&profile.alpha, profile.aw, profile.ah, 1, tw, th);
         normalize_unit(&mut t);
         let x_lo = bpx.saturating_sub(x0).saturating_sub(NCC_PYRAMID);
         let y_lo = bpy.saturating_sub(y0).saturating_sub(NCC_PYRAMID);
@@ -1626,58 +1673,83 @@ pub fn locate_ncc_impl(
     Some((px, py, score, sc))
 }
 
-/// 二值 3x3 膨胀（定位模板专用的轻量实现，不走形态学辅助函数）。
-fn dilate_bool_3x3(src: &[bool], w: usize, h: usize) -> Vec<bool> {
-    let mut out = src.to_vec();
+/// 档案定位（`match_specific` / `profile_self_check`）用**顶帽 gap-score**
+/// （笔画区均亮 − 间隙区均亮），而不是 NCC。
+///
+/// 为什么不用 NCC：水印在纹理背景上的相关性会被背景高频压垮——实测学习出的豆包 α
+/// 在 dist/3、6 上 NCC < 0.35 定位失败（dist/1 也仅 0.5），于是"定位不到 → 回落自动
+/// 识别"，精确模式与学习自检都形同虚设。gap-score 只比较"笔画处 vs 非笔画处"，背景
+/// 均值被差分抵消，对背景复杂度不敏感：同一档案在 dist/1/3/6 上都精确命中真值
+/// （45.5/17.8/43.8），在不含该水印的 dist/7/9/10 上只有 7.3/1.1/5.9。
+///
+/// 与内置豆包模板匹配（`pipeline::template_stroke_mask`）同口径：同顶帽半径、同
+/// "α 二值化成稀疏笔画点 + 笔画/间隙均亮差"的模板；差别是模板来自档案 α、搜索窗
+/// **锚定到档案的 `place`（水印相对右下角偏移）** 再 ±40px、并做 ±5% 尺度微扫。
+/// 锚点很关键：死守"贴右下角"的窄窗对离角水印（千问距右/下各 ~55px）不含真值，
+/// 只会在角上找到伪峰（实测偏 21px）。
+fn locate_gap_impl(gray: &[f32], w: usize, h: usize, profile: &Profile) -> Option<(usize, usize, f64, f64)> {
+    let short = w.min(h) as f64;
+    let base = short / profile.ref_short_side;
+    let r = (((short as usize) | 1).clamp(3, 31)) / 2;
+    let opened = open_morph(gray, w, h, r);
+    let top: Vec<f32> = (0..w * h).map(|i| gray[i] - opened[i]).collect();
+    // 前缀和求任意矩形和 O(1)（与内置模板匹配同一技巧）
+    let iw = w + 1;
+    let mut integral = vec![0f64; iw * (h + 1)];
     for y in 0..h {
+        let mut acc = 0f64;
         for x in 0..w {
-            if !src[y * w + x] {
-                continue;
-            }
-            for dy in -1isize..=1 {
-                for dx in -1isize..=1 {
-                    let (nx, ny) = (x as isize + dx, y as isize + dy);
-                    if nx < 0 || ny < 0 || nx >= w as isize || ny >= h as isize {
-                        continue;
-                    }
-                    out[ny as usize * w + nx as usize] = true;
+            acc += top[y * w + x] as f64;
+            integral[(y + 1) * iw + x + 1] = integral[y * iw + x + 1] + acc;
+        }
+    }
+    let rect_sum = |x1: usize, y1: usize, x2: usize, y2: usize| -> f64 {
+        integral[y2 * iw + x2] + integral[y1 * iw + x1] - integral[y1 * iw + x2] - integral[y2 * iw + x1]
+    };
+    let margin = 40usize;
+    let mut best: Option<(f64, usize, usize, f64)> = None;
+    for sc in [base * 0.95, base, base * 1.05] {
+        let tw = (profile.aw as f64 * sc).round() as usize;
+        let th = (profile.ah as f64 * sc).round() as usize;
+        if tw < 4 || th < 4 || tw >= w || th >= h {
+            continue;
+        }
+        let t = resize_f32(&profile.alpha, profile.aw, profile.ah, 1, tw, th);
+        let pts: Vec<(usize, usize)> = (0..tw * th)
+            .filter(|&i| t[i] > LEARN_TEMPLATE_BIN)
+            .map(|i| (i % tw, i / tw))
+            .collect();
+        let n_in = pts.len() as f64;
+        let n_out = (tw * th) as f64 - n_in;
+        if n_in < 8.0 || n_out <= 0.0 {
+            continue;
+        }
+        // 搜索窗锚定在档案记录的右下角偏移上（`place`），而不是死板的"贴右下角"：
+        // 豆包贴角（right=bottom=0）→ 窗就是右下角；千问距右/下各 ~0.032（55px）→ 窗
+        // 跟着移到水印处。否则窄窗根本不含真值，只会在角上找到伪峰。
+        let (ax, ay) = place_by_anchor(profile, w, h)
+            .map(|(px, py, _)| (px, py))
+            .unwrap_or((w - tw, h - th));
+        let (min_px, max_px) = (ax.saturating_sub(margin), (ax + margin).min(w - tw));
+        let (min_py, max_py) = (ay.saturating_sub(margin), (ay + margin).min(h - th));
+        if max_px < min_px || max_py < min_py {
+            continue;
+        }
+        for py in min_py..=max_py {
+            for px in min_px..=max_px {
+                let mut s_in = 0f64;
+                for &(dx, dy) in &pts {
+                    s_in += top[(py + dy) * w + px + dx] as f64;
+                }
+                let s_all = rect_sum(px, py, px + tw, py + th);
+                let gap = s_in / n_in - (s_all - s_in) / n_out;
+                if best.map(|b| gap > b.0).unwrap_or(true) {
+                    best = Some((gap, px, py, sc));
                 }
             }
         }
     }
-    out
-}
-
-/// 定位用模板（`locate_ncc` 专用）：
-/// 稀疏 α（笔画型，覆盖率 <20%）先二值化再逐级膨胀到约 25% 覆盖率——否则归一化后
-/// 被大量零像素主导，NCC 分数被压低（实测学习出的豆包 α 覆盖率 4%：0.29~0.49，
-/// 膨胀到 25% 后 0.60~0.68，可过 0.5 阈值）。稠密 α（千问 38%）保持原样——
-/// 对它膨胀反而降分（0.87 → 0.21）。
-fn location_template(alpha: &[f32], aw: usize, ah: usize, tw: usize, th: usize) -> Vec<f32> {
-    let mut base = resize_f32(alpha, aw, ah, 1, tw, th);
-    if tw == 0 || th == 0 {
-        return base;
-    }
-    let n = base.len() as f64;
-    let coverage = base.iter().filter(|&&v| v > 0.15).count() as f64 / n;
-    if coverage >= 0.20 {
-        return base;
-    }
-    let mut bin: Vec<bool> = base.iter().map(|&v| v > 0.15).collect();
-    if !bin.iter().any(|&b| b) {
-        return base;
-    }
-    for _ in 0..10 {
-        let cov = bin.iter().filter(|&&b| b).count() as f64 / n;
-        if cov >= 0.25 {
-            break;
-        }
-        bin = dilate_bool_3x3(&bin, tw, th);
-    }
-    for (i, &b) in bin.iter().enumerate() {
-        base[i] = if b { 255.0 } else { 0.0 };
-    }
-    base
+    best.map(|(gap, px, py, sc)| (px, py, gap, sc))
 }
 
 fn normalize_unit(v: &mut [f32]) {
@@ -2020,24 +2092,23 @@ fn gray_max_channel(img: &image::DynamicImage) -> (Vec<f32>, usize, usize) {
     (gray, w, h)
 }
 
-/// 用一个具体档案在图上定位（`densify=false`，自动路径用真实 α）。
+/// 用一个具体档案在图上定位（自动路径，NCC，真实 α）。
 pub fn locate_profile(
     img: &image::DynamicImage,
     profile: &Profile,
     any_position: bool,
 ) -> Option<(usize, usize, f64, f64)> {
     let (gray, w, h) = gray_max_channel(img);
-    locate_ncc_impl(&gray, w, h, profile, any_position, false)
+    locate_ncc_impl(&gray, w, h, profile, any_position)
 }
 
-/// 精确模式 / 学习自检用：稀疏 α 走膨胀定位模板，能定位学习的豆包式档案。
+/// 精确模式 / 学习自检用的定位（顶帽 gap-score，见 `locate_gap_impl`）。
 pub fn locate_profile_dense(
     img: &image::DynamicImage,
     profile: &Profile,
-    any_position: bool,
 ) -> Option<(usize, usize, f64, f64)> {
     let (gray, w, h) = gray_max_channel(img);
-    locate_ncc_impl(&gray, w, h, profile, any_position, true)
+    locate_gap_impl(&gray, w, h, profile)
 }
 
 /// 用户显式指定的档案：只用该档案定位（"精确模式"），阈值放宽到
@@ -2048,8 +2119,8 @@ pub fn match_specific(
     id: &str,
 ) -> Option<(Profile, usize, usize, f64, f64)> {
     let profile = load_profile(id).ok()?;
-    let (px, py, score, scale) = locate_profile_dense(img, &profile, false)?;
-    if score < FORCED_MIN_SCORE {
+    let (px, py, score, scale) = locate_profile_dense(img, &profile)?;
+    if score < PROFILE_GAP_MIN_SCORE {
         return None;
     }
     Some((profile, px, py, score, scale))
@@ -2124,8 +2195,8 @@ pub fn profile_self_check(
     for p in paths {
         let Ok(img) = image::open(p) else { continue };
         total += 1;
-        if let Some((_, _, score, _)) = locate_profile_dense(&img, profile, false) {
-            if score >= NCC_MIN_SCORE {
+        if let Some((_, _, score, _)) = locate_profile_dense(&img, profile) {
+            if score >= PROFILE_GAP_MIN_SCORE {
                 hit += 1;
                 score_sum += score;
             }
@@ -2280,5 +2351,113 @@ mod tests {
         assert!(report["residual_black"].as_f64().unwrap() < 1.0, "{report}");
         assert!(report["residual_white"].as_f64().unwrap() < 1.0, "{report}");
         println!("pair report: {report}");
+    }
+
+    /// Batch learning on the aligned doubao samples must recover the stamp shape from pixels
+    /// alone (`--ignored`); guards the median-across-samples stroke detector against regressions.
+    #[test]
+    #[ignore]
+    fn doubao_batch_learning_recovers_stamp() {
+        let root = crate::project_root();
+        let paths: Vec<std::path::PathBuf> = ["dist/1.png", "dist/2.png", "dist/3.png", "dist/6.png"]
+            .iter()
+            .map(|n| root.join(n))
+            .filter(|p| p.exists())
+            .collect();
+        if paths.len() < 3 {
+            return;
+        }
+        let (profile, report) =
+            learn_from_batch(&paths, None, None, "doubao-test", 24, 12.0).unwrap();
+        assert!(report["residual"].as_f64().unwrap() < 12.0, "{report}");
+        let profile = profile.unwrap_or_else(|| panic!("batch learning must succeed: {report}"));
+        println!("learn report: {report}");
+
+        let truth_path = root.join("tools/doubao-wm-stamp-alpha.png");
+        if !truth_path.exists() {
+            return;
+        }
+        let truth = image::open(&truth_path).unwrap().to_luma8();
+        let (tw, th) = truth.dimensions();
+        let (mut tx1, mut ty1, mut tx2, mut ty2) = (tw, th, 0u32, 0u32);
+        for (x, y, p) in truth.enumerate_pixels() {
+            if p.0[0] > 38 {
+                tx1 = tx1.min(x);
+                ty1 = ty1.min(y);
+                tx2 = tx2.max(x + 1);
+                ty2 = ty2.max(y + 1);
+            }
+        }
+        let (tox, toy) = (2541u32, 1490u32); // 真值 stamp 在 dist 图中的摆放位置
+        let sb = profile.extra["stroke_box"].as_array().expect("stroke_box");
+        let (sx, sy) = (sb[0].as_u64().unwrap() as u32, sb[1].as_u64().unwrap() as u32);
+
+        let (ox, oy, cw, ch) = (2400u32, 1430u32, 560u32, 250u32);
+        let mut ca = vec![false; (cw * ch) as usize];
+        for y in 0..profile.ah {
+            for x in 0..profile.aw {
+                if profile.alpha[y * profile.aw + x] > 8.0 / 255.0 {
+                    let (px, py) = (sx + x as u32, sy + y as u32);
+                    if px >= ox && py >= oy && px < ox + cw && py < oy + ch {
+                        ca[((py - oy) * cw + px - ox) as usize] = true;
+                    }
+                }
+            }
+        }
+        let mut ct = vec![false; (cw * ch) as usize];
+        for (x, y, p) in truth.enumerate_pixels() {
+            if p.0[0] > 38 {
+                let (px, py) = (tox + x, toy + y);
+                if px >= ox && py >= oy && px < ox + cw && py < oy + ch {
+                    ct[((py - oy) * cw + px - ox) as usize] = true;
+                }
+            }
+        }
+        let inter = (0..ca.len()).filter(|&i| ca[i] && ct[i]).count();
+        let union = (0..ca.len()).filter(|&i| ca[i] || ct[i]).count();
+        let recall = inter as f64 / (tx2 - tx1 + 1).max(1) as f64;
+        println!(
+            "learned {}x{} at ({sx},{sy}) vs truth ink {tox},{toy},{}x{} IoU={:.3}",
+            profile.aw,
+            profile.ah,
+            tx2 - tx1,
+            ty2 - ty1,
+            inter as f64 / union.max(1) as f64
+        );
+        assert!(
+            inter as f64 / union.max(1) as f64 >= 0.85,
+            "learned alpha IoU too low vs ground-truth stamp"
+        );
+        assert!(recall >= 0.6, "learned alpha misses too much of the stamp ink");
+    }
+
+    /// 精确模式 / 学习自检的定位器：顶帽 gap-score + 档案 `place` 锚点。`--ignored`.
+    /// 锚点很关键——千问水印距右/下各 ~0.032 短边（55px），死守"贴右下角"的窄窗
+    /// 根本不含真值，只会在角上找到伪峰（实测 (1297,2253) 差 21px）。
+    #[test]
+    #[ignore]
+    fn gap_locator_finds_qwen_place_anchor() {
+        let root = crate::project_root();
+        let profile = load_profile("qwen").unwrap();
+        for (name, want) in [
+            ("dist/7.png", (1276usize, 2230usize)),
+            ("dist/8.png", (906, 1567)),
+            ("dist/9.png", (1276, 2230)),
+            ("dist/10.png", (1276, 2230)),
+        ] {
+            let path = root.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let img = image::open(&path).unwrap();
+            let (px, py, score, _) = locate_profile_dense(&img, &profile)
+                .unwrap_or_else(|| panic!("{name}: qwen profile must locate via gap-score"));
+            assert!(score >= PROFILE_GAP_MIN_SCORE, "{name}: low gap score {score}");
+            assert!(
+                (px as isize - want.0 as isize).abs() <= 3 && (py as isize - want.1 as isize).abs() <= 3,
+                "{name}: pos ({px},{py}) far from {want:?}"
+            );
+            println!("{name}: gap score {score:.1} at ({px},{py})");
+        }
     }
 }
