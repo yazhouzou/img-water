@@ -765,6 +765,42 @@ body.mobile .log {
 .advanced-options > .checkbox { margin-top: 10px; }
 .advanced-options > .checkbox + .checkbox { margin-top: 6px; }
 
+/* 精确模式：水印档案选择 / 学习 */
+.precise-hint {
+  margin: 10px 0 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+.precise-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.precise-row select,
+.precise-row input[type="text"] {
+  flex: 1;
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel, transparent);
+  color: var(--text);
+  font-size: 12px;
+}
+.precise-row select:focus,
+.precise-row input[type="text"]:focus { outline: 1px solid var(--accent, #3b5bdb); }
+.precise-status {
+  margin-left: 0;
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+  word-break: break-word;
+}
+
 .run-buttons { display: flex; align-items: center; gap: 10px; }
 .run-progress {
   display: flex;

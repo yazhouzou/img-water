@@ -1489,6 +1489,20 @@ pub fn locate_ncc(
     profile: &Profile,
     any_position: bool,
 ) -> Option<(usize, usize, f64, f64)> {
+    locate_ncc_impl(gray, w, h, profile, any_position, false)
+}
+
+/// `densify=true` 时用 `location_template`（稀疏 α 膨胀后）做定位模板：
+/// 仅用于**用户显式指定档案**（精确模式）与学习自检——自动路径保持真实 α，
+/// 避免影响到此为止都正常的稠密档案匹配。
+pub fn locate_ncc_impl(
+    gray: &[f32],
+    w: usize,
+    h: usize,
+    profile: &Profile,
+    any_position: bool,
+    densify: bool,
+) -> Option<(usize, usize, f64, f64)> {
     let short = w.min(h) as f64;
     let base = short / profile.ref_short_side;
     let k = ((short as usize) | 1).clamp(3, 31);
@@ -1557,7 +1571,11 @@ pub fn locate_ncc(
         if ctw < 2 || cth < 2 || ctw >= coarse_cw || cth >= coarse_ch {
             continue;
         }
-        let mut t = resize_f32(&profile.alpha, profile.aw, profile.ah, 1, ctw, cth);
+        let mut t = if densify {
+            location_template(&profile.alpha, profile.aw, profile.ah, ctw, cth)
+        } else {
+            resize_f32(&profile.alpha, profile.aw, profile.ah, 1, ctw, cth)
+        };
         normalize_unit(&mut t);
         for (data, cw, ch2) in coarse.iter() {
             if let Some((s, cx, cy)) = cosine_scan(data, *cw, *ch2, &t, ctw, cth, 0, *cw - ctw, 0, *ch2 - cth) {
@@ -1585,7 +1603,11 @@ pub fn locate_ncc(
         if tw >= rw || th >= rh {
             continue;
         }
-        let mut t = resize_f32(&profile.alpha, profile.aw, profile.ah, 1, tw, th);
+        let mut t = if densify {
+            location_template(&profile.alpha, profile.aw, profile.ah, tw, th)
+        } else {
+            resize_f32(&profile.alpha, profile.aw, profile.ah, 1, tw, th)
+        };
         normalize_unit(&mut t);
         let x_lo = bpx.saturating_sub(x0).saturating_sub(NCC_PYRAMID);
         let y_lo = bpy.saturating_sub(y0).saturating_sub(NCC_PYRAMID);
@@ -1602,6 +1624,60 @@ pub fn locate_ncc(
         return None;
     }
     Some((px, py, score, sc))
+}
+
+/// 二值 3x3 膨胀（定位模板专用的轻量实现，不走形态学辅助函数）。
+fn dilate_bool_3x3(src: &[bool], w: usize, h: usize) -> Vec<bool> {
+    let mut out = src.to_vec();
+    for y in 0..h {
+        for x in 0..w {
+            if !src[y * w + x] {
+                continue;
+            }
+            for dy in -1isize..=1 {
+                for dx in -1isize..=1 {
+                    let (nx, ny) = (x as isize + dx, y as isize + dy);
+                    if nx < 0 || ny < 0 || nx >= w as isize || ny >= h as isize {
+                        continue;
+                    }
+                    out[ny as usize * w + nx as usize] = true;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 定位用模板（`locate_ncc` 专用）：
+/// 稀疏 α（笔画型，覆盖率 <20%）先二值化再逐级膨胀到约 25% 覆盖率——否则归一化后
+/// 被大量零像素主导，NCC 分数被压低（实测学习出的豆包 α 覆盖率 4%：0.29~0.49，
+/// 膨胀到 25% 后 0.60~0.68，可过 0.5 阈值）。稠密 α（千问 38%）保持原样——
+/// 对它膨胀反而降分（0.87 → 0.21）。
+fn location_template(alpha: &[f32], aw: usize, ah: usize, tw: usize, th: usize) -> Vec<f32> {
+    let mut base = resize_f32(alpha, aw, ah, 1, tw, th);
+    if tw == 0 || th == 0 {
+        return base;
+    }
+    let n = base.len() as f64;
+    let coverage = base.iter().filter(|&&v| v > 0.15).count() as f64 / n;
+    if coverage >= 0.20 {
+        return base;
+    }
+    let mut bin: Vec<bool> = base.iter().map(|&v| v > 0.15).collect();
+    if !bin.iter().any(|&b| b) {
+        return base;
+    }
+    for _ in 0..10 {
+        let cov = bin.iter().filter(|&&b| b).count() as f64 / n;
+        if cov >= 0.25 {
+            break;
+        }
+        bin = dilate_bool_3x3(&bin, tw, th);
+    }
+    for (i, &b) in bin.iter().enumerate() {
+        base[i] = if b { 255.0 } else { 0.0 };
+    }
+    base
 }
 
 fn normalize_unit(v: &mut [f32]) {
@@ -1944,15 +2020,24 @@ fn gray_max_channel(img: &image::DynamicImage) -> (Vec<f32>, usize, usize) {
     (gray, w, h)
 }
 
-/// 用一个具体档案在图上定位（无阈值），供 `match_image`/`match_specific`/
-/// 学习后自检复用。
+/// 用一个具体档案在图上定位（`densify=false`，自动路径用真实 α）。
 pub fn locate_profile(
     img: &image::DynamicImage,
     profile: &Profile,
     any_position: bool,
 ) -> Option<(usize, usize, f64, f64)> {
     let (gray, w, h) = gray_max_channel(img);
-    locate_ncc(&gray, w, h, profile, any_position)
+    locate_ncc_impl(&gray, w, h, profile, any_position, false)
+}
+
+/// 精确模式 / 学习自检用：稀疏 α 走膨胀定位模板，能定位学习的豆包式档案。
+pub fn locate_profile_dense(
+    img: &image::DynamicImage,
+    profile: &Profile,
+    any_position: bool,
+) -> Option<(usize, usize, f64, f64)> {
+    let (gray, w, h) = gray_max_channel(img);
+    locate_ncc_impl(&gray, w, h, profile, any_position, true)
 }
 
 /// 用户显式指定的档案：只用该档案定位（"精确模式"），阈值放宽到
@@ -1963,7 +2048,7 @@ pub fn match_specific(
     id: &str,
 ) -> Option<(Profile, usize, usize, f64, f64)> {
     let profile = load_profile(id).ok()?;
-    let (px, py, score, scale) = locate_profile(img, &profile, false)?;
+    let (px, py, score, scale) = locate_profile_dense(img, &profile, false)?;
     if score < FORCED_MIN_SCORE {
         return None;
     }
@@ -2039,7 +2124,7 @@ pub fn profile_self_check(
     for p in paths {
         let Ok(img) = image::open(p) else { continue };
         total += 1;
-        if let Some((_, _, score, _)) = locate_profile(&img, profile, false) {
+        if let Some((_, _, score, _)) = locate_profile_dense(&img, profile, false) {
             if score >= NCC_MIN_SCORE {
                 hit += 1;
                 score_sum += score;

@@ -19,6 +19,11 @@ const els = {
   keepWork: document.getElementById('keep-work'),
   anyPosition: document.getElementById('any-position'),
   refine: document.getElementById('refine'),
+  profileSelect: document.getElementById('profile-select'),
+  profileLabel: document.getElementById('profile-label'),
+  btnLearn: document.getElementById('btn-learn'),
+  btnProfileDelete: document.getElementById('btn-profile-delete'),
+  learnStatus: document.getElementById('learn-status'),
   log: document.getElementById('log'),
   reviewCandidate: document.getElementById('review-candidate'),
   reviewFinal: document.getElementById('review-final'),
@@ -62,6 +67,8 @@ let taskKind = null;
 let lastRunCount = 0;
 let lastModelPath = null;
 let manualMask = null; // 相对右下角偏移 { dx1, dy1, dx2, dy2 }
+let profiles = []; // 精确模式：可用水印档案
+let selectedProfileId = null; // null = 自动识别
 const mobileParam = new URLSearchParams(location.search).get('mobile');
 const isMobile =
   mobileParam === '1' ? true :
@@ -82,6 +89,8 @@ function setRunning(value) {
   els.btnCleanup.disabled = value || !targetRoot;
   els.btnSetup.disabled = value;
   els.btnMask.disabled = value || !targetRoot;
+  els.btnLearn.disabled = value;
+  els.btnProfileDelete.disabled = value;
   els.runProgress.hidden = !value;
   if (!value) {
     els.runProgressBar.style.width = '0%';
@@ -295,11 +304,77 @@ function applyDynamicLabels() {
   renderFolderPath();
   setMaskButtons();
   renderOutputHint();
+  renderProfileOptions();
+  els.profileLabel.placeholder = t('profileLabelPlaceholder');
   els.fileCount.textContent = t('fileCount')(els.fileList.querySelectorAll('input[type=checkbox]').length);
   if (lastModelPath) els.setupHintPath.textContent = t('modelSavePath')(lastModelPath);
   updateRunButton();
   if (document.body.classList.contains('state-empty')) renderEmptyState(lastEmptyKey);
   if (lastExitPayload) renderExitBanner(lastExitPayload);
+}
+
+// —— 精确模式：水印档案（学习/选择/删除）——
+function renderProfileOptions() {
+  const sel = els.profileSelect;
+  sel.innerHTML = '';
+  const auto = document.createElement('option');
+  auto.value = '';
+  auto.textContent = t('profileAuto');
+  sel.appendChild(auto);
+  for (const p of profiles) {
+    const opt = document.createElement('option');
+    opt.value = p.id;
+    opt.textContent = `${p.label || p.id}${p.builtin ? ` · ${t('profileBuiltin')}` : ''} (${p.width}×${p.height})`;
+    sel.appendChild(opt);
+  }
+  sel.value = profiles.some((p) => p.id === selectedProfileId) ? selectedProfileId : '';
+  selectedProfileId = sel.value || null;
+  renderProfileDelete();
+}
+
+function renderProfileDelete() {
+  const current = profiles.find((p) => p.id === selectedProfileId);
+  els.btnProfileDelete.hidden = !current || current.builtin;
+}
+
+async function refreshProfiles() {
+  try {
+    profiles = (await invoke('list_watermarks')) || [];
+  } catch (_) {
+    profiles = [];
+  }
+  renderProfileOptions();
+}
+
+async function learnProfile() {
+  const files = selectedFiles();
+  if (!targetRoot) {
+    els.learnStatus.textContent = t('learnNeedRoot');
+    return;
+  }
+  if (files.length < 2) {
+    els.learnStatus.textContent = t('learnNeedFiles');
+    return;
+  }
+  const paths = files.map((name) => `${targetRoot}/${name}`);
+  els.btnLearn.disabled = true;
+  els.learnStatus.textContent = t('learnRunning');
+  try {
+    const res = await invoke('learn_watermark', {
+      root: targetRoot,
+      files: paths,
+      label: els.profileLabel.value.trim(),
+      lang: window.i18n.lang,
+    });
+    await refreshProfiles();
+    selectedProfileId = res.id;
+    renderProfileOptions();
+    els.learnStatus.textContent = t('learnDone')(res.label || res.id, Number(res.mean_score || 0).toFixed(2));
+  } catch (err) {
+    els.learnStatus.textContent = String(err);
+  } finally {
+    els.btnLearn.disabled = running;
+  }
 }
 
 function updateMaskUi() {
@@ -494,6 +569,7 @@ function handleExit(payload) {
 
 async function init() {
   const ready = await refreshEnv();
+  await refreshProfiles();
 
   // 主题：默认跟随系统，手动切换后记忆
   const btnTheme = document.getElementById('btn-theme');
@@ -697,6 +773,34 @@ async function init() {
 
   els.outputRow.addEventListener('change', renderOutputHint);
 
+  els.profileSelect.addEventListener('change', () => {
+    selectedProfileId = els.profileSelect.value || null;
+    renderProfileDelete();
+    els.learnStatus.textContent = '';
+  });
+
+  els.btnLearn.addEventListener('click', () => {
+    if (!running) learnProfile();
+  });
+
+  els.btnProfileDelete.addEventListener('click', async () => {
+    const current = profiles.find((p) => p.id === selectedProfileId);
+    if (!current) return;
+    const ok = await confirm(t('profileDeleteConfirm')(current.label || current.id), {
+      title: t('profileDelete'),
+      kind: 'warning',
+    }).catch(() => false);
+    if (!ok) return;
+    try {
+      await invoke('delete_watermark', { id: current.id, lang: window.i18n.lang });
+      selectedProfileId = null;
+      await refreshProfiles();
+      els.learnStatus.textContent = '';
+    } catch (err) {
+      els.learnStatus.textContent = String(err);
+    }
+  });
+
   els.btnRun.addEventListener('click', async () => {
     const files = selectedFiles();
     if (files.length === 0 || running) return;
@@ -721,6 +825,7 @@ async function init() {
         overwriteOriginal: overwrite,
         anyPosition: els.anyPosition.checked,
         refine: els.refine.checked,
+        profileId: selectedProfileId,
         lang: window.i18n.lang,
         maskBox: manualMask
           ? [manualMask.dx1, manualMask.dy1, manualMask.dx2, manualMask.dy2]

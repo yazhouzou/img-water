@@ -85,6 +85,19 @@
             <span data-i18n="refine"></span>
           </label>
         </details>
+        <details class="advanced-options">
+          <summary data-i18n="preciseMode"></summary>
+          <p class="precise-hint" data-i18n="preciseHint"></p>
+          <div class="precise-row">
+            <select id="profile-select"></select>
+            <button id="btn-profile-delete" class="btn small ghost" type="button" hidden data-i18n="profileDelete"></button>
+          </div>
+          <div class="precise-row">
+            <input id="profile-label" type="text" autocomplete="off" />
+            <button id="btn-learn" class="btn small" type="button" data-i18n="profileLearn"></button>
+          </div>
+          <div id="learn-status" class="precise-status muted"></div>
+        </details>
         <div class="run-buttons">
           <button id="btn-run" class="btn primary" disabled>开始处理</button>
           <button id="btn-cancel" class="btn danger" hidden data-i18n="cancel"></button>

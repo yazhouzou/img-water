@@ -70,6 +70,23 @@
         return new Promise((resolve) =>
           setTimeout(() => resolve(svgDataUrl('复查图预览（mock）', '#3b5bdb')), 400)
         );
+      case 'list_watermarks':
+        return Promise.resolve([
+          { id: 'qwen', label: 'qwen', created: '', source: 'builtin', width: 82, height: 428, builtin: true },
+          { id: 'learned', label: 'learned', created: '', source: 'auto', width: 148, height: 223, builtin: false },
+        ]);
+      case 'learn_watermark':
+        return new Promise((resolve, reject) =>
+          setTimeout(() => {
+            if (args && args.files && args.files.length >= 2) {
+              resolve({ id: 'mock', label: args.label || 'learned', path: '/mock/profiles/mock', mean_score: 0.62 });
+            } else {
+              reject('mock: need >= 2 images');
+            }
+          }, 600)
+        );
+      case 'delete_watermark':
+        return Promise.resolve();
       case 'run_pipeline':
         fakeRun();
         return Promise.resolve();
