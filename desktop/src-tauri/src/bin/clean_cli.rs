@@ -41,6 +41,7 @@ fn main() {
     let mut no_inverse = false;
     let mut no_retry = false;
     let mut refine = false;
+    let mut profile: Option<String> = None;
     let mut model: Option<String> = None;
     let mut command: Option<String> = None;
     let mut files: Vec<String> = Vec::new();
@@ -80,6 +81,7 @@ fn main() {
             "--no-inverse" => no_inverse = true,
             "--no-retry" => no_retry = true,
             "--refine" => refine = true,
+            "--profile" => profile = take(&mut args),
             "--model" => model = take(&mut args),
             "-h" | "--help" => {
                 print_help();
@@ -126,6 +128,7 @@ fn main() {
         inverse: !no_inverse,
         retry: !no_retry,
         refine,
+        forced_profile: profile,
     };
 
     let log = |line: &str| println!("{}", line);
@@ -204,6 +207,26 @@ fn run_profile_command(
                         println!("matched {} at ({},{}) score {:.3} scale {:.3}", p.id, px, py, score, scale);
                     }
                     None => println!("no profile matched"),
+                },
+                Err(e) => {
+                    eprintln!("failed to open {path}: {e}");
+                    return Some(1);
+                }
+            }
+            Some(0)
+        }
+        "match-profile" => {
+            if files.len() < 2 {
+                eprintln!("match-profile needs <id> <image>");
+                return Some(1);
+            }
+            let (id, path) = (files[0].clone(), files[1].clone());
+            match image::open(&path) {
+                Ok(img) => match wp::match_specific(&img, &id) {
+                    Some((p, px, py, score, scale)) => {
+                        println!("matched {} at ({},{}) score {:.3} scale {:.3}", p.id, px, py, score, scale);
+                    }
+                    None => println!("profile {id} not located (score below {:.2})", wp::FORCED_MIN_SCORE),
                 },
                 Err(e) => {
                     eprintln!("failed to open {path}: {e}");
@@ -358,7 +381,7 @@ fn run_profile_command(
 }
 
 fn print_help() {
-    println!("usage: clean-cli [--root <dir>] [--mask-box x1,y1,x2,y2] [--any-position] [--refine] [--no-profile] [--no-inverse] [--no-retry] [--force] [--keep-work] [--overwrite] [--model <onnx>] <command> [files...]");
+    println!("usage: clean-cli [--root <dir>] [--mask-box x1,y1,x2,y2] [--any-position] [--refine] [--profile <id>] [--no-profile] [--no-inverse] [--no-retry] [--force] [--keep-work] [--overwrite] [--model <onnx>] <command> [files...]");
     println!("  run|prepare|inpaint|review-lama|overwrite-review|cleanup");
     println!("默认结果另存到 <root>/watermark-cleaned/；--overwrite 直接覆盖原图（自动备份 original-watermark-backup/）");
     println!("--any-position: 处理任意位置的文字水印（OCR 检测），默认只处理贴右下角的豆包水印");
@@ -366,6 +389,7 @@ fn print_help() {
     println!("--no-inverse: 关闭豆包 stamp 逐像素逆解（默认开）");
     println!("--no-retry: 关闭残留自动重试（默认开，最多 1 轮）");
     println!("--refine: 实验性：手动框选时框内笔画精分割（只重绘笔画，失败退回整框）");
+    println!("--profile <id>: 精确模式：只用指定水印档案定位（见 profiles 子命令）");
     println!();
     println!("水印档案库（逐像素逆解，去水印且不改周边元素）:");
     println!("  profiles                                  列出已装档案（含内置）");
@@ -373,6 +397,7 @@ fn print_help() {
     println!("  learn-pair <black.png> <white.png> --label <name> [--ref-short N] [--box x1,y1,x2,y2]");
     println!("  learn-solid <image> --label <name> [--bg r,g,b] [--color r,g,b] [--ref-short N]");
     println!("  learn-auto <images...> --label <name> [--color r,g,b] [--ref-short N]");
+    println!("  match-profile <id> <image>");
     println!("  learn-batch <images...> --label <name> [--ref-short N]");
     println!("档案目录：{}（可用 WATERMARK_PROFILES_DIR 覆盖）", wp::profiles_dir().display());
 }

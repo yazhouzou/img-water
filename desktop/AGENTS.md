@@ -20,7 +20,10 @@ Tauri 桌面应用，内置 Rust + ONNX Runtime 修复内核（v0.2 起，无需
 ## 水印档案库（Rust 侧）
 概念/建档案流程/阈值见 `docs/non-doubao-watermarks.md`；这里只记 Rust 侧差异与踩坑。
 - `watermark_profiles.rs`：α/C 档案读写、NCC ±35% 两级定位（`NCC_SCALE_SPAN`）、`inverse_image`、学习（pair/solid/batch/auto）。`pipeline.rs` 加 `use_profile`（默认 true）：prepare 匹配写 `.wprof`，inpaint 后 `apply_profile_inverse`。qwen 档案 `include_bytes!` 内嵌；目录 `WATERMARK_PROFILES_DIR` 可覆盖，默认 `project_root/tools/watermarks`。
-- CLI：`profiles`、`match <img>`、`learn-pair/learn-solid/learn-auto/learn-batch`（参数同 Python）、`--no-profile`。
+- CLI：`profiles`、`match <img>`、`match-profile <id> <img>`、`learn-pair/learn-solid/learn-auto/learn-batch`（参数同 Python）、`--no-profile`、`--profile <id>`。
+- **「精确模式」**：`--profile <id>`／App 选定档案 → `forced_profile` 只用该档案定位（`match_specific`，阈值 `FORCED_MIN_SCORE=0.35`），定位失败**回落自动识别**（不硬伤）。App 侧学习档案存应用数据目录（`PROFILES_DIR_OVERRIDE`），命令 `learn_watermark`/`list_watermarks`/`delete_watermark`。
+- **学习自检（必守）**：`learn_watermark` 学完先在**学习用的原图**上重新定位（`profile_self_check`），≥2/3 命中才落盘——学出来定位不到的档案存了也没用。
+- ⚠️ **已知局限（待办 A）**：`locate_ncc` 对**稀疏 α**（笔画占比 ~3%）定位失效——豆包真值 stamp α 自己也只有 <0.35 分（这正是豆包走 gap-score 而非 NCC 的原因）；因此 `learn-auto/learn-batch` 在风景图上产不出可定位档案（`learn-batch` 还会因 uniform-bg 假设残差过高直接拒学）。目前只有 `learn-pair`（黑底+白底）/`learn-solid` 这条路能产出可用档案。修法：把豆包 gap-score 泛化到任意档案 α。
 - **踩坑**：连通域筛选（`labels_areas`）必须跳过背景 label 0，否则 `areas[0] >= min_area` 把全图判成前景（`stroke_mask` 全屏 mask、`clean_alpha` 残留微 α 使裁剪不收缩）。
 - 自实现替代 imageproc：`CrossCorrelationNormalized` 是 CCORR 不减均值 → 自写 zero-mean NCC；形态学太慢 → 自写 O(n) 滑窗方形核（`rect_morph`/`slide_extreme`）。
 

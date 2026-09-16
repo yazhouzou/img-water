@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 
 pub static MODEL_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 pub static WORKDIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+pub static PROFILES_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn project_root() -> PathBuf {
     if !cfg!(debug_assertions) {

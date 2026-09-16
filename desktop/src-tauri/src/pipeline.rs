@@ -317,6 +317,9 @@ pub struct PipelineOptions {
     /// 局部自适应阈值 + 行带约束），只重绘笔画而非整框；失败自动退回整框
     /// （对应 CLI `--refine`，App 侧默认勾选）。
     pub refine: bool,
+    /// 「精确模式」：只用该 id 的水印档案定位（不做多档案择优），
+    /// 定位成功即逐像素解析逆解；`None` 为自动匹配全部档案。
+    pub forced_profile: Option<String>,
 }
 
 pub const SUPPORTED_EXTS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
@@ -1192,9 +1195,20 @@ pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Resu
                 // 档案库优先（对齐 Python）：命中即逐像素解析逆解，写 .wprof sidecar；
                 // 未命中回落到豆包模板/整框检测，原有行为不变。
                 if options.use_profile {
-                    if let Some((profile, px, py, score, scale)) =
-                        crate::watermark_profiles::match_image(&image)
-                    {
+                    let matched = match &options.forced_profile {
+                        Some(id) => {
+                            let hit = crate::watermark_profiles::match_specific(&image, id);
+                            if hit.is_none() {
+                                log(&format!(
+                                    "{}: forced profile {} not located (score below threshold), falling back to auto detect",
+                                    name, id
+                                ));
+                            }
+                            hit
+                        }
+                        None => crate::watermark_profiles::match_image(&image),
+                    };
+                    if let Some((profile, px, py, score, scale)) = matched {
                         if let Some(mask) = crate::watermark_profiles::mask_for(
                             &profile,
                             px,
@@ -2595,6 +2609,7 @@ mod tests {
             inverse: true,
             retry: true,
             refine: false,
+            forced_profile: None,
         };
         assert_eq!(output_dir(&options), root);
         let options = PipelineOptions { overwrite_original: false, ..options };
@@ -2632,7 +2647,7 @@ mod tests {
         let (x1, y1, _x2, _y2) = make_watermark_image(&root.join("b.png"), 1024, 1024, "AI");
         let _ = x1;
         let _ = y1;
-        let options = PipelineOptions { root: root.clone(), files: vec!["b.png".to_string()], keep_work: false, mask_box: None, any_position: false, overwrite_original: true, use_profile: true, force: false, inverse: true, retry: false, refine: false };
+        let options = PipelineOptions { root: root.clone(), files: vec!["b.png".to_string()], keep_work: false, mask_box: None, any_position: false, overwrite_original: true, use_profile: true, force: false, inverse: true, retry: false, refine: false, forced_profile: None };
         let names = target_names(&root, &options.files).unwrap();
         let noop_log: Logger = &|_| {};
         prepare(&options, &names, &noop_log).unwrap();
@@ -2701,6 +2716,7 @@ mod tests {
             inverse: true,
             retry: true,
             refine: false,
+            forced_profile: None,
         };
         let log = |_line: &str| {};
         let summary = run(&options, &model, &log, &|_, _, _, _| {}, &|| false).expect("pipeline run failed");

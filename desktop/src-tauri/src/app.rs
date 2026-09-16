@@ -155,6 +155,121 @@ fn list_pngs(root: String, lang: Option<String>) -> Result<Vec<String>, String> 
     Ok(names)
 }
 
+/// 「精确模式」：用同一款水印的多张图自举学习一个逐像素档案。
+///
+/// 依次尝试 auto（无监督聚类，不要求纯色背景）与 batch（要求背景一致/纯色），
+/// 取"学习后在原图上能重新定位"的那个（`profile_self_check`）；都过不了就报错。
+/// 只有自检通过的档案才落盘——否则存下来也定位不到，等于白学。
+#[tauri::command]
+fn learn_watermark(
+    root: String,
+    files: Vec<String>,
+    label: String,
+    lang: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let lang = lang_of(lang);
+    if files.len() < 2 {
+        return Err(tr(
+            &lang,
+            "请至少选中 2 张含同一款水印的图片",
+            "Select at least 2 images with the same watermark",
+        ));
+    }
+    let label = if label.trim().is_empty() {
+        tr(&lang, "learned", "learned")
+    } else {
+        label.trim().to_string()
+    };
+    let paths: Vec<PathBuf> = files.iter().map(PathBuf::from).collect();
+    let _ = root;
+
+    let frames: Vec<(String, PathBuf, Option<(i64, i64, i64, i64)>)> = paths
+        .iter()
+        .map(|p| {
+            let name = p
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (name, p.clone(), None)
+        })
+        .collect();
+
+    let mut attempts: Vec<serde_json::Value> = Vec::new();
+    let mut best: Option<(crate::watermark_profiles::Profile, serde_json::Value, f64)> = None;
+    for (mode, result) in [
+        (
+            "auto",
+            crate::watermark_profiles::auto_discover(
+                &frames,
+                &label,
+                [0f32, 0f32, 0f32],
+                None,
+                24,
+                12.0,
+                0.01,
+                60.0,
+            ),
+        ),
+        (
+            "batch",
+            crate::watermark_profiles::learn_from_batch(&paths, None, None, &label, 24, 12.0),
+        ),
+    ] {
+        match result {
+            Ok((Some(profile), report)) => {
+                let (hit, total, mean) =
+                    crate::watermark_profiles::profile_self_check(&profile, &paths);
+                let needed = (total * 2).div_ceil(3);
+                let ok = hit >= needed && hit > 0;
+                attempts.push(serde_json::json!({
+                    "mode": mode, "ok": ok, "located": hit, "samples": total, "mean_score": mean, "report": report,
+                }));
+                if ok && best.as_ref().map(|b| mean > b.2).unwrap_or(true) {
+                    best = Some((profile, report, mean));
+                }
+            }
+            Ok((None, report)) => attempts.push(serde_json::json!({
+                "mode": mode, "ok": false, "report": report,
+            })),
+            Err(e) => attempts.push(serde_json::json!({
+                "mode": mode, "ok": false, "error": e,
+            })),
+        }
+    }
+
+    let Some((profile, report, mean)) = best else {
+        return Err(tr(
+            &lang,
+            "学习失败：这批图里没有学到可复用的水印（请选 3 张以上、水印清晰且位置一致的图；\
+             若水印压在复杂风景上，改用框选后再处理）",
+            "Learning failed: no reusable watermark found (pick 3+ images with a clear, \
+             consistently placed watermark; for watermarks over busy photos, draw a box instead)",
+        ));
+    };
+    let saved = crate::watermark_profiles::save_profile(&profile, true)?;
+    Ok(serde_json::json!({
+        "id": profile.id,
+        "label": profile.label,
+        "path": saved.display().to_string(),
+        "mean_score": mean,
+        "report": report,
+        "attempts": attempts,
+    }))
+}
+
+#[tauri::command]
+fn list_watermarks() -> Result<serde_json::Value, String> {
+    let list = crate::watermark_profiles::profile_summaries();
+    serde_json::to_value(list).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_watermark(id: String, lang: Option<String>) -> Result<(), String> {
+    let lang = lang_of(lang);
+    crate::watermark_profiles::delete_profile(&id)
+        .map_err(|e| tr(&lang, &format!("删除失败：{}", e), &format!("Delete failed: {}", e)))
+}
+
 #[tauri::command]
 fn run_pipeline(
     app: AppHandle,
@@ -166,6 +281,7 @@ fn run_pipeline(
     mask_box: Option<Vec<i64>>,
     any_position: Option<bool>,
     refine: Option<bool>,
+    profile_id: Option<String>,
     lang: Option<String>,
 ) -> Result<(), String> {
     let lang = lang_of(lang);
@@ -215,6 +331,7 @@ fn run_pipeline(
             inverse: true,
             retry: true,
             refine: refine.unwrap_or(true),
+            forced_profile: profile_id.clone(),
         };
         let log = |line: &str| {
             let _ = app_handle.emit(EVENT_LOG, line);
@@ -336,6 +453,7 @@ fn cleanup_pipeline(storage: State<'_, AppStorage>, lang: Option<String>) -> Res
         inverse: true,
         retry: true,
         refine: false,
+        forced_profile: None,
     };
     let names = pipeline::target_names(&options.root, &options.files)?;
     pipeline::cleanup(&options, &names)?;
@@ -456,6 +574,8 @@ pub fn run_tauri_app() {
                     .expect("no app cache dir");
                 let _ = crate::MODEL_DIR_OVERRIDE.set(data_dir.join("models"));
                 let _ = crate::WORKDIR_OVERRIDE.set(cache_dir);
+                // 学习到的水印档案存应用数据目录（bundle 内 tools/ 只读且不打包）
+                let _ = crate::PROFILES_DIR_OVERRIDE.set(data_dir.join("profiles"));
             }
             Ok(())
         })
@@ -464,6 +584,9 @@ pub fn run_tauri_app() {
             setup_model,
             list_pngs,
             import_files,
+            learn_watermark,
+            list_watermarks,
+            delete_watermark,
             run_pipeline,
             cancel_pipeline,
             open_path,

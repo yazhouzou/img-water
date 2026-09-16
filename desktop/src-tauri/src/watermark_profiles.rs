@@ -37,6 +37,8 @@ pub const NCC_COARSE_STEP: f64 = 0.05;
 pub const NCC_FINE_SPAN: f64 = 0.05;
 pub const NCC_FINE_STEP: f64 = 0.0125;
 pub const NCC_MIN_SCORE: f64 = 0.5;
+/// 用户显式指定档案（精确模式）时的放宽阈值。
+pub const FORCED_MIN_SCORE: f64 = 0.35;
 const NCC_PYRAMID: usize = 4;
 
 const ALPHA_FILENAME: &str = "alpha.png";
@@ -77,10 +79,14 @@ pub struct Profile {
     pub color: Vec<f32>,
 }
 
-/// Where user-learned profiles are stored. `WATERMARK_PROFILES_DIR` overrides.
+/// Where user-learned profiles are stored. `WATERMARK_PROFILES_DIR` overrides;
+/// 打包后的 App 用 `PROFILES_DIR_OVERRIDE`（应用数据目录，bundle 内只读）。
 pub fn profiles_dir() -> PathBuf {
     if let Ok(path) = std::env::var("WATERMARK_PROFILES_DIR") {
         return PathBuf::from(path);
+    }
+    if let Some(dir) = crate::PROFILES_DIR_OVERRIDE.get() {
+        return dir.clone();
     }
     crate::project_root().join("tools/watermarks")
 }
@@ -1928,13 +1934,87 @@ fn ghost_for(
     Some((cov / (vx * vy).sqrt()).abs())
 }
 
-pub fn match_image(img: &image::DynamicImage) -> Option<(Profile, usize, usize, f64, f64)> {
+fn gray_max_channel(img: &image::DynamicImage) -> (Vec<f32>, usize, usize) {
     let rgb = img.to_rgb8();
     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
-    let mut gray = vec![0f32; w * h];
-    for (i, p) in rgb.pixels().enumerate() {
-        gray[i] = max3(&[p.0[0] as f32, p.0[1] as f32, p.0[2] as f32]);
+    let gray = rgb
+        .pixels()
+        .map(|p| max3(&[p.0[0] as f32, p.0[1] as f32, p.0[2] as f32]))
+        .collect::<Vec<f32>>();
+    (gray, w, h)
+}
+
+/// 用一个具体档案在图上定位（无阈值），供 `match_image`/`match_specific`/
+/// 学习后自检复用。
+pub fn locate_profile(
+    img: &image::DynamicImage,
+    profile: &Profile,
+    any_position: bool,
+) -> Option<(usize, usize, f64, f64)> {
+    let (gray, w, h) = gray_max_channel(img);
+    locate_ncc(&gray, w, h, profile, any_position)
+}
+
+/// 用户显式指定的档案：只用该档案定位（"精确模式"），阈值放宽到
+/// `FORCED_MIN_SCORE`——用户已声明"这组图就是这个水印"，定位分数偏低
+/// （压缩/缩放/裁剪痕迹）也应接受。
+pub fn match_specific(
+    img: &image::DynamicImage,
+    id: &str,
+) -> Option<(Profile, usize, usize, f64, f64)> {
+    let profile = load_profile(id).ok()?;
+    let (px, py, score, scale) = locate_profile(img, &profile, false)?;
+    if score < FORCED_MIN_SCORE {
+        return None;
     }
+    Some((profile, px, py, score, scale))
+}
+
+/// 档案摘要（列表展示用，不含大图数据）。
+#[derive(serde::Serialize)]
+pub struct ProfileSummary {
+    pub id: String,
+    pub label: String,
+    pub created: String,
+    pub source: String,
+    pub width: usize,
+    pub height: usize,
+    pub builtin: bool,
+}
+
+pub fn profile_summaries() -> Vec<ProfileSummary> {
+    let builtin_ids: Vec<String> = EMBEDDED.iter().map(|(id, _, _, _)| id.to_string()).collect();
+    list_profiles()
+        .into_iter()
+        .map(|p| ProfileSummary {
+            builtin: builtin_ids.contains(&p.id),
+            id: p.id,
+            label: p.label,
+            created: p.created,
+            source: p.source,
+            width: p.aw,
+            height: p.ah,
+        })
+        .collect()
+}
+
+/// 删除用户学习的档案（内置档案不可删）。
+pub fn delete_profile(id: &str) -> Result<(), String> {
+    if EMBEDDED.iter().any(|(eid, _, _, _)| *eid == id) {
+        return Err(format!("builtin profile cannot be deleted: {id}"));
+    }
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err(format!("invalid profile id: {id}"));
+    }
+    let dir = profiles_dir().join(id);
+    if !dir.exists() {
+        return Err(format!("profile not found: {id}"));
+    }
+    fs::remove_dir_all(&dir).map_err(|e| e.to_string())
+}
+
+pub fn match_image(img: &image::DynamicImage) -> Option<(Profile, usize, usize, f64, f64)> {
+    let (gray, w, h) = gray_max_channel(img);
     let mut best: Option<(Profile, usize, usize, f64, f64)> = None;
     for profile in list_profiles() {
         if let Some((px, py, score, scale)) = locate_ncc(&gray, w, h, &profile, false) {
@@ -1944,6 +2024,30 @@ pub fn match_image(img: &image::DynamicImage) -> Option<(Profile, usize, usize, 
         }
     }
     best
+}
+
+/// 学习结果自检：把候选档案在**用于学习的原图**上重新定位，返回
+/// (命中数, 样本数, 平均分数)。定位不到 = 档案无法复用（α 太弱/不成形），
+/// 这种档案存了也没用，应在保存前拦掉。
+pub fn profile_self_check(
+    profile: &Profile,
+    paths: &[PathBuf],
+) -> (usize, usize, f64) {
+    let mut hit = 0usize;
+    let mut total = 0usize;
+    let mut score_sum = 0.0f64;
+    for p in paths {
+        let Ok(img) = image::open(p) else { continue };
+        total += 1;
+        if let Some((_, _, score, _)) = locate_profile(&img, profile, false) {
+            if score >= NCC_MIN_SCORE {
+                hit += 1;
+                score_sum += score;
+            }
+        }
+    }
+    let mean = if hit > 0 { score_sum / hit as f64 } else { 0.0 };
+    (hit, total, mean)
 }
 
 #[cfg(test)]
