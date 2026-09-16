@@ -52,6 +52,11 @@ const LEARN_BATCH_TOPHAT_MIN: f32 = 2.0;
 /// 逆解 α 的最低保留值：低于此值的像素不参与求 C、不计残差、逆解时当纯背景。
 /// 豆包水印实测 α≈0.53，0.15 能覆盖抗锯齿边与淡笔画。
 const LEARN_CORE_ALPHA: f32 = 0.15;
+/// 掩码内相对拟合优度上限（0=完美解释，1=完全没解释）。**必须**配合 `residual` 一起用：
+/// `residual` 只看 α>core 像素，可以被"缩小 α"刷低（碎片 α 只拟合少数像素 → 残差极小），
+/// 这也是它曾把覆盖率 0.2% 的退化解判为 ok 的原因。实测：好档案（豆包，α IoU 0.914）
+/// 0.24~0.30；框太松导致 α 铺满整框的碎片解（千问，IoU 0.25~0.41）0.36~0.58。
+const LEARN_MAX_FIT: f64 = 0.4;
 
 fn learn_batch_tophat_min() -> f32 {
     std::env::var("LEARN_BATCH_TOPHAT_MIN")
@@ -65,6 +70,13 @@ fn learn_core_alpha() -> f32 {
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(LEARN_CORE_ALPHA)
+}
+
+fn learn_max_fit() -> f64 {
+    std::env::var("LEARN_MAX_FIT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(LEARN_MAX_FIT)
 }
 
 const ALPHA_FILENAME: &str = "alpha.png";
@@ -1316,15 +1328,45 @@ pub fn learn_from_batch(
         }
     }
     let resid = if cnt > 0.0 { resid / cnt } else { 999.0 };
+    // 掩码内相对拟合优度：在**整个 dil 掩码**上衡量"观测偏离背景的能量"被 α·C 解释的比例
+    // （0=完美，1=完全没解释）。不能只看 α>core 像素的残差——那可以被"缩小 α"刷低：
+    // 碎片 α 只拟合少数像素就得到极小残差，正是旧门限把覆盖率 0.2% 的退化解判为 ok 的原因。
+    // 掩码内的 α=0 像素用的是 `fill_inpaint` 的背景估计（不是 obs），所以可被检验。
+    let mut num = 0f64;
+    let mut den = 0f64;
+    for j in 0..n {
+        for i in 0..rw * rh {
+            if !dil[i] {
+                continue;
+            }
+            let o = max3(&obs_box[j][i * 3..i * 3 + 3]);
+            let b = max3(&bg_box[j][i * 3..i * 3 + 3]);
+            let hat = alpha[i] * max3(&color[i * 3..i * 3 + 3]) + (1.0 - alpha[i]) * b;
+            num += (hat - o).abs() as f64;
+            den += (o - b).abs() as f64;
+        }
+    }
+    let fit = if den > 1e-6 { num / den } else { 999.0 };
     let coverage = alpha.iter().filter(|&&a| a > 0.3).count() as f64 / (rw * rh) as f64;
+    let max_fit = learn_max_fit();
+    let reason = if resid > max_resid {
+        "reconstruction residual too high"
+    } else if fit > max_fit {
+        "stroke mask not explained by alpha (fit too high)"
+    } else if !(0.003..=0.6).contains(&coverage) {
+        "alpha coverage out of range"
+    } else {
+        "ok"
+    };
     let report = serde_json::json!({
-        "reason": if resid > max_resid { "reconstruction residual too high" } else { "ok" },
+        "reason": reason,
         "samples": n,
         "coverage": coverage,
         "residual": resid,
+        "fit": fit,
         "box": [x1, y1, x2, y2],
     });
-    if resid > max_resid || !(0.003..=0.6).contains(&coverage) {
+    if reason != "ok" {
         return Ok((None, report));
     }
     clean_alpha(&mut alpha, rw, rh, 0.08, min_area);
@@ -1364,6 +1406,24 @@ pub fn learn_from_batch(
     }), report))
 }
 
+/// 把"这个档案是怎么来的"（`strategy` / `self_check`）同时写进**返回的报告**和
+/// **档案 `extra.learn_report`**。只写报告的话，档案落盘后就查不到来源了
+/// （曾因此让 `learn-auto` 的 batch 分支看起来生效、实际落盘档案里没有 strategy）。
+fn mark_learning_strategy(profile: &mut Profile, report: &mut Value, strategy: &str, self_check: Option<f64>) {
+    let put = |v: &mut Value| {
+        if let Some(o) = v.as_object_mut() {
+            o.insert("strategy".into(), Value::String(strategy.to_string()));
+            if let Some(s) = self_check {
+                o.insert("self_check".into(), serde_json::json!(s));
+            }
+        }
+    };
+    put(report);
+    if let Some(lr) = profile.extra.get_mut("learn_report") {
+        put(lr);
+    }
+}
+
 pub fn auto_discover(
     frames: &[(String, PathBuf, Option<(i64, i64, i64, i64)>)],
     label: &str,
@@ -1376,6 +1436,8 @@ pub fn auto_discover(
 ) -> Result<(Option<Profile>, Value), String> {
     let mut scored: Vec<Value> = Vec::new();
     let mut eligible: Vec<(PathBuf, (usize, usize, usize, usize), (usize, usize), f64)> = Vec::new();
+    // 逐帧基本信息：路径、尺寸、检测框、是否用户显式给了框
+    let mut frames_info: Vec<(PathBuf, (usize, usize), Option<(i64, i64, i64, i64)>, bool)> = Vec::new();
     for (name, path, box_) in frames {
         let img = match image::open(path) {
             Ok(i) => i.to_rgb8(),
@@ -1390,6 +1452,8 @@ pub fn auto_discover(
             Some(b) => Some(*b),
             None => detect_watermark_box(&obs, w, h).map(|(a, b, c, d)| (a as i64, b as i64, c as i64, d as i64)),
         };
+        // 多帧 batch 用：尺寸 + 检测框（不参与下面的"纯色背景"资格门槛）
+        frames_info.push((path.clone(), (w, h), box_eff, box_.is_some()));
         let score = background_score(&obs, w, h, box_eff, color);
         let score = match score {
             Some(s) => s,
@@ -1428,44 +1492,120 @@ pub fn auto_discover(
             eligible.push((path.clone(), box_usize, (w, h), uniformity));
         }
     }
-    let report = serde_json::json!({"reason": "no usable frame", "candidates": scored});
-    if eligible.is_empty() {
-        return Ok((None, report));
+    // —— 多帧 batch（主策略）：**不参与**上面那套"纯色背景"资格门槛。
+    // 那套门槛（coverage/contrast/uniformity）是给单帧 `build_from_uniform` 的
+    // "已知背景色"假设用的，真实照片上必然被过滤（实测 dist/1、3 的 coverage
+    // 0.012/0.0003、contrast -91/-194，全被挡在 eligible 外）→ batch 分支永远走不到。
+    // 而 batch 学习器自带残差/覆盖率校验，前置只需要"≥3 张同尺寸图"。
+    let mut groups: BTreeMap<(usize, usize), Vec<(PathBuf, Option<(usize, usize, usize, usize)>, bool)>> = BTreeMap::new();
+    for (path, size, bx, explicit) in &frames_info {
+        groups
+            .entry(*size)
+            .or_default()
+            .push((path.clone(), bx.map(|(a, b, c, d)| (a as usize, b as usize, c as usize, d as usize)), *explicit));
     }
-    eligible.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
-    let mut best: Option<(Profile, Value)> = None;
-    for (path, box_usize, _size, _u) in &eligible {
-        let box_i = Some((box_usize.0 as i64, box_usize.1 as i64, box_usize.2 as i64, box_usize.3 as i64));
-        if let Ok((Some(p), rep)) = build_from_uniform(path, box_i, color, ref_short_side, label, min_area, None, max_resid) {
-            best = Some((p, rep));
-            break;
+    // 候选框之间用 `fit`（掩码内相对拟合优度，越小越说明 α 真把掩码解释掉了）择优，
+    // 同分再看 gap-score 自检均分——它们跑的是**同一组图**，比较是公平的。
+    let batch_possible = groups.values().any(|g| g.len() >= 3);
+    let mut batch_best: Option<(Profile, Value, f64, f64)> = None;
+    for group in groups.values() {
+        if group.len() < 3 {
+            continue;
         }
-    }
-    // unsupervised batch over the largest same-size group
-    let mut groups: BTreeMap<(usize, usize), Vec<(PathBuf, (usize, usize, usize, usize))>> = BTreeMap::new();
-    for (path, box_usize, size, _u) in &eligible {
-        groups.entry(*size).or_default().push((path.clone(), *box_usize));
-    }
-    if let Some(group) = groups.values().max_by_key(|g| g.len()).cloned() {
-        if group.len() >= 3 {
-            let box_i = Some((group[0].1 .0 as i64, group[0].1 .1 as i64, group[0].1 .2 as i64, group[0].1 .3 as i64));
-            let paths: Vec<PathBuf> = group.iter().map(|g| g.0.clone()).collect();
-            if let Ok((Some(p), rep)) = learn_from_batch(&paths, box_i, ref_short_side, label, min_area, max_resid) {
-                let better = match &best {
+        let paths: Vec<PathBuf> = group.iter().map(|g| g.0.clone()).collect();
+        // 候选框：
+        // ① 用户显式给框 → 只用它；
+        // ② 否则把**逐帧检测框都试一遍**（按面积升序、去重、取前 3），再加"默认右下角框"。
+        //    通用检测器在复杂背景上会明显偏大（实测 dist/1 853x200、dist/3 1014x227
+        //    vs 真值 307x102），框太大时水印只占很小比例、中位数判据失效；而检测器
+        //    **在有的帧上很准**（千问 dist/10 检出 428x83 与真值一致、residual 7.75），
+        //    取"第一个有框的帧"会碰运气拿到坏框（dist/9 714x437 → residual 12.9 学不出）。
+        //    面积小的框通常最精确，故按面积升序取前几个，最终由 `fit` 择优。
+        let mut boxes: Vec<Option<(i64, i64, i64, i64)>> = Vec::new();
+        if group[0].2 {
+            if let Some(b) = group[0].1 {
+                boxes.push(Some((b.0 as i64, b.1 as i64, b.2 as i64, b.3 as i64)));
+            }
+        } else {
+            let mut detect: Vec<(i64, i64, i64, i64)> = group
+                .iter()
+                .filter_map(|g| g.1)
+                .map(|b| (b.0 as i64, b.1 as i64, b.2 as i64, b.3 as i64))
+                .collect();
+            detect.sort_by_key(|b| (b.2 - b.0).max(1) * (b.3 - b.1).max(1));
+            let iou = |a: (i64, i64, i64, i64), b: (i64, i64, i64, i64)| -> f64 {
+                let ix = (a.2.min(b.2) - a.0.max(b.0)).max(0) as f64;
+                let iy = (a.3.min(b.3) - a.1.max(b.1)).max(0) as f64;
+                let inter = ix * iy;
+                let ua = ((a.2 - a.0) as f64 * (a.3 - a.1) as f64).max(1.0);
+                let ub = ((b.2 - b.0) as f64 * (b.3 - b.1) as f64).max(1.0);
+                inter / (ua + ub - inter)
+            };
+            let mut picked: Vec<(i64, i64, i64, i64)> = Vec::new();
+            for b in detect {
+                if !picked.iter().any(|p| iou(*p, b) >= 0.5) {
+                    picked.push(b);
+                }
+                if picked.len() >= 3 {
+                    break;
+                }
+            }
+            boxes.extend(picked.into_iter().map(Some));
+            boxes.push(None);
+        }
+        for bx in boxes {
+            if let Ok((Some(p), rep)) = learn_from_batch(&paths, bx, ref_short_side, label, min_area, max_resid) {
+                // 学出来在学习图上都定位不到的档案没有意义，直接淘汰（避免"选了最差的"）。
+                let (hit, _, mean) = profile_self_check(&p, &paths);
+                if hit == 0 {
+                    continue;
+                }
+                let fit = rep.get("fit").and_then(Value::as_f64).unwrap_or(1.0);
+                let better = match &batch_best {
                     None => true,
-                    Some((_, prev)) => rep.get("residual").and_then(Value::as_f64).unwrap_or(1e9)
-                        < prev.get("residual").and_then(Value::as_f64).unwrap_or(1e9),
+                    Some((_, _, prev_fit, prev_mean)) => {
+                        fit < prev_fit - 1e-9 || ((fit - prev_fit).abs() <= 1e-9 && mean > prev_mean + 1e-9)
+                    }
                 };
                 if better {
-                    best = Some((p, rep));
+                    let (mut p, mut rep) = (p, rep);
+                    mark_learning_strategy(&mut p, &mut rep, "batch", Some(mean));
+                    batch_best = Some((p, rep, fit, mean));
                 }
             }
         }
     }
-    match best {
-        None => Ok((None, serde_json::json!({"reason": "no frame produced a reliable profile"}))),
-        Some((p, rep)) => Ok((Some(p), rep)),
+    // batch 是主策略（≥3 张同尺寸对齐图 + 自带校验/residual+fit 门限），有就优先返回。
+    if let Some((p, rep, _, _)) = batch_best {
+        return Ok((Some(p), rep));
     }
+    // 有 ≥3 张同尺寸图却学不出东西 → 这组图里没有可学的共性水印，**不要**再退回单帧
+    // "纯色背景"猜测：那种解常常覆盖率 ~0.2%（几乎删不掉任何东西）却因为残差极小而被
+    // 判为 ok，属于静默失败。宁可如实报告学不到。
+    if batch_possible {
+        return Ok((
+            None,
+            serde_json::json!({
+                "reason": "batch learning found no learnable watermark in the aligned images",
+                "candidates": scored,
+            }),
+        ));
+    }
+
+    // —— 单帧"纯色背景"回退：保留原有资格门槛（coverage/contrast/uniformity）
+    eligible.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+    if let Some((path, box_usize, _size, _u)) = eligible.first() {
+        let box_i = Some((box_usize.0 as i64, box_usize.1 as i64, box_usize.2 as i64, box_usize.3 as i64));
+        if let Ok((Some(p), mut rep)) = build_from_uniform(path, box_i, color, ref_short_side, label, min_area, None, max_resid) {
+            let mut p = p;
+            mark_learning_strategy(&mut p, &mut rep, "uniform", None);
+            return Ok((Some(p), rep));
+        }
+    }
+    Ok((
+        None,
+        serde_json::json!({"reason": "no frame produced a reliable profile", "candidates": scored}),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2336,6 +2476,47 @@ mod tests {
         }
     }
 
+    /// 诊断：`auto_discover` 的逐帧资格门槛在真实照片上的取值。`--ignored`.
+    /// 用来判断 batch 分支为什么走不到（门槛按"纯色背景"假设设计）。
+    #[test]
+    #[ignore]
+    fn diagnose_learning_eligibility() {
+        let root = crate::project_root();
+        for name in [
+            "dist/1.png",
+            "dist/3.png",
+            "dist/7.png",
+            "tools/watermarks/qwen/samples/qwen-black.png",
+        ] {
+            let path = root.join(name);
+            if !path.exists() {
+                continue;
+            }
+            let img = image::open(&path).unwrap().to_rgb8();
+            let (w, h) = (img.width() as usize, img.height() as usize);
+            let rgb = rgb_f32_from(&img);
+            let box_det = detect_watermark_box(&rgb, w, h);
+            let (w2, h2) = (w as i64, h as i64);
+            let s_det = box_det.and_then(|b| {
+                background_score(&rgb, w, h, Some((b.0 as i64, b.1 as i64, b.2 as i64, b.3 as i64)), [0.0, 0.0, 0.0])
+            });
+            let s_def = background_score(&rgb, w, h, None, [0.0, 0.0, 0.0]);
+            let fmt = |s: &Option<Value>| match s {
+                Some(v) => format!(
+                    "cov={:.4} contrast={:.1} unif={:.1} box={}",
+                    v["coverage"].as_f64().unwrap_or(-1.0),
+                    v["contrast"].as_f64().unwrap_or(-1.0),
+                    v["uniformity"].as_f64().unwrap_or(-1.0),
+                    v["box"]
+                ),
+                None => "None".into(),
+            };
+            println!("{name} ({w}x{h}) box_det={box_det:?} (默认右下角 = {},{} 起)", w2, h2);
+            println!("   检测框: {}", fmt(&s_det));
+            println!("   默认框: {}", fmt(&s_def));
+        }
+    }
+
     /// Pair learning on the shipped qwen black/white samples; `--ignored`.
     #[test]
     #[ignore]
@@ -2458,6 +2639,55 @@ mod tests {
                 "{name}: pos ({px},{py}) far from {want:?}"
             );
             println!("{name}: gap score {score:.1} at ({px},{py})");
+        }
+    }
+
+    /// `auto_discover` 的多帧 batch 分支必须可达。原先它被"纯色背景"资格门槛
+    /// （coverage/contrast/uniformity）挡死——真实照片 coverage ~0.012/0.0003、
+    /// contrast -91/-194 全部出局，于是 `learn-auto` 永远退回退化的单帧解。`--ignored`.
+    ///
+    /// 慢（debug 下数分钟）：`learn_from_batch` + `profile_self_check` 要在大图上跑
+    /// 每个候选框各一遍。
+    #[test]
+    #[ignore]
+    fn learn_auto_uses_batch_on_aligned_photos() {
+        let root = crate::project_root();
+        let frames = |names: &[&str], b: Option<(i64, i64, i64, i64)>| {
+            names
+                .iter()
+                .map(|n| (n.to_string(), root.join(n), b))
+                .collect::<Vec<(String, std::path::PathBuf, Option<(i64, i64, i64, i64)>)>>()
+        };
+        // 豆包给显式框（只跑 1 个候选，快）；千问不给框（要它自己从多个检测框里挑出
+        // dist/10 那个精确框，覆盖"取第一个有框的帧会碰到坏框"这个回归）。
+        let groups: &[(&[&str], Option<(i64, i64, i64, i64)>)] = &[
+            (&["dist/1.png", "dist/2.png", "dist/3.png", "dist/6.png"], Some((2518, 1482, 2848, 1600))),
+            (&["dist/7.png", "dist/9.png", "dist/10.png"], None),
+        ];
+        for (names, box_) in groups {
+            let fs = frames(names, *box_);
+            if !fs.iter().all(|f| f.1.exists()) {
+                continue;
+            }
+            let tag = names[0];
+            let (p, rep) = auto_discover(&fs, "auto-test", [255.0, 255.0, 255.0], None, 24, 12.0, 0.01, 60.0)
+                .unwrap();
+            // 允许"如实报告学不到"，但若返回档案：必须是 batch 策略、`fit` 过门限、
+            // 且**能在学习原图上定位到**（学出来定位不到的档案存了也没用）。
+            let p = match p {
+                Some(p) => p,
+                None => {
+                    println!("{tag}: no profile ({})", rep["reason"]);
+                    continue;
+                }
+            };
+            assert_eq!(p.extra["learn_report"]["strategy"].as_str(), Some("batch"), "{tag}: {rep}");
+            let fit = p.extra["learn_report"]["fit"].as_f64().unwrap();
+            assert!(fit <= LEARN_MAX_FIT, "{tag}: fit {fit} over gate: {rep}");
+            let paths: Vec<PathBuf> = fs.iter().map(|f| f.1.clone()).collect();
+            let (hit, total, mean) = profile_self_check(&p, &paths);
+            assert!(hit >= 2, "{tag}: learned profile localises on only {hit}/{total} frames");
+            println!("{tag}: strategy=batch fit={fit:.3} self_check={hit}/{total} mean={mean:.1}");
         }
     }
 }

@@ -157,8 +157,8 @@ fn list_pngs(root: String, lang: Option<String>) -> Result<Vec<String>, String> 
 
 /// 「精确模式」：用同一款水印的多张图自举学习一个逐像素档案。
 ///
-/// 依次尝试 auto（无监督聚类，不要求纯色背景）与 batch（要求背景一致/纯色），
-/// 取"学习后在原图上能重新定位"的那个（`profile_self_check`）；都过不了就报错。
+/// 依次尝试 auto（多图自举 + 单帧纯色回退）与 batch（多图统一步长），取"学习后
+/// 在原图上能重新定位"的那个（`profile_self_check`，按均分择优）；都过不了就报错。
 /// 只有自检通过的档案才落盘——否则存下来也定位不到，等于白学。
 #[tauri::command]
 fn learn_watermark(
@@ -202,7 +202,7 @@ fn learn_watermark(
             crate::watermark_profiles::auto_discover(
                 &frames,
                 &label,
-                [0f32, 0f32, 0f32],
+                [255f32, 255f32, 255f32],
                 None,
                 24,
                 12.0,

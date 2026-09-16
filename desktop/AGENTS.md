@@ -27,7 +27,12 @@ Tauri 桌面应用，内置 Rust + ONNX Runtime 修复内核（v0.2 起，无需
 - **`place` 锚点（关键）**：档案 `extra.place` 记录水印**相对右下角的偏移**（按短边归一，`place_by_anchor` 反算位置）。定位窗锚定到它 ±40px，而不是死守"贴右下角"——千问距右/下各 ~0.032 短边（55px），窄窗根本不含真值、只会在角上找到伪峰（实测偏 21px、模板分只掉到 29.3）。`learn_from_batch`/`extract_from_pair`/`build_from_uniform` 都写 `place`；老档案缺 `place` 时退化为贴角（对豆包正确）。阈值 `PROFILE_GAP_MIN_SCORE=12`（实测含水印 17.8~130、不含水印 1.1~7.3）。
 - **踩坑（曾误判）**：`doubao-stamp` 不在 `EMBEDDED` 里（独立 const，只给 stamp 逆解用），`load_profile("doubao-stamp")` 必然失败 → `match-profile doubao-stamp` 打印"not located"。别当成"真值 α 也定位不了"的证据；实测真值 stamp α（覆盖率 27.8%）标准 per-window zero-mean NCC **0.772**、qwen α（38%）0.870。
 - **`learn-batch` 保真度（v0.5.5 已修）**：原先逐样本"顶帽 >12 取并集"，单张图的背景强结构会把并集污染 → 框/α 形状不符、残差 13.5 过不了 12 的门限，学习直接失败。改为**逐样本顶帽后跨样本取中位数**（水印是各图共性结构，各图背景高频互不相关，中位数保留水印、压掉背景伪结构）：同召回下精确率 0.55→0.81。再加 `LEARN_CORE_ALPHA` 0.35→0.15（豆包 α≈0.53，0.35 门限把抗锯齿边与淡笔画全丢了）。**实测（1,2,3 学、6 留出）α 对真值 stamp 墨迹 IoU 0.914**（改前 0.664），`--profile` 在 dist/1/3/6 全部命中真值 (2568,1511)、模板分 58.6/33.0/53.2 → **0.0**，与内置 stamp 通路等效。两个阈值可用环境变量 `LEARN_BATCH_TOPHAT_MIN`/`LEARN_CORE_ALPHA` 微调。
-- ⚠️ **`learn-auto` 仍不好用（独立遗留）**：其 batch 分支要求 ≥3 帧通过 `background_score` 的资格门槛（`min_coverage=0.01`/`min_contrast=60`），而那是**按纯色背景假设**设计的——真实照片覆盖率只有 ~0.2% 全被过滤，该分支实际上**永远走不到**，只能回落到单帧"纯色背景"策略（覆盖率 ~0.2% 的退化解，残差却很小）。App 的 `learn_watermark` 同时跑 `auto_discover` 与 `learn_from_batch` 并按自检择优，所以 **App 侧走 batch 分支即可正常工作**；CLI 的 `learn-auto` 要能用需重做资格门槛，属独立课题。
+- **`learn-auto` 已转正（v0.5.5）**：`auto_discover` 改为 **batch-first**——多帧 batch 与 `background_score` 的"纯色背景"资格门槛**解耦**（那套门槛 cover./contrast 按纯色假设设计，真实照片覆盖率 ~0.2% 必然被过滤，曾使该分支**永远走不到**）。现在只要 ≥3 张同尺寸图就学，选出档案的门槛是 `learn_from_batch` 自带的 `residual`+**`fit`**。
+  - **`fit` 指标（关键）**：掩码内相对拟合优度 = `num/den`（整个 `dil` 掩码上"obs 偏离背景的能量"被 α·C 解释的比例，0=完美）。**`residual` 可被"缩小 α"刷低**（碎片 α 只拟合少数像素 → 残差极小，正是旧门限把覆盖率 0.2% 退化解判 ok 的原因）；`fit` 补上这一刀，`LEARN_MAX_FIT=0.4`。实测：豆包好档案 fit 0.24~0.30、松框碎片解 0.36~0.58。
+  - **候选框要取多个、按 `fit` 择优**：通用检测器**有的帧准、有的帧离谱**（千问 dist/10 检出 428x83 = 真值 → residual 7.75；dist/9 714x437 → residual 12.9 学不出）。取"第一个有框的帧"是碰运气；改为逐帧检测框按**面积升序**去重取前 3 + 默认右下角框，全试一遍取 `fit` 最小。
+  - **`strategy`/`self_check` 必须同时写回档案 `extra`**：曾只写进返回报告 → 落盘档案查不到来源（`learn-auto` 看起来走了 batch、meta.json 里却没有）。
+  - 实测：`learn-auto` 豆包 4 张 → batch fit 0.301/self_check 59.1；千问 3 张 → batch fit 0.179/self_check 27.8；`--profile` 在 dist/1/3/6（tmpl 58.6/33.0/53.2→0.0）与 dist/7/9/10（tmpl→0.0）全部 PASS。
+  - 仍有 ≥3 张同尺寸图却学不出来时**如实报"学不到"**，不回退单帧纯色猜测（那是静默失败）。App `learn_watermark` 仍并发跑两法按自检均分择优。
 - **踩坑**：连通域筛选（`labels_areas`）必须跳过背景 label 0，否则 `areas[0] >= min_area` 把全图判成前景（`stroke_mask` 全屏 mask、`clean_alpha` 残留微 α 使裁剪不收缩）。
 - 自实现替代 imageproc：`CrossCorrelationNormalized` 是 CCORR 不减均值 → 自写 zero-mean NCC；形态学太慢 → 自写 O(n) 滑窗方形核（`rect_morph`/`slide_extreme`）。
 
@@ -35,7 +40,7 @@ Tauri 桌面应用，内置 Rust + ONNX Runtime 修复内核（v0.2 起，无需
 - `cd desktop && pnpm install && pnpm tauri dev`。
 - 跑 `cargo build`/`check` 必须先 `env -u CFLAGS -u CXXFLAGS -u CCFLAGS -u LDFLAGS -u MACOSX_DEPLOYMENT_TARGET`（`.zshrc` 旧 MacPorts 变量破坏 `objc2-exception-helper`），或用 `desktop/build.sh`。
 - Windows 包无法在 macOS 交叉编译；`tools/package-app.sh`：`mac`（本机 DMG）/`win`（Windows Git Bash 本机，或 macOS `--remote user@host --win-repo C:/path` 经 SSH 远程构建拉回）/`both`；产物在根 `dist/`。
-- `cargo test --lib`（常规 18）+ `cargo test --lib -- --ignored --nocapture`（含 `detect_box_on_qwen_samples`/`qwen_profile_matches_real_images`/`qwen_pair_learning_residual_is_tiny`/`full_run_with_lama_e2e`）。
+- `cargo test --lib`（常规 19）+ `cargo test --lib -- --ignored --nocapture`（含 `detect_box_on_qwen_samples`/`qwen_profile_matches_real_images`/`qwen_pair_learning_residual_is_tiny`/`doubao_batch_learning_recovers_stamp`/`gap_locator_finds_qwen_place_anchor`/`learn_auto_uses_batch_on_aligned_photos`/`full_run_with_lama_e2e`）。
 - 推送前预检、CI 工作流、本地 E2E 与发版：见 `docs/ci.md`。
 
 ## UI 本地联调（零 SDK）
