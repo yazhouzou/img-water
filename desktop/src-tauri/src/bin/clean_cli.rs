@@ -49,6 +49,7 @@ fn main() {
     let mut ref_short: Option<f64> = None;
     let mut bg = [0f32, 0f32, 0f32];
     let mut color = [255f32, 255f32, 255f32];
+    let mut mine = MineOpts { min_samples: 3, corner_tol: 0.05, recursive: false, dry_run: false, out: None };
 
     let mut args = std::env::args().skip(1);
     while let Some(raw) = args.next() {
@@ -69,7 +70,7 @@ fn main() {
                 eprintln!("--box needs a value");
                 exit(1);
             })),
-            "--label" => label = take(&mut args),
+            "--label" | "--label-prefix" => label = take(&mut args),
             "--ref-short" => ref_short = take(&mut args).and_then(|v| v.parse().ok()),
             "--bg" => bg = take(&mut args).map(|v| parse_triple(&v)).unwrap_or(bg),
             "--color" => color = take(&mut args).map(|v| parse_triple(&v)).unwrap_or(color),
@@ -83,6 +84,11 @@ fn main() {
             "--refine" => refine = true,
             "--profile" => profile = take(&mut args),
             "--model" => model = take(&mut args),
+            "--min-samples" => mine.min_samples = take(&mut args).and_then(|v| v.parse().ok()).unwrap_or(mine.min_samples),
+            "--corner-tol" => mine.corner_tol = take(&mut args).and_then(|v| v.parse().ok()).unwrap_or(mine.corner_tol),
+            "--recursive" => mine.recursive = true,
+            "--dry-run" => mine.dry_run = true,
+            "--out" => mine.out = take(&mut args),
             "-h" | "--help" => {
                 print_help();
                 return;
@@ -98,12 +104,12 @@ fn main() {
     }
 
     let command = command.unwrap_or_else(|| {
-        eprintln!("missing command; use run|prepare|inpaint|review-lama|overwrite-review|cleanup|profiles|match|learn-pair|learn-solid|learn-auto|learn-batch");
+        eprintln!("missing command; use run|prepare|inpaint|review-lama|overwrite-review|cleanup|profiles|match|learn-pair|learn-solid|learn-auto|learn-batch|learn-mine");
         exit(1);
     });
 
     // 档案库子命令（不依赖 root/model）
-    if let Some(code) = run_profile_command(&command, &files, label.as_deref(), ref_short, box_raw, bg, color) {
+    if let Some(code) = run_profile_command(&command, &files, label.as_deref(), ref_short, box_raw, bg, color, &mine) {
         exit(code);
     }
 
@@ -172,6 +178,50 @@ fn main() {
     }
 }
 
+/// `learn-mine` 的开关（文件夹自动聚类建档）。
+struct MineOpts {
+    min_samples: usize,
+    corner_tol: f64,
+    recursive: bool,
+    dry_run: bool,
+    out: Option<String>,
+}
+
+fn is_image_path(p: &std::path::Path) -> bool {
+    matches!(
+        p.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("png" | "jpg" | "jpeg" | "bmp" | "webp" | "tif" | "tiff")
+    )
+}
+
+/// 把参数里的目录展开成图片文件（`--recursive` 决定是否下钻）；非目录、非图片的
+/// 原样保留，好让 `image::open` 报出到底是哪个文件打不开。
+fn expand_inputs(files: &[String], recursive: bool) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = files.iter().map(std::path::PathBuf::from).collect();
+    while let Some(p) = stack.pop() {
+        if p.is_dir() {
+            let Ok(rd) = std::fs::read_dir(&p) else { continue };
+            let mut entries: Vec<std::path::PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+            entries.sort();
+            for e in entries {
+                if e.is_dir() {
+                    if recursive {
+                        stack.push(e);
+                    }
+                } else if is_image_path(&e) {
+                    out.push(e);
+                }
+            }
+        } else {
+            out.push(p);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// 返回 Some(exit_code) 表示这是档案库子命令，已处理完毕。
 fn run_profile_command(
     command: &str,
@@ -181,6 +231,7 @@ fn run_profile_command(
     box_raw: Option<MaskBox>,
     bg: [f32; 3],
     color: [f32; 3],
+    mine: &MineOpts,
 ) -> Option<i32> {
     match command {
         "profiles" | "list-profiles" => {
@@ -305,6 +356,53 @@ fn run_profile_command(
                 }
             }
         }
+        "learn-mine" => {
+            if files.is_empty() {
+                eprintln!("learn-mine needs <dir|images...> [--label-prefix X]");
+                return Some(1);
+            }
+            let paths = expand_inputs(files, mine.recursive);
+            if paths.is_empty() {
+                eprintln!("learn-mine: no images found");
+                return Some(1);
+            }
+            let prefix = label.unwrap_or("mined");
+            let out = mine
+                .out
+                .clone()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| doubao_clean::workdir().join("mined-review"));
+            match wp::mine_watermarks(
+                &paths,
+                prefix,
+                color,
+                ref_short,
+                opt_box(box_raw),
+                mine.min_samples,
+                12.0,
+                mine.corner_tol,
+                Some(&out),
+                !mine.dry_run,
+            ) {
+                Ok((profiles, report)) => {
+                    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                    for p in &profiles {
+                        println!("mined profile {} shape=({},{}) ref_short={}", p.id, p.ah, p.aw, p.ref_short_side);
+                    }
+                    println!(
+                        "{} profile(s) {}; review montages in {}",
+                        profiles.len(),
+                        if mine.dry_run { "learned (dry-run, not saved)" } else { "saved" },
+                        out.display()
+                    );
+                    Some(0)
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    Some(1)
+                }
+            }
+        }
         "learn-auto" => {
             if files.is_empty() {
                 eprintln!("learn-auto needs <images...> --label X");
@@ -399,6 +497,10 @@ fn print_help() {
     println!("  learn-auto <images...> --label <name> [--color r,g,b] [--ref-short N]");
     println!("  match-profile <id> <image>");
     println!("  learn-batch <images...> --label <name> [--ref-short N]");
+    println!("  learn-mine <dir|images...> [--label-prefix <name>] [--min-samples N] [--corner-tol F] [--recursive] [--dry-run] [--out <dir>]");
+    println!("     文件夹自动聚类建档：逐图检测水印 → 按「尺寸 + 水印相对右下角位置」聚簇 →");
+    println!("     每簇 ≥3 张就学习并自检，只留能定位的档；复查拼图写到 --out（默认 <workdir>/mined-review）");
+    println!("     自动聚类只在右下角找水印；水印在别处时用 --box 显式指定（此时按尺寸聚簇）");
     println!("档案目录：{}（可用 WATERMARK_PROFILES_DIR 覆盖）", wp::profiles_dir().display());
 }
 

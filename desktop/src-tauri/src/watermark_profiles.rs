@@ -1608,6 +1608,210 @@ pub fn auto_discover(
     ))
 }
 
+/// 从一个（可能混杂多个 App、多款水印的）文件夹里自动挖出可复用档案。
+///
+/// 为什么需要聚类：`auto_discover` 只按**图片尺寸**分组，同尺寸但**水印不同**的图
+/// 会被混进同一组，中位数取出来的是"几种水印的叠加"→ 学出垃圾。所以先用
+/// **水印框右下角在整图中的相对位置**（`x2/w`, `y2/h`）把同款水印的图聚到一起。
+/// 不用检测框尺寸作标识：检测框逐帧漂移很大（实测豆包 853x200 vs 1014x227 vs
+/// 1149x298、千问 428x83 vs 714x437），而水印的**落位**很稳定——实测豆包四张的
+/// 右下角相对位置 0.964~1.000、千问三张 0.969~1.000，同款水印天然聚在一起。
+/// （注意是分别除以 w / h，不是都除以短边：后者跨长宽比不可比，还把豆包同款
+/// 水印按框大小拆成了三簇。）
+///
+/// 每个簇（需 ≥`min_samples` 且同尺寸）交给 `auto_discover` 处理——它内部会试多个
+/// 候选框、按 `fit` 择优、并做自检，这里再要求自检命中 ≥2/3 才收下，最后写
+/// 复查拼图（`out_dir/<id>-review.png`，人工扫一眼即可判断该簇学没学对）。
+///
+/// 局限：只在**右下角**找水印（与 `detect_watermark_box`/`resolve_box` 同假设）。
+/// 水印在别处时用 `box_` 显式指定（此时按尺寸聚类）。
+pub fn mine_watermarks(
+    paths: &[PathBuf],
+    label_prefix: &str,
+    color: [f32; 3],
+    ref_short_side: Option<f64>,
+    box_: Option<(i64, i64, i64, i64)>,
+    min_samples: usize,
+    max_resid: f64,
+    corner_tol: f64,
+    out_dir: Option<&Path>,
+    save: bool,
+) -> Result<(Vec<Profile>, Value), String> {
+    let min_samples = min_samples.max(3); // batch 学习器要 ≥3 张（中位数才稳）
+    let mut info: Vec<(PathBuf, usize, usize, (i64, i64, i64, i64))> = Vec::new();
+    let mut per_frame: Vec<Value> = Vec::new();
+    for p in paths {
+        let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        let img = match image::open(p) {
+            Ok(i) => i.to_rgb8(),
+            Err(e) => {
+                per_frame.push(serde_json::json!({"file": name, "reason": e.to_string()}));
+                continue;
+            }
+        };
+        let (w, h) = (img.width() as usize, img.height() as usize);
+        let b = box_.map(|b| (b.0, b.1, b.2, b.3)).or_else(|| {
+            detect_watermark_box(&rgb_f32_from(&img), w, h).map(|(a, b, c, d)| (a as i64, b as i64, c as i64, d as i64))
+        });
+        match b {
+            Some(b) => {
+                info.push((p.clone(), w, h, b));
+                per_frame.push(serde_json::json!({
+                    "file": name, "size": [w, h], "box": [b.0, b.1, b.2, b.3],
+                    "corner": [(b.2 as f64 / w as f64), (b.3 as f64 / h as f64)],
+                }));
+            }
+            None => per_frame.push(serde_json::json!({"file": name, "size": [w, h], "reason": "no watermark detected"})),
+        }
+    }
+    // 贪心聚类：同尺寸 + 右下角位置在 `corner_tol`（按短边归一）内 → 同簇
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
+    for i in 0..info.len() {
+        let (w, h, b) = {
+            let (_, w, h, b) = &info[i];
+            (*w, *h, *b)
+        };
+        let (cr, cb) = (b.2 as f64 / w as f64, b.3 as f64 / h as f64);
+        let mut hit = None;
+        for (ci, c) in clusters.iter().enumerate() {
+            let (cw, ch, cb0) = {
+                let (_, cw, ch, cb0) = &info[c[0]];
+                (*cw, *ch, *cb0)
+            };
+            if (cw, ch) != (w, h) {
+                continue;
+            }
+            if (cr - cb0.2 as f64 / cw as f64).abs() <= corner_tol
+                && (cb - cb0.3 as f64 / ch as f64).abs() <= corner_tol
+            {
+                hit = Some(ci);
+                break;
+            }
+        }
+        match hit {
+            Some(ci) => clusters[ci].push(i),
+            None => clusters.push(vec![i]),
+        }
+    }
+
+    let mut out: Vec<Profile> = Vec::new();
+    let mut cluster_reports: Vec<Value> = Vec::new();
+    for c in &clusters {
+        let (w, h, b) = {
+            let (_, w, h, b) = &info[c[0]];
+            (*w, *h, *b)
+        };
+        let files: Vec<PathBuf> = c.iter().map(|&i| info[i].0.clone()).collect();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default())
+            .collect();
+        let mut entry = serde_json::json!({
+            "size": [w, h], "box": [b.0, b.1, b.2, b.3], "count": c.len(), "files": names,
+        });
+        if c.len() < min_samples {
+            entry["reason"] = Value::String(format!("only {} frames (< {min_samples})", c.len()));
+            cluster_reports.push(entry);
+            continue;
+        }
+        // 每簇一个 id：<prefix>-<w>x<h>（同款水印出现在多个尺寸档时会各建一个，
+        // 因为学习器要求同尺寸；运行时按 id 选用，多余的可用 delete_profile 删）。
+        let id = slug(&format!("{label_prefix}-{w}x{h}"));
+        let frames: Vec<(String, PathBuf, Option<(i64, i64, i64, i64)>)> =
+            files.iter().enumerate().map(|(k, p)| (names[k].clone(), p.clone(), box_)).collect();
+        let (profile, rep) = auto_discover(&frames, &id, color, ref_short_side, 24, max_resid, 0.01, 60.0)?;
+        entry["learn"] = rep;
+        let Some(mut profile) = profile else {
+            entry["reason"] = Value::String("learning rejected this cluster".into());
+            cluster_reports.push(entry);
+            continue;
+        };
+        let (hits, total, mean) = profile_self_check(&profile, &files);
+        let needed = (total * 2).div_ceil(3);
+        entry["self_check"] = serde_json::json!({"located": hits, "samples": total, "mean_score": mean});
+        if hits < needed {
+            entry["reason"] = Value::String(format!("self-check {hits}/{total} below {needed}"));
+            cluster_reports.push(entry);
+            continue;
+        }
+        profile.id = id.clone();
+        profile.label = id.clone();
+        profile.source = format!("mine_watermarks: {} frames", c.len());
+        if let Some(dir) = out_dir {
+            fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            // 拼图优先用**学到的** stroke_box（检测框常明显偏大，看不出细节）
+            let crop_box = profile
+                .extra
+                .get("stroke_box")
+                .and_then(Value::as_array)
+                .filter(|a| a.len() == 4)
+                .map(|a| {
+                    (
+                        a[0].as_i64().unwrap_or(b.0),
+                        a[1].as_i64().unwrap_or(b.1),
+                        a[2].as_i64().unwrap_or(b.2),
+                        a[3].as_i64().unwrap_or(b.3),
+                    )
+                })
+                .unwrap_or(b);
+            let _ = write_cluster_review(&files, crop_box, &dir.join(format!("{id}-review.png")));
+            entry["review"] = Value::String(dir.join(format!("{id}-review.png")).display().to_string());
+        }
+        if save {
+            match save_profile(&profile, true) {
+                Ok(base) => entry["saved"] = Value::String(base.display().to_string()),
+                Err(e) => entry["reason"] = Value::String(e),
+            }
+        } else {
+            entry["saved"] = Value::String("(dry-run)".into());
+        }
+        cluster_reports.push(entry);
+        out.push(profile);
+    }
+    Ok((
+        out,
+        serde_json::json!({
+            "candidates": per_frame,
+            "clusters": cluster_reports,
+        }),
+    ))
+}
+
+/// 把每帧的水印区域（框 + 8px 余量）裁出来纵向拼成复查图：一眼看出这簇是不是同一款
+/// 水印、学出的框有没有对准。
+fn write_cluster_review(frames: &[PathBuf], b: (i64, i64, i64, i64), out: &Path) -> Result<(), String> {
+    const WIDTH: u32 = 900;
+    let mut crops: Vec<RgbImage> = Vec::new();
+    for p in frames {
+        let img = match image::open(p) {
+            Ok(i) => i.to_rgb8(),
+            Err(_) => continue,
+        };
+        let (iw, ih) = (img.width() as i64, img.height() as i64);
+        let (x1, y1) = ((b.0 - 8).max(0), (b.1 - 8).max(0));
+        let (x2, y2) = ((b.2 + 8).min(iw), (b.3 + 8).min(ih));
+        if x2 <= x1 || y2 <= y1 {
+            continue;
+        }
+        let crop = image::imageops::crop_imm(&img, x1 as u32, y1 as u32, (x2 - x1) as u32, (y2 - y1) as u32)
+            .to_image();
+        let nh = ((crop.height() as f64 * WIDTH as f64 / crop.width() as f64).round() as u32).max(1);
+        crops.push(image::imageops::resize(&crop, WIDTH, nh, image::imageops::FilterType::Triangle));
+    }
+    if crops.is_empty() {
+        return Ok(());
+    }
+    let gap = 6u32;
+    let total: u32 = crops.iter().map(|c| c.height() + gap).sum();
+    let mut canvas = RgbImage::from_pixel(WIDTH, total, image::Rgb([220, 0, 0]));
+    let mut y = 0i64;
+    for c in &crops {
+        image::imageops::replace(&mut canvas, c, 0, y);
+        y += c.height() as i64 + gap as i64;
+    }
+    canvas.save(out).map_err(|e| e.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // localisation + removal
 // ---------------------------------------------------------------------------
@@ -2689,5 +2893,47 @@ mod tests {
             assert!(hit >= 2, "{tag}: learned profile localises on only {hit}/{total} frames");
             println!("{tag}: strategy=batch fit={fit:.3} self_check={hit}/{total} mean={mean:.1}");
         }
+    }
+
+    /// `mine_watermarks` 必须把**不同款水印**分到不同簇。豆包与千问的检测框尺寸漂移
+    /// 都很大（豆包 853x200 / 1149x298 / 1014x227），若拿检测框大小当标识或按短边
+    /// 归一，会把同款水印拆成多簇。实测豆包四张的落位 0.964~1.000、千问三张
+    /// 0.969~1.000（按 w/h 分别归一）→ 各成一簇。`--ignored`（慢，数分钟）。
+    #[test]
+    #[ignore]
+    fn mine_watermarks_groups_by_watermark() {
+        let root = crate::project_root();
+        let names = ["dist/1.png", "dist/2.png", "dist/3.png", "dist/7.png", "dist/9.png", "dist/10.png"];
+        let paths: Vec<PathBuf> = names.iter().map(|n| root.join(n)).collect();
+        if !paths.iter().all(|p| p.exists()) {
+            return;
+        }
+        let (profiles, rep) = mine_watermarks(
+            &paths,
+            "mine-test",
+            [255.0, 255.0, 255.0],
+            None,
+            None,
+            3,
+            12.0,
+            0.05,
+            None,
+            false,
+        )
+        .unwrap();
+        let ids: Vec<&str> = profiles.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(profiles.len(), 2, "expected 2 watermarks, got {ids:?}: {rep}");
+        assert!(ids.contains(&"mine-test-2848x1600"), "missing doubao cluster: {ids:?}");
+        assert!(ids.contains(&"mine-test-1760x2368"), "missing qwen cluster: {ids:?}");
+        // 两个簇都要走 batch 策略、且自检在**自己那簇的每一张**上都定位到（没到
+        // min_samples 的簇不算，它们带 reason）。
+        let clusters = rep["clusters"].as_array().unwrap();
+        let usable: Vec<&Value> = clusters.iter().filter(|c| c.get("reason").is_none()).collect();
+        assert_eq!(usable.len(), 2, "expected 2 usable clusters: {rep}");
+        for c in usable {
+            assert_eq!(c["learn"]["strategy"].as_str(), Some("batch"), "{c}");
+            assert_eq!(c["self_check"]["located"], c["self_check"]["samples"], "partial localisation: {c}");
+        }
+        println!("mined {ids:?}");
     }
 }
