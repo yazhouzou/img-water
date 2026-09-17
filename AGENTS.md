@@ -45,7 +45,7 @@ $P $S --root /path run            # 项目外目录
 1. **自动检测（默认）**：全图白字 + 右下兜底，框过**字符行判据**，膨胀只可 5x5 一次（阈值/判据参数见 `docs/lessons.md` §10）。
 2. **只留贴右下角的框**（豆包必贴右下），分散水印用 `--mask-box`。
 3. **检不到 → 跳过**（空 mask 不进模型）；`--mask-box` 指定则强制。
-4. **模板笔画 mask**：豆包字形固定，资产 `tools/doubao-wm-template.png`/`.json`；按短边缩放后在右下角 40px 窗口用**顶帽 gap-score** 匹配，命中写连续 α 笔画 mask（`tools/doubao-wm-alpha.png`）并写 `.tpl`；不足回退整框，再不到则空 mask 跳过。
+4. **模板 footprint mask**：豆包字形固定，资产 `tools/doubao-wm-template.png`/`.json`；按短边缩放后在右下角 40px 窗口用**顶帽 gap-score** 匹配；命中写 mask 并写 `.tpl`。mask 来源优先级：**stamp 完整 footprint**（`tools/doubao-wm-stamp-alpha.png`，含暗色描边/抗锯齿，α>0.03）> 模板亮字 α（`tools/doubao-wm-alpha.png`，**仅亮字核心、漏描边**）> 二值模板。**必须用含描边的完整 footprint**——只盖亮字会在低对比背景（木纹/纸面）MAT 重绘后留暗字形残影，且 gap-score 判据检测不到暗描边（会误判 PASS）。不足回退整框，再不到则空 mask 跳过。
 5. **模板命中即完成**（非 `--any-position`）。
 6. **空 source 防御**：全部无 mask 透传时 source 为空，必须跳过 iopaint（空目录报 `invalid --image` 退出 255）。
 7. **`--refine`（框内笔画精分割）默认关、实验性**：Python 由 `--refine` 开；Rust/App 由 `--refine`／UI「框选区域精细处理」（默认勾选）开，精分割留残留自动退化整框（详见 `desktop/AGENTS.md`）。
@@ -54,10 +54,11 @@ $P $S --root /path run            # 项目外目录
 
 ## 验证、备份与质量标准
 - **验证（`verify_paths`）**：`overwrite-review`/`review-lama` 打印 `[PASS]/[WARN]/[FAIL]`，**FAIL 拒绝覆盖**（`--force` 强制）。判据：① mask 外零改动（mask 外差异 >2 即 FAIL，必是 bug）；② 模板残留（`.tpl` 原图命中而修复后仍命中 → FAIL/WARN）；③ mask 面积 >8% 告警。
-- **残留重试（默认开、1 轮、`--no-retry` 关）**：残留 FAIL 时 mask 膨胀一级（`RETRY_DILATE=5x5`）隔离重跑；仍残留交 `overwrite-review` 拒绝。
+- **残留重试（默认开、1 轮、`--no-retry` 关）**：残留判定 = 绝对分 ≥ `TEMPLATE_MIN_SCORE`(20) 或 相对分 ≥ 原分 `TEMPLATE_RESIDUAL_RATIO`(0.2) 且 ≥ `TEMPLATE_RESIDUAL_FLOOR`(8)——低对比残影达不到 20，靠相对判据兜底。命中即 mask 膨胀一级（`RETRY_DILATE=5x5`）隔离重跑；仍残留交 `overwrite-review` 拒绝。
 - **备份**：`original-watermark-backup/` 不存在才复制、不覆盖；通过后删备份与 `/tmp` 复查产物。
 - **覆盖安全（md5）**：prepare 记源 md5 到 `WORK/manifest.json`，`overwrite-review` 覆盖前校验，不一致/无 manifest 拒绝。**`--root` 不得指向 `dist/`**。
 - **回归**：`tools/watermark_regression.py`（L1 快；`--e2e --model lama` 慢），非零退出可接 CI；改管线后先 `verify` 再回归。
+- **新增功能不得影响老功能**：改 mask/检测/管线时，老路径（豆包模板命中、已去水印跳过）的默认行为必须逐字节不变；任何新能力须同时在 `watermark_regression.py` 增加防回归用例（尤其"暗描边/低对比残影"这类 gap-score 测不到的盲区），CI 不绿不许合并。
 - **质量标准**：① 无水印残留；② 背景纹理自然无矩形糊块；③ 不破坏主体/边缘/地面/水面；④ 回复前必须完成**落盘复查**。
 
 ## 会话与提效

@@ -55,6 +55,14 @@ TEMPLATE_META = TEMPLATE_ASSET.with_suffix('.json')
 # 沙滩 96 / 纸面 33；已去水印图（负样本）≤8.4。阈值 20 取中间空档：3.png 纸面
 # 低对比水印并入模板路径走笔画级 α mask，避免回退整框重绘抹平纸面折痕。
 TEMPLATE_MIN_SCORE = 20.0
+# 相对残留判据（触发自动重试）：模板笔画 α mask 只覆盖亮字核心，盖不住豆包水印的
+# 暗色描边——低对比背景（4.png 纸面）上 MAT 只重绘笔画区，暗描边残留成字形凹痕。
+# 修复后模板分本应大幅下降（高对比图 120→<5，去除率 >95%）；残影图的残留占比很高
+# （4.png 43.2→10.7，约 25%），故用相对下降比例而非绝对分兜底：残留 ≥ 原分 20% 且
+# ≥ 8（高于已去水印负样本 ≤8.4 的底噪，避免干净图误触发）时重试。绝对阈值 20 只
+# 用于 FAIL 判定，低对比残影达不到 20 会被放过（本 bug 的根因）。
+TEMPLATE_RESIDUAL_RATIO = 0.2
+TEMPLATE_RESIDUAL_FLOOR = 8.0
 # 连续 α mask：水印真正污染的像素是 α>0（含抗锯齿带），二值模板（α>0.5）只覆盖
 # 笔画核心，只能靠大膨胀补抗锯齿，代价是多盖 ~30% 干净画面被模型重绘（"影响周边
 # 元素"的根因）。改用从黑底 2.png 提取的连续 α 图（tools/doubao-wm-alpha.png，
@@ -63,6 +71,13 @@ TEMPLATE_MIN_SCORE = 20.0
 # 1.png 沙粒保留明显多于二值+7x7；改动面积 -10%~-30%）。
 TEMPLATE_ALPHA_THRESHOLD = 8  # 0..255，约 α>0.03
 TEMPLATE_STROKE_DILATE = (3, 3)  # ±1px，仅补偿缩放/对齐误差
+# 模板 mask 的来源优先级：stamp 完整 footprint（含暗色描边/抗锯齿，α>0.03）> 模板亮字
+# α（仅亮字核心）> 二值模板。只盖亮字的 mask 漏掉水印暗色描边——低对比背景（2.png
+# 木纹、4.png 纸面）上 MAT 重绘后描边残留成暗字形（模板分消不掉，因为判据只看"亮于
+# 背景"的 gap）。stamp α 从多样张联立标定，覆盖整条字形+描边，用它做 mask 后模板分
+# 直接归零。OPEN 清掉标定背景残差产生的孤立低 α 点，避免干净背景被点状重绘。
+STAMP_MASK_THRESHOLD = 8  # 0..255，约 α>0.03
+STAMP_MASK_OPEN = (3, 3)
 # refine（--refine 实验性框内笔画精分割）仍用较大核连接笔画碎片
 REFINE_DILATE_MAT = (7, 7)
 REFINE_DILATE_LAMA = (19, 11)
@@ -157,7 +172,16 @@ def template_stroke_mask(gray, width, height, model='mat'):
     score = float(response[py, px])
     if score < TEMPLATE_MIN_SCORE:
         return None, score, f'template score {score:.1f} < {TEMPLATE_MIN_SCORE}'
-    if alpha is not None:
+    stamp_a, _ = _load_stamp()
+    if stamp_a is not None:
+        # stamp 完整 footprint（含暗色描边）：只盖亮字的 mask 会在低对比背景留暗字形
+        sa = cv2.resize(stamp_a, (tw_t, th_t), interpolation=cv2.INTER_LINEAR)
+        core = (sa * 255.0 > STAMP_MASK_THRESHOLD).astype(np.uint8)
+        core = cv2.morphologyEx(
+            core, cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, STAMP_MASK_OPEN))
+        how = 'stamp footprint'
+    elif alpha is not None:
         a = cv2.resize(alpha, (tw_t, th_t), interpolation=cv2.INTER_LINEAR)
         core = (a * 255.0 > TEMPLATE_ALPHA_THRESHOLD).astype(np.uint8)
         how = 'alpha'
@@ -1058,8 +1082,11 @@ def verify_paths(orig_path, res_path, mask_path, outside_tol=2, warn_ratio=0.08,
                             and abs(scale - 1.0) <= INVERSE_SCALE_TOL)
     # 结构化残留标记：供自动重试逻辑判定"是否因水印残留而不完美"
     # （区别于 mask 外改动——那是工程 bug，重试无法修复）
-    report['residual'] = bool(template_applied and orig_score >= TEMPLATE_MIN_SCORE
-                              and res_score >= TEMPLATE_MIN_SCORE)
+    report['residual'] = bool(
+        template_applied and orig_score >= TEMPLATE_MIN_SCORE
+        and (res_score >= TEMPLATE_MIN_SCORE
+             or (res_score >= TEMPLATE_RESIDUAL_FLOOR
+                 and res_score >= orig_score * TEMPLATE_RESIDUAL_RATIO)))
     verdict = 'PASS'
     if report['outside_changed'] > 0:
         verdict = 'FAIL'

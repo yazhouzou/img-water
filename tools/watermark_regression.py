@@ -239,7 +239,7 @@ def run_verify_checks(rdw, only):
         rgb = im.convert('RGB')
         w, h = rgb.size
         gray = np.array(rgb).max(axis=2).astype(np.float32)
-    mask_arr, _, _ = rdw.template_stroke_mask(gray, w, h)
+    mask_arr, _, info = rdw.template_stroke_mask(gray, w, h)
     if mask_arr is None:
         return rows
     tmp = Path(tempfile.mkdtemp(prefix='wm-verify-'))
@@ -289,6 +289,31 @@ def run_verify_checks(rdw, only):
         rdw._retry_inpaint = saved_retry
     rows.append(({**base, 'name': 'auto-retry expands mask'},
                  after > before, f'{before}->{after}'))
+    # mask 必须覆盖水印完整 footprint（含暗色描边），而非仅亮字核心：只盖亮字的 mask
+    # 会在低对比背景（木纹/纸面）MAT 重绘后留暗字形残影，而 gap-score 判据测不到暗
+    # 描边会误判 PASS（2.png/4.png 的真实回归）。这条锁死"mask 来源必须是含描边的
+    # stamp footprint"，防止日后又退回只用模板亮字 α。
+    import re as _re
+    import cv2 as _cv2
+    m_pos = _re.search(r'at \((\d+),(\d+)\)', info or '')
+    tpl, alpha, meta = rdw.load_template()
+    stamp_a, _ = rdw._load_stamp()
+    if m_pos and stamp_a is not None and alpha is not None:
+        px, py = int(m_pos.group(1)), int(m_pos.group(2))
+        scale = min(h, w) / meta['ref_short_side']
+        th = int(round(stamp_a.shape[0] * scale))
+        tw = int(round(stamp_a.shape[1] * scale))
+        sa = _cv2.resize(stamp_a, (tw, th), interpolation=_cv2.INTER_LINEAR)
+        ta = _cv2.resize(alpha, (tw, th), interpolation=_cv2.INTER_LINEAR)
+        # 描边区 = stamp footprint 有、模板亮字 α 没有的像素
+        outline = ((sa * 255.0 > rdw.STAMP_MASK_THRESHOLD)
+                   & (ta * 255.0 <= rdw.TEMPLATE_ALPHA_THRESHOLD))
+        sub = mask_arr[py:py + th, px:px + tw] > 0
+        cov = float(sub[outline].mean()) if outline.any() else 1.0
+        rows.append(({'group': 'footprint', 'name': 'mask covers dark outline',
+                      'expect': 'ok'},
+                     bool(outline.any()) and cov >= 0.9,
+                     f'outline {int(outline.sum())}px covered {cov * 100:.1f}%'))
     rmtree(tmp, ignore_errors=True)
     return rows
 
