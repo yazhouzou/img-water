@@ -152,6 +152,27 @@ function closeLightbox() {
   lightbox.querySelector('img').src = '';
 }
 
+// Android 返回键（MainActivity 经 evaluateJavascript 调用）：
+// 返回 true = 已消费（关闭了弹层或正在处理），返回 false = 交由原生退出应用。
+window.__onAndroidBack = () => {
+  const lightbox = document.getElementById('lightbox');
+  if (lightbox && lightbox.classList.contains('open')) {
+    closeLightbox();
+    return true;
+  }
+  if (!els.maskOverlay.hidden) {
+    closeMaskEditor();
+    return true;
+  }
+  if (!els.disclaimerOverlay.hidden) {
+    els.disclaimerOverlay.hidden = true;
+    return true;
+  }
+  // 处理中拦下返回，避免进程被杀导致任务中断、输出半成品
+  if (running) return true;
+  return false;
+};
+
 function escapeHtml(text) {
   return text.replace(/[&<>"']/g, (ch) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -528,6 +549,32 @@ function renderExitBanner(payload) {
         invoke('open_path', { path: payload.outputDir, lang: window.i18n.lang }).catch((err) => logLine(t('logError')(String(err))));
       });
       els.resultBanner.appendChild(btn);
+    } else if (isMobile) {
+      const paths = payload.outputs || [];
+      const wrap = document.createElement('div');
+      wrap.className = 'banner-actions';
+      const mk = (label, cmd, doneText, failText, noneText) => {
+        const btn = document.createElement('button');
+        btn.className = 'btn small primary';
+        btn.type = 'button';
+        btn.textContent = label;
+        btn.disabled = paths.length === 0;
+        btn.addEventListener('click', async () => {
+          btn.disabled = true;
+          try {
+            const n = await invoke(cmd, { paths, lang: window.i18n.lang });
+            logLine(n > 0 ? doneText(n) : noneText);
+          } catch (err) {
+            logLine(failText(String(err)));
+          } finally {
+            btn.disabled = false;
+          }
+        });
+        return btn;
+      };
+      wrap.appendChild(mk(t('exportGallery'), 'export_results', t('exportDone'), t('exportFailed'), t('exportNone')));
+      wrap.appendChild(mk(t('shareResults'), 'share_results', t('shareDone'), t('shareFailed'), t('shareNone')));
+      els.resultBanner.appendChild(wrap);
     }
   } else if (payload.cancelled) {
     els.resultBanner.textContent = t('cancelledBanner');

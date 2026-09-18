@@ -367,6 +367,7 @@ fn run_pipeline(
                         "code": 0,
                         "success": true,
                         "outputDir": summary.output_dir.display().to_string(),
+                        "outputs": summary.outputs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                         "processed": summary.processed,
                         "overwritten": options.overwrite_original,
                     }),
@@ -428,6 +429,64 @@ fn open_path(path: String, lang: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// 「保存到相册」：Android 用 MediaStore 写入 Pictures/WatermarkCleaner（免权限）。
+#[tauri::command]
+fn export_results(
+    window: tauri::WebviewWindow,
+    paths: Vec<String>,
+    lang: Option<String>,
+) -> Result<usize, String> {
+    let lang = lang_of(lang);
+    if paths.is_empty() {
+        return Err(tr(&lang, "没有可保存的图片", "No images to export"));
+    }
+    do_export(&window, &paths)
+}
+
+#[cfg(target_os = "android")]
+fn do_export(window: &tauri::WebviewWindow, paths: &[String]) -> Result<usize, String> {
+    crate::android_export::export_to_gallery(window, paths)
+}
+
+#[cfg(not(target_os = "android"))]
+fn do_export(_window: &tauri::WebviewWindow, _paths: &[String]) -> Result<usize, String> {
+    Err("Save to gallery is only available on Android".to_string())
+}
+
+/// 「分享」：Android 走系统分享面板（FileProvider + ACTION_SEND），接收方应用可存相册。
+#[tauri::command]
+fn share_results(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    paths: Vec<String>,
+    lang: Option<String>,
+) -> Result<usize, String> {
+    let lang = lang_of(lang);
+    if paths.is_empty() {
+        return Err(tr(&lang, "没有可分享的图片", "No images to share"));
+    }
+    let cache = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+    do_share(&window, &cache, &paths)
+}
+
+#[cfg(target_os = "android")]
+fn do_share(
+    window: &tauri::WebviewWindow,
+    cache: &std::path::Path,
+    paths: &[String],
+) -> Result<usize, String> {
+    crate::android_export::share_via_system(window, cache, paths)
+}
+
+#[cfg(not(target_os = "android"))]
+fn do_share(
+    _window: &tauri::WebviewWindow,
+    _cache: &std::path::Path,
+    _paths: &[String],
+) -> Result<usize, String> {
+    Err("Sharing is only available on Android".to_string())
+}
+
 #[tauri::command]
 fn cleanup_pipeline(storage: State<'_, AppStorage>, lang: Option<String>) -> Result<(), String> {
     let lang = lang_of(lang);
@@ -474,6 +533,20 @@ fn import_files(app: AppHandle, window: tauri::WebviewWindow, paths: Vec<String>
         .as_millis();
     let dir = base.join(format!("import-{}", stamp));
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // 换批即替换：删掉上一次导入的副本目录（含其 watermark-cleaned 结果）。否则每次选图
+    // 都往应用私有目录里塞一份照片副本，永久累积且用户无法感知。结果导出走「保存到相册/
+    // 分享」，故这里保留当前这一批即可。
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let is_old_import = p.file_name()
+                .map(|n| n.to_string_lossy().starts_with("import-"))
+                .unwrap_or(false);
+            if is_old_import && p != dir {
+                let _ = std::fs::remove_dir_all(&p);
+            }
+        }
+    }
     let mut names: Vec<String> = Vec::new();
     for (index, raw) in paths.iter().enumerate() {
         let name = copy_one(&window, raw, &dir, index, &names, &lang)?;
@@ -591,6 +664,8 @@ pub fn run_tauri_app() {
             cancel_pipeline,
             open_path,
             cleanup_pipeline,
+            export_results,
+            share_results,
             read_image_base64
         ])
         .build(tauri::generate_context!())

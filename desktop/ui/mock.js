@@ -43,6 +43,7 @@
       processed: FAKE_PNGS.length,
       overwritten: false,
       outputDir: '/mock/Pictures/watermark/watermark-cleaned',
+      outputs: FAKE_PNGS.map((n) => '/mock/Pictures/watermark/watermark-cleaned/' + n),
     });
   }
 

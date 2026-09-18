@@ -328,6 +328,8 @@ body {
 }
 .result-banner.ok { background: #e8f7ee; color: var(--ok); }
 .result-banner.err { background: #fdecec; color: var(--danger); }
+.banner-actions { display: flex; gap: 8px; margin-top: 8px; }
+.banner-actions .btn { flex: 1; }
 
 .log {
   flex: 1;

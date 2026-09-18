@@ -2223,6 +2223,8 @@ pub struct RunSummary {
     pub cancelled: bool,
     pub processed: usize,
     pub output_dir: PathBuf,
+    /// 落盘后的结果文件绝对路径（供移动端「保存到相册/分享」直接使用）。
+    pub outputs: Vec<PathBuf>,
 }
 
 pub fn run(
@@ -2247,6 +2249,7 @@ pub fn run(
     let candidate_review = review_lama(&names, &options.root)?;
     let final_review = finalize_outputs(options, &names, log)?;
     let output_dir_path = output_dir(options);
+    let outputs: Vec<PathBuf> = names.iter().map(|n| output_dir_path.join(n)).collect();
     if options.keep_work {
         return Ok(RunSummary {
             source_review,
@@ -2256,6 +2259,7 @@ pub fn run(
             cancelled: false,
             processed: names.len(),
             output_dir: output_dir_path,
+            outputs,
         });
     }
     let (source_review, candidate_review, final_review) =
@@ -2274,6 +2278,7 @@ pub fn run(
         cancelled: false,
         processed: names.len(),
         output_dir: output_dir_path,
+        outputs,
     })
 }
 
