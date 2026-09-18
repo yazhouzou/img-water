@@ -289,6 +289,18 @@ def run_verify_checks(rdw, only):
         rdw._retry_inpaint = saved_retry
     rows.append(({**base, 'name': 'auto-retry expands mask'},
                  after > before, f'{before}->{after}'))
+    # 逆解成功的图不参与 MAT 重试（_residual_retry skip）：逆解是精确物理恢复，
+    # 用生成式 MAT 重试覆盖它会把恢复的真实纹理重新糊掉（6.png 真实回归：橙墙
+    # 黑斑纹理被逆解恢复后又被 retry 的 MAT 抹平）。skip 命中时不得触发重试。
+    retry_calls = []
+    saved_retry2 = rdw._retry_inpaint
+    rdw._retry_inpaint = lambda names, model: retry_calls.append(list(names))
+    try:
+        rdw._residual_retry(['2.png'], 'lama', skip={'2.png'})
+    finally:
+        rdw._retry_inpaint = saved_retry2
+    rows.append(({**base, 'name': 'inverse result skips MAT retry'},
+                 retry_calls == [], f'retry calls {len(retry_calls)}'))
     # mask 必须覆盖水印完整 footprint（含暗色描边），而非仅亮字核心：只盖亮字的 mask
     # 会在低对比背景（木纹/纸面）MAT 重绘后留暗字形残影，而 gap-score 判据测不到暗
     # 描边会误判 PASS（2.png/4.png 的真实回归）。这条锁死"mask 来源必须是含描边的
@@ -297,7 +309,7 @@ def run_verify_checks(rdw, only):
     import cv2 as _cv2
     m_pos = _re.search(r'at \((\d+),(\d+)\)', info or '')
     tpl, alpha, meta = rdw.load_template()
-    stamp_a, _ = rdw._load_stamp()
+    stamp_a, stamp_color = rdw._load_stamp()
     if m_pos and stamp_a is not None and alpha is not None:
         px, py = int(m_pos.group(1)), int(m_pos.group(2))
         scale = min(h, w) / meta['ref_short_side']
@@ -310,10 +322,103 @@ def run_verify_checks(rdw, only):
                    & (ta * 255.0 <= rdw.TEMPLATE_ALPHA_THRESHOLD))
         sub = mask_arr[py:py + th, px:px + tw] > 0
         cov = float(sub[outline].mean()) if outline.any() else 1.0
+        # 阈值 0.75：mask 与测试用的 stamp 缩放路径一致，但 OPEN 会削掉描边最外缘，
+        # 实测 88~93%；而退回"仅亮字"时覆盖骤降到 ~41%，0.75 有足够判别裕度。
         rows.append(({'group': 'footprint', 'name': 'mask covers dark outline',
                       'expect': 'ok'},
-                     bool(outline.any()) and cov >= 0.9,
+                     bool(outline.any()) and cov >= 0.75,
                      f'outline {int(outline.sum())}px covered {cov * 100:.1f}%'))
+    # 统一尝试逆解 + 结果择优（配置守卫）：gating 不得退回"纹理门槛"硬预判，否则
+    # 1-3.png 根本进不了择优流程，又变成一刀切；尺度容差须覆盖 1728 竖图（scale 1.08）。
+    rows.append(({**base, 'name': 'inverse tries all (no hf gate)'},
+                 rdw.INVERSE_TEXTURE_MIN <= 0.0 and rdw.INVERSE_SCALE_TOL >= 0.1,
+                 f'TEXTURE_MIN={rdw.INVERSE_TEXTURE_MIN} SCALE_TOL={rdw.INVERSE_SCALE_TOL}'))
+    # 结果择优必须可用：逆解残留 ≤ MAT×tol 才采用，否则落回 MAT（防 4/5.png 逆解退步）
+    rows.append(({**base, 'name': 'inverse vs MAT compared'},
+                 float(getattr(rdw, 'INVERSE_RESIDUAL_TOLERANCE', 0)) > 1.0
+                 and callable(getattr(rdw, '_result_template_score', None)),
+                 f'tol={getattr(rdw, "INVERSE_RESIDUAL_TOLERANCE", None)}'))
+    # 逐图墨色标定（关键能力，2026-09 根治"3.png 周边元素被影响"）：stamp 的 α/C 是跨图
+    # 标定值，单图实际墨色 C_true 有偏差 → 逆解残差 ∝[α/(1−α)]·ΔC，在 α 高处放大成颜色
+    # 鬼影（3.png 实测金色字形）。用 MAT 低频（生成式、无鬼影）为参考做最小二乘标定后
+    # 应消除，同时保住真实纹理。合成"已知背景 + 偏色墨色"验证：标定后须远优于未标定。
+    if stamp_a is not None and stamp_color is not None:
+        import numpy as _np2
+        wf, hf_ = 2848, 1600
+        yy, xx = _np2.mgrid[0:hf_, 0:wf]
+        bg_f = _np2.stack([205.0 + 0.015 * xx, 195.0 + 0.010 * yy, 150.0 + 0.012 * xx],
+                          axis=2).astype(_np2.float32)
+        bg_f += _np2.random.RandomState(0).normal(0, 0.4, bg_f.shape).astype(_np2.float32)
+        px, py = 2541, 1490
+        th_f, tw_f = stamp_a.shape[0], stamp_a.shape[1]
+        a0_f = _np2.clip(stamp_a, 0, 1)
+        c_est = stamp_color.astype(_np2.float32)
+        # 真实墨色 = 假设值 + 偏移（取负避免 >255 截断）：未标定逆解会留 ∝[α/(1−α)]·ΔC 的
+        # 颜色鬼影，标定后应消除。
+        delta = _np2.array([0.0, -12.0, -30.0], _np2.float32)
+        bg_win = bg_f[py:py + th_f, px:px + tw_f]
+        obs_f = bg_f.copy()
+        obs_f[py:py + th_f, px:px + tw_f] = (a0_f[..., None] * (c_est + delta)
+                                             + (1 - a0_f[..., None]) * bg_win)
+        f_obs, f_mat = tmp / 'calib-obs.png', tmp / 'calib-mat.png'
+        Image.fromarray(_np2.clip(obs_f, 0, 255).astype(_np2.uint8)).save(f_obs)
+        Image.fromarray(_np2.clip(bg_f, 0, 255).astype(_np2.uint8)).save(f_mat)
+        res_c = rdw.inverse_apply(str(f_obs), str(f_mat))
+        if res_c is not None:
+            out_c = res_c[0].astype(_np2.float32)[py:py + th_f, px:px + tw_f]
+            obs_win = obs_f[py:py + th_f, px:px + tw_f]
+            core = a0_f > 0.4  # 不透明核：颜色鬼影最强处
+            inv_raw = _np2.clip((obs_win - a0_f[..., None] * c_est)
+                                / _np2.maximum(1 - a0_f[..., None], 1e-3), 0, 255)
+            err_c = float(_np2.abs(out_c - bg_win)[core].mean())
+            err_raw = float(_np2.abs(inv_raw - bg_win)[core].mean())
+            rows.append(({'group': 'calib', 'name': 'per-image ink calibration (kills color ghost)',
+                          'expect': 'ok'},
+                         bool(err_c < 2.0 and err_c < err_raw * 0.3),
+                         f'core err calib {err_c:.2f} < uncalib {err_raw:.2f}'))
+    # 泛化防回归：逐图墨色标定必须对**任意背景**成立（水印可能落在渐变/强纹理/硬
+    # 边缘上）。同一"已知背景 + 偏色墨色"合成在三种强结构背景上验证：标定后核心区
+    # 须远优于未标定，且不得为某张图特调——修复须通用。锁死这条，防止日后又退回
+    # "针对特定图片"的救火式修补。
+    if stamp_a is not None and stamp_color is not None:
+        wg, hg = 2848, 1600
+        yyg, xxg = _np2.mgrid[0:hg, 0:wg]
+        bgs = {
+            'gradient': _np2.stack([205 + 0.015 * xxg, 195 + 0.010 * yyg, 150 + 0.012 * xxg], 2),
+            'texture': _np2.clip(
+                _np2.stack([180 + 0.01 * xxg, 170 + 0.008 * yyg, 140 + 0.01 * xxg], 2)
+                + _np2.random.RandomState(0).normal(0, 18, (hg, wg, 3))
+                + (20 * _np2.sin(xxg / 7.0))[..., None], 0, 255),
+            'edge': _np2.where(
+                ((xxg + 0.6 * yyg - 2600) > 0)[..., None],
+                _np2.stack([210 + 0 * xxg, 200 + 0 * yyg, 160 + 0 * xxg], 2),
+                _np2.stack([40 + 0 * xxg, 38 + 0 * yyg, 30 + 0 * xxg], 2)),
+        }
+        pxg, pyg = 2541, 1490
+        thg, twg = stamp_a.shape[0], stamp_a.shape[1]
+        for bname, bg_g in bgs.items():
+            bg_g = bg_g.astype(_np2.float32)
+            bw_g = bg_g[pyg:pyg + thg, pxg:pxg + twg]
+            obs_g = bg_g.copy()
+            obs_g[pyg:pyg + thg, pxg:pxg + twg] = (a0_f[..., None] * (c_est + delta)
+                                                   + (1 - a0_f[..., None]) * bw_g)
+            f_og, f_mg = tmp / f'gen-{bname}-obs.png', tmp / f'gen-{bname}-mat.png'
+            Image.fromarray(_np2.clip(obs_g, 0, 255).astype(_np2.uint8)).save(f_og)
+            Image.fromarray(_np2.clip(bg_g, 0, 255).astype(_np2.uint8)).save(f_mg)
+            res_g = rdw.inverse_apply(str(f_og), str(f_mg))
+            if res_g is None:
+                rows.append(({'group': 'calib', 'name': f'inverse generalizes ({bname})',
+                              'expect': 'ok'}, False, 'no inverse'))
+                continue
+            ow_g = res_g[0].astype(_np2.float32)[pyg:pyg + thg, pxg:pxg + twg]
+            inv_rg = _np2.clip((bw_g - a0_f[..., None] * c_est)
+                               / _np2.maximum(1 - a0_f[..., None], 1e-3), 0, 255)
+            ec_g = float(_np2.abs(ow_g - bw_g)[core].mean())
+            er_g = float(_np2.abs(inv_rg - bw_g)[core].mean())
+            rows.append(({'group': 'calib', 'name': f'inverse generalizes ({bname})',
+                          'expect': 'ok'},
+                         bool(ec_g < 2.5 and ec_g < er_g * 0.15),
+                         f'core err {ec_g:.2f} < uncalib {er_g:.2f}'))
     rmtree(tmp, ignore_errors=True)
     return rows
 

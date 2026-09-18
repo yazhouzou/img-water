@@ -25,7 +25,7 @@
 # 分步（默认）：prepare→inpaint→review-lama→overwrite-review→cleanup
 P=.img-inpaint-venv/bin/python; S=tools/remove_doubao_watermark.py
 $P $S prepare [文件]
-$P $S inpaint [文件]              # 默认逐图择优：复杂纹理 scale≈1.0 走 stamp 逆解，其余 MAT；残留自动重试 1 轮
+$P $S inpaint [文件]              # 逐图统一尝试 stamp 逆解（逐图标定 gain+墨色 C：以 MAT 低频为参考最小二乘，消颜色鬼影并保真实纹理）+ 结果择优（残留 ≤ MAT×1.75+2 且 <20 且 无正字形残影 才采用，否则落回 MAT）；残留自动重试 1 轮（逆解图跳过）
 $P $S --no-inverse inpaint [文件] # 强制全 MAT
 $P $S --no-retry inpaint [文件]   # 关残留重试
 $P $S review-lama [文件]          # 候选复查图 + PASS/WARN/FAIL
@@ -54,7 +54,7 @@ $P $S --root /path run            # 项目外目录
 
 ## 验证、备份与质量标准
 - **验证（`verify_paths`）**：`overwrite-review`/`review-lama` 打印 `[PASS]/[WARN]/[FAIL]`，**FAIL 拒绝覆盖**（`--force` 强制）。判据：① mask 外零改动（mask 外差异 >2 即 FAIL，必是 bug）；② 模板残留（`.tpl` 原图命中而修复后仍命中 → FAIL/WARN）；③ mask 面积 >8% 告警。
-- **残留重试（默认开、1 轮、`--no-retry` 关）**：残留判定 = 绝对分 ≥ `TEMPLATE_MIN_SCORE`(20) 或 相对分 ≥ 原分 `TEMPLATE_RESIDUAL_RATIO`(0.2) 且 ≥ `TEMPLATE_RESIDUAL_FLOOR`(8)——低对比残影达不到 20，靠相对判据兜底。命中即 mask 膨胀一级（`RETRY_DILATE=5x5`）隔离重跑；仍残留交 `overwrite-review` 拒绝。
+- **残留重试（默认开、1 轮、`--no-retry` 关）**：残留判定 = 绝对分 ≥ `TEMPLATE_MIN_SCORE`(20) 或 相对分 ≥ 原分 `TEMPLATE_RESIDUAL_RATIO`(0.2) 且 ≥ `TEMPLATE_RESIDUAL_FLOOR`(8)——低对比残影达不到 20，靠相对判据兜底。命中即 mask 膨胀一级（`RETRY_DILATE=5x5`）隔离重跑；仍残留交 `overwrite-review` 拒绝。**逆解已生效的图跳过重试**——逆解是精确物理恢复，生成式 MAT 重试会把它重新糊掉（`.tpl`/`.wprof` 侧车标记者不入重试候选）。
 - **备份**：`original-watermark-backup/` 不存在才复制、不覆盖；通过后删备份与 `/tmp` 复查产物。
 - **覆盖安全（md5）**：prepare 记源 md5 到 `WORK/manifest.json`，`overwrite-review` 覆盖前校验，不一致/无 manifest 拒绝。**`--root` 不得指向 `dist/`**。
 - **回归**：`tools/watermark_regression.py`（L1 快；`--e2e --model lama` 慢），非零退出可接 CI；改管线后先 `verify` 再回归。

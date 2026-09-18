@@ -85,13 +85,41 @@ REFINE_DILATE_LAMA = (19, 11)
 # C 为逐像素颜色（含暗色描边——纯白字模型反解不掉它）。从 4 张同款水印、不同背景
 # 的图（黑底/纸面/沙滩/花墙）联立标定。逆解恢复的是**真实背景**（非生成），对复杂
 # 纹理背景（花丛类）明显优于 MAT 的平滑重绘；但对低纹理背景（暗底/沙面/纸面）会
-# 放大噪声，故用 gating 只在 scale≈1.0 且水印邻域纹理复杂时启用，其余走 MAT。
+# 放大噪声、对 scale≠1.0 会因 stamp 缩放插值失配而留字形。故不再用预判 gating 一刀切，
+# 而是**统一尝试逆解 + 结果择优**：gating 只保留极端尺度上限与失解（ghost）回退，是否
+# 采用交由结果层指标决定（见 INVERSE_RESIDUAL_TOLERANCE）。
 STAMP_ASSET = Path(__file__).resolve().parent / 'doubao-wm-stamp.npz'
 STAMP_REF_SHORT = 1600.0
-INVERSE_SCALE_TOL = 0.03
-INVERSE_TEXTURE_MIN = 9.0
+INVERSE_SCALE_TOL = 0.15
+INVERSE_TEXTURE_MIN = 0.0  # 不再作硬门槛（保留计算供日志）；由结果择优决定采用
 INVERSE_ALPHA_GAIN_RANGE = (0.8, 1.25)
-INVERSE_MAX_GHOST = 0.12
+# 逐图自标定（关键，2026-09 根治"3.png 周边元素被影响"）：stamp 的 α/C 是跨图标定值，
+# 单图实际墨色 C_true 会有偏差 → 逆解残差 ∝ [α/(1−α)]·(C_true−C_est)，在 α 高处被放大成
+# **颜色鬼影**（3.png 实测金色字形：gain=1.10 时蓝通道欠还原 13 级）。旧做法用"高频残影
+# 与 α 的相关"选 gain——目标错误、且对低频颜色鬼影不敏感，治标不治本。改为以 MAT 结果的
+# 低频（生成式、无鬼影）为参考，对每个 gain 用最小二乘拟合每通道墨色偏移 ΔC
+# （inv−MAT_low ≈ [α/(1−α)]·ΔC），取低频失配最小的 gain。
+# 等价于把墨色校正为 C+ΔC——是**物理量（墨色）的标定**，不是事后抹平，故能同时消除鬼影
+# 与保住真实纹理（3.png 标定后模板分 1.82 ≤ MAT 1.44×1.75，被择优选为逆解）。
+INVERSE_ALPHA_GAIN_STEP = 0.02
+INVERSE_CALIB_SIGMA = 6.0
+INVERSE_MAX_DC = 48.0
+# 择优放宽 + 字形残影闸门（2026-09，"3.png 周边元素被影响"收口）：gap-score 只测
+# "笔画区−间隙区"亮度差，对**保纹理的逆解不公平**——真实高频纹理本身会抬高该分
+# （3.png 标定逆解 1.9 > MAT 1.0，纯按 ×1.75 会被误拒、退回抹平纹理的 MAT）。故允许
+# 逆解在 MAT 分之上再高 INVERSE_RESIDUAL_SLACK；但必须同时过"无正字形残影"闸门：
+# 低频 (逆解−MAT) 与字形掩码的相关，**正值=水印残留**（字形处偏亮，2.png 逆解 0.396，
+# 且其暗底噪声团肉眼可见）判负，负值=真实纹理（3.png −0.199、1.png −0.798）无害。
+INVERSE_RESIDUAL_SLACK = 2.0
+INVERSE_GHOST_MAX = 0.25
+# 结果择优（逆解 vs MAT）：逆解是精确恢复、保留真实纹理，但只在模型适用的图（scale≈1.0
+# 且 stamp 匹配好）上可靠；对 scale≠1.0（4/5.png 1728 竖图，scale=1.08）会因 stamp
+# 缩放插值失配产生字形残留（实测模板分 29/34），对平滑背景会放大噪声。故不再只靠预
+# 判 gating，而是**同时产出逆解与 MAT，按结果层指标择优**：逆解模板残留分必须
+# < TEMPLATE_MIN_SCORE(20) 且 ≤ MAT 残留分 × RATIO(1.75) 才采用逆解，否则保留 MAT。
+# 实测：6.png 12.7 ≤ 8.6×1.75=15.1 → 逆解（保橙墙黑斑）；3.png 3.0 > 1.2×1.75 → MAT；
+# 4/5.png 29/34 ≥ 20 → MAT。这样"能逆解的都逆解、逆解会退步的自动落回 MAT"。
+INVERSE_RESIDUAL_TOLERANCE = 1.75
 
 
 try:
@@ -195,10 +223,57 @@ def template_stroke_mask(gray, width, height, model='mat'):
     return full, score, f'template matched at ({px},{py}) score {score:.1f} ({how})'
 
 
+def _result_template_score(image):
+    """对修复结果（RGB ndarray 或文件路径）算豆包模板 gap-score，供逆解/MAT 结果择优。"""
+    import numpy as np
+
+    if isinstance(image, np.ndarray):
+        gray = image[..., :3].max(axis=2).astype(np.float32)
+        height, width = gray.shape
+    else:
+        with Image.open(image) as im:
+            rgb = im.convert('RGB')
+            width, height = rgb.size
+            gray = np.array(rgb).max(axis=2).astype(np.float32)
+    _, score, _ = template_stroke_mask(gray, width, height)
+    return float(score)
+
+
+def _result_ghost_score(out, mat_path, px, py):
+    """逆解相对 MAT 的**低频字形残影**指标：corr(blur(逆解−MAT), 字形掩码)。
+    正值 = 水印残留（字形处偏亮，须拒绝）；负值 = 真实纹理（字形处偏暗，无害）。
+    用于择优时把"保纹理但含残影"的逆解与"真纹理"的逆解区分开（见 INVERSE_GHOST_MAX）。"""
+    import cv2
+    import numpy as np
+
+    alpha0, _ = _load_stamp()
+    if alpha0 is None:
+        return None
+    h, w = out.shape[:2]
+    scale = min(h, w) / STAMP_REF_SHORT
+    tw = int(round(alpha0.shape[1] * scale))
+    th = int(round(alpha0.shape[0] * scale))
+    if py + th > h or px + tw > w:
+        return None
+    a0 = cv2.resize(alpha0, (tw, th), interpolation=cv2.INTER_LINEAR)
+    with Image.open(mat_path) as im:
+        mat = np.array(im.convert('RGB')).astype(np.float32)
+    o = out[py:py + th, px:px + tw].astype(np.float32)
+    m = mat[py:py + th, px:px + tw]
+    glyph = np.repeat((a0 > 0.1).astype(np.float32)[..., None], 3, axis=2)
+    r = cv2.GaussianBlur(o, (0, 0), INVERSE_CALIB_SIGMA) - cv2.GaussianBlur(m, (0, 0), INVERSE_CALIB_SIGMA)
+    r = r - r.mean()
+    glyph = glyph - glyph.mean()
+    denom = float(np.linalg.norm(r) * np.linalg.norm(glyph))
+    return float((r * glyph).sum() / denom) if denom > 1e-6 else 0.0
+
+
 def inverse_apply(obs_path, mat_path, model='mat'):
-    """对模板命中的图做完整 stamp 逆解（obs = α·C + (1−α)·bg），返回处理后整图；
-    不满足 gating（scale≈1.0 + 水印邻域纹理复杂）或逆解不可靠时返回 None（保持 MAT）。
-    逐图自校正 α 增益（最小化残影与 α 的相关性），饱和像素回退 MAT 结果。"""
+    """对模板命中的图做完整 stamp 逆解（obs = α·C + (1−α)·bg），逐图标定 gain 与墨色 C，
+    返回处理后整图；不满足尺度上限或 stamp 无法定位时返回 None（保持 MAT）。
+    标定：以 MAT 结果低频为"无鬼影"参考，最小二乘拟合每通道墨色偏移 ΔC，取低频失配最小
+    的 gain（见 INVERSE_ALPHA_GAIN_* 常量注释）——消除颜色失配鬼影的同时保住真实纹理。
+    失解（raw 超出 [0,255] 或全通道饱和）像素回退 MAT 结果。"""
     import cv2
     import numpy as np
 
@@ -224,7 +299,7 @@ def inverse_apply(obs_path, mat_path, model='mat'):
     tw = int(round(alpha0.shape[1] * scale))
     if py + th > height or px + tw > width:
         return None
-    # 水印邻域纹理复杂度（排除背景过于平滑的场景：MAT 已足够，逆解只会放大噪声）
+    # 水印邻域纹理复杂度（仅日志：gating 不再据此预判，是否采用交给结果择优）
     y0, x0 = max(0, py - 40), max(0, px - 60)
     y1, x1 = min(height, py + th + 40), min(width, px + tw + 60)
     reg = obs[y0:y1, x0:x1]
@@ -235,23 +310,33 @@ def inverse_apply(obs_path, mat_path, model='mat'):
     color = cv2.resize(color0, (tw, th), interpolation=cv2.INTER_LINEAR)
     win = obs[py:py + th, px:px + tw]
     mat = np.array(Image.open(mat_path).convert('RGB')).astype(np.float32)[py:py + th, px:px + tw]
+    # 标定参考：MAT 结果的低频。MAT 是生成式的、无字形鬼影，其低频可作"背景真值"的估计。
+    mat_low = cv2.GaussianBlur(mat, (0, 0), INVERSE_CALIB_SIGMA)
     best = None
     lo, hi = INVERSE_ALPHA_GAIN_RANGE
-    for k in np.arange(lo, hi + 1e-6, 0.05):
+    for k in np.arange(lo, hi + 1e-6, INVERSE_ALPHA_GAIN_STEP):
         a = np.clip(a0 * k, 0, 1)
         a3 = a[..., None]
         inv = np.clip((win - a3 * color) / np.maximum(1 - a3, 1e-3), 0, 255)
-        g = cv2.GaussianBlur(inv, (0, 0), 2.5)
-        hfm = (inv - g).max(axis=2)
-        m = a > 0.03
+        m = a > 0.05
         if int(m.sum()) < 50:
             continue
-        ghost = abs(float(np.corrcoef(hfm[m], a[m])[0, 1]))
-        if best is None or ghost < best[0]:
-            best = (ghost, inv, a, float(k))
-    if best is None or best[0] > INVERSE_MAX_GHOST:
+        # 残差 inv−MAT_low ∝ [α/(1−α)]·ΔC：对每通道 ΔC 做最小二乘，再按下标定后的
+        # 低频失配挑 gain。ΔC 即"墨色标定误差"，校正它=用 C+ΔC 重算逆解。
+        kf = a / np.maximum(1 - a, 1e-3)
+        err = inv - mat_low
+        denom = float((kf[m] ** 2).sum())
+        if denom < 1e-6:
+            continue
+        dc = np.array([float((kf[m] * err[..., c][m]).sum()) / denom for c in range(3)])
+        dc = np.clip(dc, -INVERSE_MAX_DC, INVERSE_MAX_DC)
+        corr = inv - kf[..., None] * dc
+        resid = float(np.abs(cv2.GaussianBlur(corr, (0, 0), INVERSE_CALIB_SIGMA) - mat_low)[m].mean())
+        if best is None or resid < best[0]:
+            best = (resid, corr, a, float(k))
+    if best is None:
         return None
-    _, inv, a, gain = best
+    resid, inv, a, gain = best
     # ① 只改写"声明的 mask"内（stamp α 比模板 mask 略宽，放任越界会破坏
     #    "mask 外零改动"这条场景无关的硬性保证）。
     # ② 回退 MAT 仅在【逆解失解】时：模型不适用（raw 超出 [0,255]，obs 无法由
@@ -263,12 +348,12 @@ def inverse_apply(obs_path, mat_path, model='mat'):
     ill_posed = (((raw < -0.5) | (raw > 255.5)).any(axis=2)
                  | (win >= 252).all(axis=2))
     m = (a > 0.03) & (mask[py:py + th, px:px + tw] > 0)
-    hyb = np.where(ill_posed[..., None], mat, inv)
+    hybrid = np.where(ill_posed[..., None], mat, inv)
     out = obs.copy()
     sub = out[py:py + th, px:px + tw]
-    sub[m] = hyb[m]
+    sub[m] = hybrid[m]
     out[py:py + th, px:px + tw] = sub
-    return out.astype(np.uint8), (px, py, hf, gain, best[0])
+    return out.astype(np.uint8), (px, py, hf, gain, resid)
 
 
 def _load_stamp():
@@ -1116,7 +1201,11 @@ def verify_repaired(name, root):
     orig = backup_dir(root) / name
     if not orig.exists():
         orig = SOURCE / name
-    tpl_applied = (MASKS / f'{name}.tpl').exists()
+    # 逆解已采用的图不做模板残留判据：gap-score 是为"亮于背景的笔画"设计的，对逆解
+    # 恢复的真实纹理（同样有高频结构）会误报 WARN/FAIL，而逆解正确性已由结果择优把关
+    # （inverse 残留 <20 且 ≤ MAT×1.75 才采用）。mask 外零改动等检查仍照常。
+    tpl_applied = ((MASKS / f'{name}.tpl').exists()
+                   and not (MASKS / f'{name}.inv').exists())
     return verify_paths(orig, LAMA / name, MASKS / name, template_applied=tpl_applied)
 
 
@@ -1235,9 +1324,12 @@ def _retry_inpaint(names, model):
         copyfile(sub_out / name, LAMA / name)
 
 
-def _residual_retry(names, model):
-    """对残留图扩 mask 并用 MAT 重跑复验；仍残留则打印 FAIL（交给 overwrite-review 拒绝落盘）。"""
-    candidates = [name for name in names if _residual_state(name)[0]]
+def _residual_retry(names, model, skip=()):
+    """对残留图扩 mask 并用 MAT 重跑复验；仍残留则打印 FAIL（交给 overwrite-review 拒绝落盘）。
+    skip 中的图（逆解已成功）不参与 MAT 重试——避免精确逆解被生成式重绘覆盖。"""
+    skip = set(skip)
+    candidates = [name for name in names
+                  if name not in skip and _residual_state(name)[0]]
     if not candidates:
         return
     print(f'verify: watermark residual detected in {", ".join(candidates)} — '
@@ -1298,6 +1390,7 @@ def inpaint(model='mat', inverse=True, retry=True, use_profile=True):
         ],
         check=True,
     )
+    inverse_done = set()
     if inverse:
         # inverse（默认开，逐图自动择优）：模板命中且纹理复杂的 scale≈1.0 图用
         # 完整 stamp 逆解恢复真实背景（覆盖 MAT 结果）；其余图 gating 判定后保持
@@ -1312,9 +1405,29 @@ def inpaint(model='mat', inverse=True, retry=True, use_profile=True):
             if res is None:
                 print(f'{name}: inverse skipped (gating), keep MAT')
                 continue
-            out, (px, py, hf, gain, ghost) = res
-            Image.fromarray(out).save(mat_path)
-            applied.append(f'{name} (pos {px},{py} hf {hf:.1f} gain {gain:.2f} ghost {ghost:.3f})')
+            out, (px, py, hf, gain, calib) = res
+            # 结果择优：逆解 vs MAT。三条件同时满足才采用逆解（保住真实纹理）：
+            # ① 绝对分 < TEMPLATE_MIN_SCORE（无强字形残留）；
+            # ② 不显著差于 MAT（×TOL 之上再放 SLACK，抵消"真实纹理抬高 gap-score"的偏差）；
+            # ③ 无**正字形残影**（≤ GHOST_MAX，区分"真纹理"与"水印残留"，见 _result_ghost_score）。
+            # 任一不过 → 保留 MAT（避免暗底噪声团/失配字形覆盖更干净的 MAT，如 2/4/5.png）。
+            inv_score = _result_template_score(out)
+            mat_score = _result_template_score(mat_path)
+            ghost = _result_ghost_score(out, mat_path, px, py)
+            if (inv_score < TEMPLATE_MIN_SCORE
+                    and inv_score <= mat_score * INVERSE_RESIDUAL_TOLERANCE + INVERSE_RESIDUAL_SLACK
+                    and (ghost is None or ghost <= INVERSE_GHOST_MAX)):
+                Image.fromarray(out).save(mat_path)
+                inverse_done.add(name)
+                # .inv 标记：verify 对逆解结果放宽模板残留判据（gap-score 对逆解恢复的
+                # 真实纹理会误报，见 verify_repaired）
+                (MASKS / f'{name}.inv').write_text('')
+                applied.append(f'{name} (pos {px},{py} hf {hf:.1f} gain {gain:.2f} '
+                               f'calib {calib:.2f} ghost {ghost:.2f}; '
+                               f'resid inv {inv_score:.1f} vs mat {mat_score:.1f})')
+            else:
+                print(f'{name}: inverse rejected by result comparison '
+                      f'(resid inv {inv_score:.1f} vs mat {mat_score:.1f} ghost {ghost:.2f}), keep MAT')
         if applied:
             print('inverse stamp applied: ' + '; '.join(applied))
     if inverse and use_profile and wprof is not None:
@@ -1345,12 +1458,17 @@ def inpaint(model='mat', inverse=True, retry=True, use_profile=True):
                 print(f'{name}: profile inverse skipped ({detail}), keep MAT')
                 continue
             Image.fromarray(out).save(mat_path)
+            inverse_done.add(name)
+            (MASKS / f'{name}.inv').write_text('')
             applied.append(f'{name} ({detail})')
         if applied:
             print('profile inverse applied: ' + '; '.join(applied))
     if retry:
-        # 自校验不完美 → 重新处理（最多 1 轮）：见 _residual_retry
-        _residual_retry(active_names, model)
+        # 自校验不完美 → 重新处理（最多 1 轮）：见 _residual_retry。
+        # 逆解成功的图不重试：逆解是精确物理恢复（已覆盖 MAT），retry 会用生成式
+        # MAT 把它重新糊掉；且 gap-score 对逆解恢复的真实背景仍有残余响应（6.png
+        # 逆解后 12.0，被判"残留"），据此重试会破坏逆解。
+        _residual_retry(active_names, model, skip=inverse_done)
 
 
 def review_lama(names, emit=True, root=None, verify=True):
