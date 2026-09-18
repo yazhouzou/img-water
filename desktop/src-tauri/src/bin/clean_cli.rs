@@ -42,6 +42,7 @@ fn main() {
     let mut no_retry = false;
     let mut refine = false;
     let mut profile: Option<String> = None;
+    let mut output_dir: Option<String> = None;
     let mut model: Option<String> = None;
     let mut command: Option<String> = None;
     let mut files: Vec<String> = Vec::new();
@@ -83,6 +84,7 @@ fn main() {
             "--no-retry" => no_retry = true,
             "--refine" => refine = true,
             "--profile" => profile = take(&mut args),
+            "--output-dir" | "--out-dir" => output_dir = take(&mut args),
             "--model" => model = take(&mut args),
             "--min-samples" => mine.min_samples = take(&mut args).and_then(|v| v.parse().ok()).unwrap_or(mine.min_samples),
             "--corner-tol" => mine.corner_tol = take(&mut args).and_then(|v| v.parse().ok()).unwrap_or(mine.corner_tol),
@@ -135,6 +137,7 @@ fn main() {
         retry: !no_retry,
         refine,
         forced_profile: profile,
+        output_dir_override: output_dir.map(PathBuf::from),
     };
 
     let log = |line: &str| println!("{}", line);
@@ -479,7 +482,7 @@ fn run_profile_command(
 }
 
 fn print_help() {
-    println!("usage: clean-cli [--root <dir>] [--mask-box x1,y1,x2,y2] [--any-position] [--refine] [--profile <id>] [--no-profile] [--no-inverse] [--no-retry] [--force] [--keep-work] [--overwrite] [--model <onnx>] <command> [files...]");
+    println!("usage: clean-cli [--root <dir>] [--mask-box x1,y1,x2,y2] [--any-position] [--refine] [--profile <id>] [--no-profile] [--no-inverse] [--no-retry] [--force] [--keep-work] [--overwrite] [--output-dir <dir>] [--model <onnx>] <command> [files...]");
     println!("  run|prepare|inpaint|review-lama|overwrite-review|cleanup");
     println!("默认结果另存到 <root>/watermark-cleaned/；--overwrite 直接覆盖原图（自动备份 original-watermark-backup/）");
     println!("--any-position: 处理任意位置的文字水印（OCR 检测），默认只处理贴右下角的豆包水印");
@@ -488,6 +491,7 @@ fn print_help() {
     println!("--no-retry: 关闭残留自动重试（默认开，最多 1 轮）");
     println!("--refine: 实验性：手动框选时框内笔画精分割（只重绘笔画，失败退回整框）");
     println!("--profile <id>: 精确模式：只用指定水印档案定位（见 profiles 子命令）");
+    println!("--output-dir <dir>: 另存模式的自定义输出目录（默认 <root>/watermark-cleaned/；--overwrite 时忽略）");
     println!();
     println!("水印档案库（逐像素逆解，去水印且不改周边元素）:");
     println!("  profiles                                  列出已装档案（含内置）");

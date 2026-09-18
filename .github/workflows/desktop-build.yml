@@ -92,6 +92,40 @@ jobs:
           set -o pipefail
           pnpm tauri build --target ${{ matrix.target }} 2>&1 | tee build.log
 
+      # 签名/公证校验：配了证书就必须真签上；配了公证账号就必须过 Gatekeeper + 已装订票据。
+      # 未配 Secrets 时只告警（产物可用但用户首次打开需右键「打开」绕过 Gatekeeper）。
+      - name: Verify macOS signing & notarization
+        if: runner.os == 'macOS'
+        working-directory: desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          app="$(ls -d *.app 2>/dev/null | head -1)"
+          if [ -z "$app" ]; then
+            echo "::error::未找到 macOS .app 产物"
+            exit 1
+          fi
+          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            echo "::warning::未配置 APPLE_SIGNING_IDENTITY：产物未签名/未公证，用户首次打开会被 Gatekeeper 拦截"
+            exit 0
+          fi
+          echo "[verify] codesign $app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=4 "$app" 2>&1 | grep -E "Authority|TeamIdentifier" || true
+          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_PASSWORD:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ]; then
+            echo "::warning::已签名但未配置公证账号（APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID），Gatekeeper 仍会拦截"
+            exit 0
+          fi
+          echo "[verify] Gatekeeper assessment"
+          spctl -a -t exec -vv "$app" || { echo "::error::Gatekeeper 校验失败（未公证或签名无效）"; exit 1; }
+          echo "[verify] notarization staple"
+          xcrun stapler validate "$app" || { echo "::error::未装订公证票据（stapler validate 失败）"; exit 1; }
+          echo "[OK] 已签名、通过 Gatekeeper 且已装订公证票据"
+
       - name: Emit error summary
         if: failure()
         working-directory: desktop

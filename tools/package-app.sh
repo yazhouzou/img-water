@@ -29,6 +29,31 @@ WIN_REPO=""
 die() { echo "[ERROR] $*" >&2; exit 1; }
 usage() { grep '^#' "$0" | sed 's/^# \{0,1\}//; 1d'; exit "${1:-1}"; }
 
+# 签名/公证校验：本地构建后立刻验证，避免把"没签上"的包发出去。
+# 未配置证书时只告警（产物仍可用，用户首次打开需右键「打开」绕过 Gatekeeper）。
+verify_mac_signing() {
+  local dmg="$1"
+  local app_dir="$ROOT/desktop/src-tauri/target/release/bundle/macos"
+  local app=""
+  app="$(ls -d "$app_dir"/*.app 2>/dev/null | head -1 || true)"
+  if [[ -z "${APPLE_SIGNING_IDENTITY:-}" ]]; then
+    echo "[WARN] 未设置 APPLE_SIGNING_IDENTITY：产物未签名/未公证，用户首次打开会被 Gatekeeper 拦截"
+    echo "       启用方法见 docs/ci.md「macOS 签名与公证」"
+    return 0
+  fi
+  [[ -n "$app" ]] || { echo "[WARN] 未找到 .app，跳过签名校验"; return 0; }
+  codesign --verify --deep --strict --verbose=2 "$app"
+  echo "[verify] codesign OK: $(basename "$app")"
+  if [[ -z "${APPLE_ID:-}" || -z "${APPLE_PASSWORD:-}" || -z "${APPLE_TEAM_ID:-}" ]]; then
+    echo "[WARN] 已签名但未配置公证账号（APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID），Gatekeeper 仍会拦截"
+    return 0
+  fi
+  spctl -a -t exec -vv "$app" || die "Gatekeeper 校验失败（未公证或签名无效）"
+  xcrun stapler validate "$app" || die "未装订公证票据（app）"
+  xcrun stapler validate "$dmg" || die "未装订公证票据（dmg）"
+  echo "[OK] 已签名、通过 Gatekeeper 且已装订公证票据"
+}
+
 build_mac() {
   [[ "$OS" == Darwin ]] || die "macOS 打包需要在 macOS 上执行"
   "$ROOT/desktop/build.sh"
@@ -41,6 +66,7 @@ build_mac() {
   local dmg="$arm"
   [[ -f "$dmg" ]] || dmg="$x64"
   [[ -f "$dmg" ]] || die "未找到 DMG 产物: $dmg_dir"
+  verify_mac_signing "$dmg"
   mkdir -p "$DIST"
   cp -f "$dmg" "$DIST/"
   echo "[OK] macOS 产物: $DIST/$(basename "$dmg")"

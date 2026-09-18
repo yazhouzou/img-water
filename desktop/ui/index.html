@@ -70,6 +70,11 @@
           </div>
         </div>
         <div id="output-hint" class="output-hint"></div>
+        <div id="output-dir-row" class="output-dir-row">
+          <button id="btn-output-dir" class="btn small" type="button" data-i18n="pickOutputDir"></button>
+          <span id="output-dir-path" class="muted" data-i18n="outputDirDefault"></span>
+          <button id="btn-output-dir-reset" class="btn small ghost" type="button" data-i18n="outputDirReset" hidden></button>
+        </div>
         <details class="advanced-options">
           <summary data-i18n="advanced"></summary>
           <label class="checkbox">
@@ -117,6 +122,13 @@
         <h2 data-i18n="resultTitle"></h2>
       </div>
       <div id="result-banner" class="result-banner" hidden></div>
+      <div id="result-list" class="result-list" hidden>
+        <div class="result-list-head">
+          <span data-i18n="resultListTitle"></span>
+          <span id="result-list-count" class="muted"></span>
+        </div>
+        <div id="result-list-grid" class="result-list-grid"></div>
+      </div>
       <div id="compare-box" class="compare-box" hidden>
         <img id="compare-final" class="compare-final" alt="处理后" draggable="false" />
         <img id="compare-source" class="compare-source" alt="处理前" draggable="false" />
@@ -137,6 +149,7 @@
       <details id="log-box" class="log-box">
         <summary>
           <span data-i18n="logTitle"></span>
+          <button id="btn-export-log" class="btn small ghost" type="button" data-i18n="exportLog"></button>
           <button id="btn-clear-log" class="btn small ghost" type="button" data-i18n="clearLog"></button>
         </summary>
         <pre id="log" class="log"></pre>
@@ -180,6 +193,13 @@
 
   <div id="lightbox" class="lightbox">
     <img src="" alt="预览大图" />
+  </div>
+
+  <div id="drop-overlay" class="drop-overlay" hidden>
+    <div class="drop-overlay-inner">
+      <div class="drop-overlay-icon">＋</div>
+      <div data-i18n="dropHint"></div>
+    </div>
   </div>
 
   <script src="mock.js"></script>

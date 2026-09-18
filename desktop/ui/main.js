@@ -1,6 +1,6 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
-const { open, message, confirm } = window.__TAURI__.dialog;
+const { open, message, confirm, save } = window.__TAURI__.dialog;
 const t = (key) => window.i18n.t(key);
 
 const els = {
@@ -13,6 +13,7 @@ const els = {
   btnRun: document.getElementById('btn-run'),
   btnCleanup: document.getElementById('btn-cleanup'),
   btnClearLog: document.getElementById('btn-clear-log'),
+  btnExportLog: document.getElementById('btn-export-log'),
   folderPath: document.getElementById('folder-path'),
   fileList: document.getElementById('file-list'),
   fileCount: document.getElementById('file-count'),
@@ -32,6 +33,14 @@ const els = {
   modelProgressText: document.getElementById('model-progress-text'),
   logBox: document.getElementById('log-box'),
   resultBanner: document.getElementById('result-banner'),
+  outputDirRow: document.getElementById('output-dir-row'),
+  btnOutputDir: document.getElementById('btn-output-dir'),
+  outputDirPath: document.getElementById('output-dir-path'),
+  btnOutputDirReset: document.getElementById('btn-output-dir-reset'),
+  resultList: document.getElementById('result-list'),
+  resultListCount: document.getElementById('result-list-count'),
+  resultListGrid: document.getElementById('result-list-grid'),
+  dropOverlay: document.getElementById('drop-overlay'),
   btnMask: document.getElementById('btn-mask'),
   maskStatus: document.getElementById('mask-status'),
   btnMaskClear: document.getElementById('btn-mask-clear'),
@@ -106,6 +115,16 @@ function overwriteMode() {
 function renderOutputHint() {
   els.outputHint.innerHTML = overwriteMode() ? t('outputHintOverwrite') : t('outputHintSave');
   els.outputHint.classList.toggle('warn', overwriteMode());
+  els.outputDirRow.hidden = overwriteMode();
+}
+
+let outputDirOverride = null;
+
+function renderOutputDir() {
+  const custom = !!outputDirOverride;
+  els.outputDirPath.textContent = custom ? outputDirOverride : t('outputDirDefault');
+  els.outputDirPath.title = custom ? outputDirOverride : '';
+  els.btnOutputDirReset.hidden = !custom;
 }
 
 const STAGE_LABEL = () => ({ prepare: t('stagePrepare'), inpaint: t('stageInpaint'), save: t('stageSave') });
@@ -325,6 +344,7 @@ function applyDynamicLabels() {
   renderFolderPath();
   setMaskButtons();
   renderOutputHint();
+  renderOutputDir();
   renderProfileOptions();
   els.profileLabel.placeholder = t('profileLabelPlaceholder');
   els.fileCount.textContent = t('fileCount')(els.fileList.querySelectorAll('input[type=checkbox]').length);
@@ -496,6 +516,90 @@ function clearReviews() {
   els.resultBanner.hidden = true;
   els.reviewCandidate.innerHTML = `<div class="placeholder">${t('placeholderBefore')}</div>`;
   els.reviewFinal.innerHTML = `<div class="placeholder">${t('placeholderAfter')}</div>`;
+  clearResultList();
+}
+
+function basename(p) {
+  const parts = String(p).split(/[\\/]/);
+  return parts[parts.length - 1] || String(p);
+}
+
+let resultPaths = [];
+const thumbQueue = [];
+let thumbActive = 0;
+const THUMB_CONCURRENCY = 3;
+
+function clearResultList() {
+  resultPaths = [];
+  thumbQueue.length = 0;
+  els.resultList.hidden = true;
+  els.resultListGrid.innerHTML = '';
+  els.resultListCount.textContent = '';
+}
+
+function pumpThumbQueue() {
+  while (thumbActive < THUMB_CONCURRENCY && thumbQueue.length > 0) {
+    const job = thumbQueue.shift();
+    thumbActive += 1;
+    invoke('read_thumbnail_base64', { path: job.path, max: 200, lang: window.i18n.lang })
+      .then((dataUrl) => {
+        job.img.src = dataUrl;
+        job.img.dataset.ready = '1';
+        job.img.classList.remove('pending');
+      })
+      .catch(() => { job.img.classList.remove('pending'); })
+      .finally(() => {
+        thumbActive -= 1;
+        pumpThumbQueue();
+      });
+  }
+}
+
+/// 结果列表：逐张缩略图（点击大图预览，桌面端可定位文件）。
+function renderResultList(paths) {
+  clearResultList();
+  const list = (paths || []).filter(Boolean);
+  if (list.length === 0) return;
+  resultPaths = list;
+  els.resultList.hidden = false;
+  els.resultListCount.textContent = t('resultListCount')(list.length);
+  list.forEach((path) => {
+    const item = document.createElement('div');
+    item.className = 'result-item';
+
+    const img = document.createElement('img');
+    img.className = 'result-thumb pending';
+    img.alt = '';
+    img.title = t('viewLarge');
+    img.addEventListener('click', () => {
+      if (img.dataset.ready) openLightbox(img.src);
+    });
+    item.appendChild(img);
+    thumbQueue.push({ path, img });
+    pumpThumbQueue();
+
+    const name = document.createElement('div');
+    name.className = 'result-item-name';
+    name.textContent = basename(path);
+    name.title = path;
+    item.appendChild(name);
+
+    if (!isMobile) {
+      const actions = document.createElement('div');
+      actions.className = 'result-item-actions';
+      const reveal = document.createElement('button');
+      reveal.className = 'result-item-btn';
+      reveal.type = 'button';
+      reveal.textContent = t('viewInFolder');
+      reveal.addEventListener('click', () => {
+        invoke('reveal_path', { path, lang: window.i18n.lang })
+          .catch((err) => logLine(t('logError')(String(err))));
+      });
+      actions.appendChild(reveal);
+      item.appendChild(actions);
+    }
+    els.resultListGrid.appendChild(item);
+  });
 }
 
 function setModelProgress(done, total) {
@@ -601,6 +705,7 @@ function handleExit(payload) {
   if (!payload.success) els.logBox.open = true;
   lastExitPayload = payload;
   renderExitBanner(payload);
+  renderResultList(payload.success ? payload.outputs : []);
   setState('done');
   const logText = els.log.textContent;
   const lastMatch = (re) => [...logText.matchAll(re)].pop();
@@ -703,6 +808,21 @@ async function init() {
     if (e.key === 'Escape') {
       closeLightbox();
       if (!els.maskOverlay.hidden) closeMaskEditor();
+      return;
+    }
+    const mod = e.metaKey || e.ctrlKey;
+    if (!mod) return;
+    const el = document.activeElement;
+    const typing = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
+    if (typing) return;
+    if (e.key === 'o' || e.key === 'O') {
+      e.preventDefault();
+      if (!running && !els.btnPick.disabled) els.btnPick.click();
+      return;
+    }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (!els.btnRun.hidden && !els.btnRun.disabled) els.btnRun.click();
     }
   });
 
@@ -750,6 +870,25 @@ async function init() {
     els.log.textContent = '';
   });
 
+  els.btnExportLog.addEventListener('click', async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const text = els.log.textContent || '';
+    if (!text.trim()) return;
+    try {
+      const path = await save({
+        title: t('exportLogTitle'),
+        defaultPath: `watermark-cleaner-log-${Date.now()}.txt`,
+        filters: [{ name: 'Text', extensions: ['txt'] }],
+      });
+      if (!path) return;
+      await invoke('write_text_file', { path, content: text, lang: window.i18n.lang });
+      logLine(`[${t('exportLog')}] ${path}`);
+    } catch (err) {
+      logLine(t('logError')(String(err)));
+    }
+  });
+
   async function importPaths(paths) {
     try {
       const imported = await invoke('import_files', { paths, lang: window.i18n.lang });
@@ -789,16 +928,30 @@ async function init() {
     await refreshFiles();
   });
 
-  // 桌面拖拽导入：把图片文件拖进窗口即导入
+  // 桌面拖拽导入：把图片文件拖进窗口即导入（含高亮反馈）
   if (!isMobile && window.__TAURI__.window) {
     try {
       const { getCurrentWindow } = window.__TAURI__.window;
       getCurrentWindow().onDragDropEvent((event) => {
-        if (running) return;
         const payload = event.payload;
-        if (payload.type === 'drop' && Array.isArray(payload.paths)) {
-          const paths = payload.paths.filter((p) => /\.(png|jpe?g|webp)$/i.test(p));
+        if (running) {
+          els.dropOverlay.hidden = true;
+          return;
+        }
+        if (payload.type === 'enter' || payload.type === 'over') {
+          els.dropOverlay.hidden = false;
+          return;
+        }
+        if (payload.type === 'leave') {
+          els.dropOverlay.hidden = true;
+          return;
+        }
+        if (payload.type === 'drop') {
+          els.dropOverlay.hidden = true;
+          const all = Array.isArray(payload.paths) ? payload.paths : [];
+          const paths = all.filter((p) => /\.(png|jpe?g|webp)$/i.test(p));
           if (paths.length > 0) importPaths(paths);
+          else if (all.length > 0) logLine(t('dropNoImage'));
         }
       });
     } catch (_) { /* 旧版本 API 缺失时忽略 */ }
@@ -819,6 +972,18 @@ async function init() {
   });
 
   els.outputRow.addEventListener('change', renderOutputHint);
+  if (els.btnOutputDir) {
+    els.btnOutputDir.addEventListener('click', async () => {
+      const picked = await open({ directory: true, multiple: false, title: t('pickOutputDir') });
+      if (!picked) return;
+      outputDirOverride = Array.isArray(picked) ? picked[0] : picked;
+      renderOutputDir();
+    });
+    els.btnOutputDirReset.addEventListener('click', () => {
+      outputDirOverride = null;
+      renderOutputDir();
+    });
+  }
 
   els.profileSelect.addEventListener('change', () => {
     selectedProfileId = els.profileSelect.value || null;
@@ -873,6 +1038,7 @@ async function init() {
         anyPosition: els.anyPosition.checked,
         refine: els.refine.checked,
         profileId: selectedProfileId,
+        outputDir: overwrite ? null : outputDirOverride,
         lang: window.i18n.lang,
         maskBox: manualMask
           ? [manualMask.dx1, manualMask.dy1, manualMask.dx2, manualMask.dy2]

@@ -71,6 +71,16 @@
         return new Promise((resolve) =>
           setTimeout(() => resolve(svgDataUrl('复查图预览（mock）', '#3b5bdb')), 400)
         );
+      case 'read_thumbnail_base64':
+        return new Promise((resolve) =>
+          setTimeout(() => resolve(svgDataUrl('缩略图（mock）', '#0f766e')), 200)
+        );
+      case 'reveal_path':
+        console.log('[mock] reveal_path:', args && args.path);
+        return Promise.resolve();
+      case 'write_text_file':
+        console.log('[mock] write_text_file:', args && args.path);
+        return Promise.resolve();
       case 'list_watermarks':
         return Promise.resolve([
           { id: 'qwen', label: 'qwen', created: '', source: 'builtin', width: 82, height: 428, builtin: true },
@@ -122,6 +132,7 @@
         if (opts && opts.directory) return '/mock/Pictures/watermark';
         return ['/mock/import/a.png', '/mock/import/b.png'];
       },
+      save: async (opts) => (opts && opts.defaultPath) || '/mock/watermark-cleaner-log.txt',
       confirm: async () => true,
       message: async () => {},
     },

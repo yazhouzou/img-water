@@ -282,6 +282,7 @@ fn run_pipeline(
     any_position: Option<bool>,
     refine: Option<bool>,
     profile_id: Option<String>,
+    output_dir: Option<String>,
     lang: Option<String>,
 ) -> Result<(), String> {
     let lang = lang_of(lang);
@@ -332,6 +333,8 @@ fn run_pipeline(
             retry: true,
             refine: refine.unwrap_or(true),
             forced_profile: profile_id.clone(),
+            // 覆盖模式下由 output_dir() 统一忽略
+            output_dir_override: output_dir.as_ref().map(PathBuf::from),
         };
         let log = |line: &str| {
             let _ = app_handle.emit(EVENT_LOG, line);
@@ -513,6 +516,7 @@ fn cleanup_pipeline(storage: State<'_, AppStorage>, lang: Option<String>) -> Res
         retry: true,
         refine: false,
         forced_profile: None,
+        output_dir_override: None,
     };
     let names = pipeline::target_names(&options.root, &options.files)?;
     pipeline::cleanup(&options, &names)?;
@@ -630,9 +634,115 @@ fn read_image_base64(path: String, lang: Option<String>) -> Result<String, Strin
     Ok(format!("data:image/png;base64,{}", encoded))
 }
 
+/// 结果列表缩略图：解码后等比缩到最长边 `max` 像素再编码 PNG，
+/// 避免把整张大图塞进列表（原图预览仍走 `read_image_base64`）。
+#[tauri::command]
+fn read_thumbnail_base64(path: String, max: Option<u32>, lang: Option<String>) -> Result<String, String> {
+    let lang = lang_of(lang);
+    let max = max.unwrap_or(160).clamp(32, 512);
+    let file = PathBuf::from(&path);
+    if !file.is_file() {
+        return Err(tr(&lang, "文件不存在", "File not found"));
+    }
+    let img = image::open(&file).map_err(|e| {
+        tr(
+            &lang,
+            &format!("无法读取图片: {}", e),
+            &format!("Failed to read image: {}", e),
+        )
+    })?;
+    let thumb = img.thumbnail(max, max);
+    let mut buf = std::io::Cursor::new(Vec::new());
+    thumb
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(buf.into_inner());
+    Ok(format!("data:image/png;base64,{}", encoded))
+}
+
+/// 在系统文件管理器中定位并选中文件（结果列表「在文件夹中显示」）。仅桌面可用。
+#[cfg(desktop)]
+#[tauri::command]
+fn reveal_path(path: String, lang: Option<String>) -> Result<(), String> {
+    let lang = lang_of(lang);
+    if !PathBuf::from(&path).exists() {
+        return Err(tr(&lang, "文件不存在", "File not found"));
+    }
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        c.arg("-R").arg(&path);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("explorer");
+        c.arg(format!("/select,{}", path));
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let dir = PathBuf::from(&path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(dir);
+        c
+    };
+    cmd.spawn().map_err(|e| {
+        tr(
+            &lang,
+            &format!("打开失败: {}", e),
+            &format!("Failed to open: {}", e),
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(not(desktop))]
+#[tauri::command]
+fn reveal_path(path: String, lang: Option<String>) -> Result<(), String> {
+    let _ = path;
+    let lang = lang_of(lang);
+    Err(tr(&lang, "仅桌面端支持定位文件", "Reveal in folder is desktop-only"))
+}
+
+/// 导出运行日志到用户选定的文件（配合 dialog 插件的保存对话框）。
+#[tauri::command]
+fn write_text_file(path: String, content: String, lang: Option<String>) -> Result<(), String> {
+    let lang = lang_of(lang);
+    std::fs::write(&path, content).map_err(|e| {
+        tr(
+            &lang,
+            &format!("写入失败: {}", e),
+            &format!("Failed to write: {}", e),
+        )
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run_tauri_app() {
-    tauri::Builder::default()
+    // 移动端 cfg(desktop) 块被编译掉，builder 不再需要 mut
+    #[allow(unused_mut)]
+    let mut builder = tauri::Builder::default();
+    // 桌面专属插件（两者在移动端整 crate 为空，必须 cfg 守卫，否则 Android 编译报错）：
+    // - single-instance 必须最先注册：第二个实例把已有窗口带到前台后自身退出，避免两个
+    //   进程共用同一 workdir（/tmp/doubao-watermark-work）与输出/备份目录互相覆盖。
+    // - window-state 记忆窗口尺寸/位置（关闭时保存、窗口就绪时恢复）。
+    #[cfg(desktop)]
+    {
+        builder = builder
+            .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }))
+            .plugin(tauri_plugin_window_state::Builder::default().build());
+    }
+    builder
         .plugin(tauri_plugin_dialog::init())
         .manage(AppStorage::default())
         .setup(|app| {
@@ -666,7 +776,10 @@ pub fn run_tauri_app() {
             cleanup_pipeline,
             export_results,
             share_results,
-            read_image_base64
+            read_image_base64,
+            read_thumbnail_base64,
+            reveal_path,
+            write_text_file
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

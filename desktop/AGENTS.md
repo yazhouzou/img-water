@@ -14,7 +14,7 @@ Tauri 桌面应用，内置 Rust + ONNX Runtime 修复内核（v0.2 起，无需
 
 ## 流水线 / CLI
 - `pipeline.rs` 是 Python 脚本的 Rust 移植（备份/遮罩/修复/复查/覆盖/清理）；`run` 清理前把两张复查拼图复制到系统临时目录 `doubao-watermark-review/` 再输出路径。
-- CLI `clean-cli`（`cargo build --bin clean-cli`），参数同 Python（`--root`/`--mask-box`/`--keep-work`/`--force`（验证 FAIL 时强制落盘） + `run|prepare|inpaint|review-lama|overwrite-review|cleanup`）。
+- CLI `clean-cli`（`cargo build --bin clean-cli`），参数同 Python（`--root`/`--mask-box`/`--keep-work`/`--force`（验证 FAIL 时强制落盘）/`--output-dir <dir>`（另存模式自定义输出目录） + `run|prepare|inpaint|review-lama|overwrite-review|cleanup`）。
 - 模型下载：启动缺失即自动下载（多连接分段+重试+源回退 hf-mirror→huggingface），顶栏进度条；`LAMA_ONNX_URL` 覆盖源，`LAMA_ONNX_PATH` 覆盖位置。
 
 ## 水印档案库（Rust 侧）
@@ -43,6 +43,12 @@ Tauri 桌面应用，内置 Rust + ONNX Runtime 修复内核（v0.2 起，无需
 - Windows 包无法在 macOS 交叉编译；`tools/package-app.sh`：`mac`（本机 DMG）/`win`（Windows Git Bash 本机，或 macOS `--remote user@host --win-repo C:/path` 经 SSH 远程构建拉回）/`both`；产物在根 `dist/`。
 - `cargo test --lib`（常规 19）+ `cargo test --lib -- --ignored --nocapture`（含 `detect_box_on_qwen_samples`/`qwen_profile_matches_real_images`/`qwen_pair_learning_residual_is_tiny`/`doubao_batch_learning_recovers_stamp`/`gap_locator_finds_qwen_place_anchor`/`learn_auto_uses_batch_on_aligned_photos`/`full_run_with_lama_e2e`）。
 - 推送前预检、CI 工作流、本地 E2E 与发版：见 `docs/ci.md`。
+- macOS `tauri.conf.json` 的 `bundle` 带 `category`/`copyright`（Dock/Finder 显示）；窗口 `label` 固定 `main`（单实例聚焦用）。
+- 桌面端单实例 + 窗口状态：`tauri-plugin-single-instance`（第二个实例聚焦已有窗口后自身退出，避免两进程共用同一 workdir/输出目录）+ `tauri-plugin-window-state`（记忆尺寸/位置）。两者在移动端整 crate 为空，注册处必须 `#[cfg(desktop)]` 守卫（否则 Android 编译失败）。**不设 `visible:false`**：该配置在移动端同样生效会让 Android 白屏，因此接受窗口恢复时短暂闪现默认尺寸。
+- 结果区「逐张缩略图」：pipeline-exit 带 `outputs`，前端用 `read_thumbnail_base64`（解码后 `thumbnail(200,200)` 再编码 PNG，3 并发）渲染；桌面每张可 `reveal_path`（macOS `open -R`）。拖拽导入有高亮遮罩（enter/over/leave/drop），非图片给提示；快捷键 Cmd/Ctrl+O 选图、Cmd/Ctrl+Enter 开始（输入框内不触发）。日志区「导出日志」走 dialog `save` + `write_text_file`，便于用户反馈问题。
+- 签名/公证：CI 与 `tools/package-app.sh mac` 均做分级校验（未配证书只告警），详见 `docs/ci.md`「macOS 签名与公证」。
+- 图片格式：`image` crate 显式只开 `png`（jpeg/webp 由 `imageproc` 默认特性带入，`Cargo.lock` 有 `zune-jpeg`/`image-webp`）；**HEIC 不支持**（要 libheif/平台解码器，代价大），picker 与拖拽过滤都只认 png/jpg/jpeg/webp。
+- 自动更新**尚未接入**，启用步骤（需先有签名密钥对）见 `docs/ci.md`「自动更新」。
 
 ## UI 本地联调（零 SDK）
 `./tools/ui-preview.sh` 起 http 服务打开 `desktop/ui/index.html`；`ui/mock.js` 在浏览器 mock 全部 Tauri API（打包内自动失效），`?mobile=1/0` 强制移动/桌面、`?nomodel=1` 模拟未下载；改 ui 下文件刷新即可，不依赖 CI；Windows: PowerShell 需 `chcp 65001`。
@@ -63,6 +69,8 @@ Python（终端）与 Rust 口径**除修复模型外已对齐**：
 | 修复模型 | 默认 MAT | LaMa ONNX |
 
 **唯一残余差异**：修复模型（MAT vs LaMa ONNX）——两者都是生成式路线，复杂纹理（花墙/花丛）MAT 更稳；`scale≈1.0 + 邻域纹理复杂` 的图会被 stamp 逆解接管，此时模型差异不重要。
+
+**仅 Rust/App、Python 无对应参数**：`--output-dir <dir>`（App「选择输出目录」）自定义另存目录，`output_dir()` 在**覆盖模式下忽略**该值（否则"以为替换了原图"却写到别处）；`None`（默认）行为与历史版本逐字节一致，回归用例 `output_dir_modes` 已覆盖三种情形。
 
 **框选精分割（`--refine` / App「框选区域精细处理」）**：框内顶帽局部对比 + 低饱和过滤 + 局部自适应阈值 + 行带约束 → 笔画级 mask（实测千问 7.png：12083px vs 整框 53592px，少重绘 4.4 倍）。关键设计：
 - 精分割**不写 `.tpl`**（写了会强制启用豆包模板残留检查，非豆包水印碰巧高分 → 假残留），只写 `{name}.refinebox`（记录了原始框）；

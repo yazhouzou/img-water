@@ -320,6 +320,9 @@ pub struct PipelineOptions {
     /// 「精确模式」：只用该 id 的水印档案定位（不做多档案择优），
     /// 定位成功即逐像素解析逆解；`None` 为自动匹配全部档案。
     pub forced_profile: Option<String>,
+    /// 另存模式（`overwrite_original=false`）下的自定义输出目录。
+    /// `None`（默认）＝沿用 `root/watermark-cleaned/`，行为与历史版本逐字节一致。
+    pub output_dir_override: Option<PathBuf>,
 }
 
 pub const SUPPORTED_EXTS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
@@ -1037,10 +1040,13 @@ fn backup_dir(root: &Path) -> PathBuf {
 /// 结果输出目录：覆盖模式就是原图目录，另存模式是 watermark-cleaned/。
 pub fn output_dir(options: &PipelineOptions) -> PathBuf {
     if options.overwrite_original {
-        options.root.clone()
-    } else {
-        options.root.join("watermark-cleaned")
+        // 覆盖模式忽略自定义目录：否则会"以为替换了原图"却写到了别处
+        return options.root.clone();
     }
+    if let Some(dir) = &options.output_dir_override {
+        return dir.clone();
+    }
+    options.root.join("watermark-cleaned")
 }
 
 fn work_dirs() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
@@ -2615,10 +2621,17 @@ mod tests {
             retry: true,
             refine: false,
             forced_profile: None,
+            output_dir_override: None,
         };
         assert_eq!(output_dir(&options), root);
         let options = PipelineOptions { overwrite_original: false, ..options };
         assert_eq!(output_dir(&options), root.join("watermark-cleaned"));
+        // 自定义输出目录：另存模式生效；覆盖模式忽略（保证"原图已替换"的语义不被改写）
+        let custom = root.join("custom-out");
+        let options = PipelineOptions { output_dir_override: Some(custom.clone()), ..options };
+        assert_eq!(output_dir(&options), custom);
+        let options = PipelineOptions { overwrite_original: true, ..options };
+        assert_eq!(output_dir(&options), root, "覆盖模式必须忽略自定义目录");
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -2652,7 +2665,7 @@ mod tests {
         let (x1, y1, _x2, _y2) = make_watermark_image(&root.join("b.png"), 1024, 1024, "AI");
         let _ = x1;
         let _ = y1;
-        let options = PipelineOptions { root: root.clone(), files: vec!["b.png".to_string()], keep_work: false, mask_box: None, any_position: false, overwrite_original: true, use_profile: true, force: false, inverse: true, retry: false, refine: false, forced_profile: None };
+        let options = PipelineOptions { root: root.clone(), files: vec!["b.png".to_string()], keep_work: false, mask_box: None, any_position: false, overwrite_original: true, use_profile: true, force: false, inverse: true, retry: false, refine: false, forced_profile: None, output_dir_override: None };
         let names = target_names(&root, &options.files).unwrap();
         let noop_log: Logger = &|_| {};
         prepare(&options, &names, &noop_log).unwrap();
@@ -2722,6 +2735,7 @@ mod tests {
             retry: true,
             refine: false,
             forced_profile: None,
+            output_dir_override: None,
         };
         let log = |_line: &str| {};
         let summary = run(&options, &model, &log, &|_, _, _, _| {}, &|| false).expect("pipeline run failed");
