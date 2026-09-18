@@ -12,6 +12,7 @@
 - `pipeline.rs` 单元测试（遮罩/负数坐标/文件名排序/无模型全流程）+ `#[ignore]` E2E（真实 LaMa，断言白像素下降与自动清理）。
 - 本地 E2E：模型放 `desktop/src-tauri/.models/lama_fp32.onnx` 后，`cd desktop/src-tauri && LAMA_MODEL=.models/lama_fp32.onnx cargo test --quiet -- --ignored`（清 MacPorts 变量）。
 - CI `desktop-build.yml` 跑单测 + 模型缓存 + E2E。
+- 水印管线回归 `tools/watermark_regression.py`（L1，无模型）已接入 `watermark-regression.yml`：改 `tools/**` 的推送/PR 必跑，非零退出即失败。CI 无 `dist/`/根目录成品图，故正样本走"合成带水印图 + 资产模板"，覆盖 mask footprint、逐图墨色标定、逆解背景泛化（渐变/强纹理/硬边缘）、MAT 低频带偏。需模型/真实图的 L3（`--e2e`）不在 CI。
 
 ## CI（GitHub Actions）
 - 仓库 `github.com/yazhouzou/img-water`，remote `github`；origin 仍 Codeup，**双推**。产物自动附 Release（免登录）。

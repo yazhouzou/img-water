@@ -1,0 +1,37 @@
+name: Watermark Regression
+
+# 水印处理管线回归（tools/watermark_regression.py 的 L1：无模型、无需 venv/权重）。
+# 这是"改坏老路径（模板 / 遮罩 / 逆解 / 逐图墨色标定）会被自动发现"的防线：
+# 没有它，任何 tools/** 改动只能靠人记得手跑回归，退步会静默溜进主干。
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/**'
+      - '.github/workflows/watermark-regression.yml'
+  pull_request:
+    paths:
+      - 'tools/**'
+      - '.github/workflows/watermark-regression.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  l1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # L1 只依赖 Pillow / numpy / OpenCV（不加载 torch / iopaint / 模型权重）；
+      # headless 版避免 CI 上需要 X 库。
+      - name: Install deps
+        run: pip install --quiet pillow numpy opencv-python-headless
+
+      - name: L1 regression (no model)
+        run: python tools/watermark_regression.py
