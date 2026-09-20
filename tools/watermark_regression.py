@@ -824,6 +824,72 @@ def run_crop_checks(rdw, only):
     return rows
 
 
+def run_sd_checks(rdw, only):
+    """扩散修补（--sd）的防回归（无模型，打桩 pipe）：
+    ① `_ring_hf` 只测**水印周边环带**、排除字形框本身——否则字形边缘也是高频、所有图都会
+       被误判为"有纹理"而全走慢速 SD；
+    ② `_sd_inpaint` 只对高纹理图路由、且只贴回 **mask 像素**（mask 外逐字节不变）。"""
+    import numpy as np
+    from shutil import rmtree
+    rows = []
+    if only and 'sd' not in only:
+        return rows
+    # ① 环带纹理判据
+    box = np.zeros((400, 600), np.uint8)
+    box[150:250, 250:450] = 255
+    rng = np.random.default_rng(1)
+    flat = np.full((400, 600, 3), 128, np.uint8)
+    flat[150:250, 250:450] = rng.integers(0, 255, (100, 200, 3), dtype=np.uint8)  # 字形框内塞噪声
+    noisy = rng.integers(0, 255, (400, 600, 3), dtype=np.uint8)
+    hf_flat = rdw._ring_hf(flat, box)
+    hf_noisy = rdw._ring_hf(noisy, box)
+    rows.append(({'group': 'sd', 'name': 'ring_hf excludes glyph box', 'expect': 'ok'},
+                 hf_flat < 3 < hf_noisy, f'flat={hf_flat:.2f} noisy={hf_noisy:.2f}'))
+
+    # ② 路由 + 只贴 mask
+    tmp = Path(tempfile.mkdtemp(prefix='wm-sd-'))
+    old = (rdw.SOURCE, rdw.MASKS, rdw.LAMA, rdw._sd_pipe, rdw._sd_generator)
+    try:
+        src, msk, out = tmp / 'source', tmp / 'masks', tmp / 'lama'
+        for d in (src, msk, out):
+            d.mkdir(parents=True, exist_ok=True)
+        tex = rng.integers(0, 255, (900, 1400, 3), dtype=np.uint8)  # 高纹理
+        smooth = np.full((900, 1400, 3), 100, np.uint8)             # 平滑
+        mask = np.zeros((900, 1400), np.uint8)
+        mask[700:760, 1000:1180] = 255
+        Image.fromarray(tex).save(src / 'tex.png')
+        Image.fromarray(smooth).save(src / 'smooth.png')
+        for n in ('tex.png', 'smooth.png'):
+            Image.fromarray(mask).save(msk / n)
+            Image.fromarray(np.full((900, 1400, 3), 50, np.uint8)).save(out / n)  # LAMA 底
+
+        class _FakePipe:  # 返回纯 (0,255,0)，供断言"mask 内被 SD 覆盖"
+            def __call__(self, **kw):
+                w, h = kw['image'].size
+                arr = np.zeros((h, w, 3), np.float32)  # diffusers output_type='np' → [0,1]
+                arr[..., 1] = 1.0
+                return type('R', (), {'images': [arr]})()
+
+        rdw.SOURCE, rdw.MASKS, rdw.LAMA = src, msk, out
+        rdw._sd_pipe = lambda: (_FakePipe(), 'cpu')
+        rdw._sd_generator = lambda device, seed: None  # 免 torch（CI 无 torch）
+        applied = rdw._sd_inpaint(['tex.png', 'smooth.png'], texture_min=rdw.SD_TEXTURE_MIN)
+        rt = np.array(Image.open(out / 'tex.png').convert('RGB'))
+        rs = np.array(Image.open(out / 'smooth.png').convert('RGB'))
+        inside = mask > 0
+        # 只贴 mask：mask 外应保持 LAMA 底（50），mask 内应为 stub 的纯绿
+        tex_ok = (bool((rt[~inside] == 50).all())
+                  and bool((rt[inside] == np.array([0, 255, 0])).all()))
+        smooth_ok = bool((rs == 50).all())  # 平滑图未被路由、LAMA 原样
+        rows.append(({'group': 'sd', 'name': 'sd routes textured, pastes mask only', 'expect': 'ok'},
+                     applied == {'tex.png'} and tex_ok and smooth_ok,
+                     f'applied={sorted(applied)} tex_ok={tex_ok} smooth_skipped={smooth_ok}'))
+    finally:
+        rdw.SOURCE, rdw.MASKS, rdw.LAMA, rdw._sd_pipe, rdw._sd_generator = old
+        rmtree(tmp, ignore_errors=True)
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser(description='watermark processing regression corpus')
     ap.add_argument('--e2e', action='store_true', help='also run full pipeline + result verification (slow)')
@@ -844,6 +910,7 @@ def main():
     rows += run_crop_checks(rdw, args.only)
     rows += run_skip_checks(rdw, args.only)
     rows += run_anchor_checks(rdw, args.only)
+    rows += run_sd_checks(rdw, args.only)
 
     print(f'{"layer":5s} {"case":40s} {"expect":6s} {"mark":5s} detail')
     fails = 0

@@ -28,6 +28,7 @@ $P $S prepare [文件]
 $P $S inpaint [文件]              # 默认**纯 MAT**；随后两轮自动兜底：① 暗字形（过冲）→ mask 膨胀 15x15 重跑（1 轮）；② 水印残留 → mask 膨胀 5x5 重跑（1 轮）
 $P $S --inverse inpaint [文件]     # 额外启用 stamp 逆解（逐图标定 gain+墨色 C + 结果择优，可保真实纹理，但在实拍图上会留暗字形/白线/彩点等伪影，故默认关）
 $P $S --no-retry inpaint [文件]   # 关残留重试
+$P $S --sd inpaint [文件]         # 水印压在高频纹理（花丛/枝叶）上时用 SD 生成式修补（默认关：要下 ~4GB 模型、单图分钟级；按背景纹理自动路由，平滑图仍走 MAT）
 $P $S review-lama [文件]          # 候选复查图 + PASS/WARN/FAIL
 $P $S overwrite-review [文件]     # FAIL 拒绝覆盖
 $P $S --force overwrite-review [文件]
@@ -55,6 +56,7 @@ $P $S --root /path run            # 项目外目录
 ## 验证、备份与质量标准
 - **验证（`verify_paths`）**：`overwrite-review`/`review-lama` 打印 `[PASS]/[WARN]/[FAIL]`。落盘**逐张判定**（与 Rust `finalize_outputs` 对齐）：FAIL 的图**保留原图不落盘**、其余照写，`--force` 跳过自检全部照写——**不再"任何一张 FAIL 就整批拒绝"**（旧行为下单张复杂背景的模板残留误报会让整批看似"跑了没用、水印还在"）。判据：① mask 外零改动（mask 外差异 >2 即 FAIL，必是 bug）；② 模板残留（`.tpl` 原图命中而修复后仍命中 → FAIL/WARN）——**结果分取源图水印锚点处的分**（非角窗最大分），且须 `≥ TEMPLATE_RESIDUAL_DOMINANCE`(0.85)×角窗最大分（"水印处即主导峰"）；强纹理背景（沙地/花墙）在角窗别处凑的高分不再误判已去干净图为 FAIL（实测 1.png 锚点 11.0/窗 27.3、6.png 锚点 24.6/窗 34.6）；③ mask 面积 >8% 告警。
 - **逆解默认关（`--inverse` 开）**：逆解按 stamp α/C 逐像素反解，能保真实纹理，但前提是"该图水印与资产 α/C 完全一致"——实拍图上并不总成立，会留**伪影**（4.png 白线、2.png 彩点、1.png 暗字形）。实测 7 张实拍图中 MAT 版模板残留**在 6 张上更低或相等**，故默认纯 MAT；需要保纹理的复杂背景（花丛类）可显式 `--inverse`。
+- **SD 生成式修补（默认关、`--sd` 开）**：MAT/LaMa 是"平滑填充器"，水印压在**高频纹理**（花丛/枝叶）上时只会插值、留可见糊块（6.png 实测花瓣被抹平成红块）。`--sd` 改用 Stable Diffusion（SD1.5 inpainting + LCM-LoRA 6 步、fp16/MPS、`diffusers`）生成式修补，能"脑补"可信纹理。按**水印周边环带高频能量**路由（`_ring_hf ≥ SD_TEXTURE_MIN`(9)；平滑图 1–5、花丛 ~10），只对纹理图启用；自裁 ≤512 方块、只贴 mask 像素；SD 图跳过逆解与两轮重试（生成式，MAT 重试会把它糊掉）。代价：要下模型（`runwayml/stable-diffusion-inpainting`；直连 HF 不通自动走 `hf-mirror.com`）、单图分钟级（M1 8GB 实测 LCM 6 步 2–6min，MAT 仅 ~10s）。**与 App/Rust 无关**（App 用自带 ONNX LaMa，不支持 SD）。
 - **暗字形（过冲）自动重试（默认开、1 轮）**：MAT 在 mask 盖不住水印**淡边缘/暗描边**时会把残留暗边当内容保留 → 结果字形区比周围暗（`_result_overshoot_score` 负值，1.png 地毯实测 −23）。检测到即把 mask 膨胀 `OVERSHOOT_DILATE=15x15` 重跑该图（实测 −23 → −3~−6），先于残留重试执行。这是"换一张图就失效"的兜底：判据只关乎结果本身、与图无关。
 - **残留重试（默认开、1 轮、`--no-retry` 关）**：残留判定 = 绝对分 ≥ `TEMPLATE_MIN_SCORE`(20) 或 相对分 ≥ 原分 `TEMPLATE_RESIDUAL_RATIO`(0.2) 且 ≥ `TEMPLATE_RESIDUAL_FLOOR`(8)——低对比残影达不到 20，靠相对判据兜底。命中即 mask 膨胀一级（`RETRY_DILATE=5x5`）隔离重跑；仍残留交 `overwrite-review` 拒绝。**逆解已生效的图跳过重试**——逆解是精确物理恢复，生成式 MAT 重试会把它重新糊掉（`.tpl`/`.wprof` 侧车标记者不入重试候选）。
 - **备份**：`original-watermark-backup/` 不存在才复制、不覆盖；通过后删备份与 `/tmp` 复查产物。

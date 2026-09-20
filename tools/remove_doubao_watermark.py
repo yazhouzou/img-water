@@ -1409,6 +1409,20 @@ OVERSHOOT_DILATE = (15, 15)
 # 方块（补齐后仍是 512²），只把 **mask 区域** 贴回原图 → mask 外逐字节不变。
 CROP_SIDE_MAX = 512
 CROP_MARGIN = 128
+# 扩散修补（**可选**，--sd 开；解决"水印压在高频纹理上"的固有难题）：MAT/LaMa 是"平滑
+# 填充器"，只会插值、不会生成花瓣/枝叶，水印压在花丛上时会留下可见糊块（6.png 实测）。
+# 用 Stable Diffusion 生成式修补可"脑补"出可信纹理，肉眼明显更自然。代价：要下模型
+# （~4GB）、单图分钟级（M1 8GB 实测 LCM 6 步 ≈ 2–4min，MAT 仅 ~10s），故**默认关**，
+# 且只对"背景有高频纹理"的图启用（按水印周边环带高频能量路由，平滑背景仍走 MAT）。
+SD_MODEL = 'runwayml/stable-diffusion-inpainting'
+SD_LCM_LORA = 'latent-consistency/lcm-lora-sdv1-5'
+SD_STEPS = 6              # LCM-LoRA 少步采样（4–8 步即可，实测与 25 步质量相当）
+SD_GUIDANCE = 1.5         # LCM 用低 CFG
+SD_SEED = 42
+SD_PROMPT = ''
+SD_TEXTURE_MIN = 9.0      # 水印周边环带高频能量阈值（>此值才走 SD）；平滑图 1–5、花丛 ~10
+SD_TEXTURE_RING = 90      # 环带外扩像素
+_sd_pipe_cache = None
 
 
 def _crop_box(mask, w, h):
@@ -1483,6 +1497,133 @@ def _iopaint_batch(names, model, src_dir, mask_dir, out_dir):
         out[Y1:Y2, X1:X2] = region
         Image.fromarray(out).save(out_dir / name)
     rmtree(crop_root, ignore_errors=True)
+
+
+def _hf_reachable(timeout=4.0):
+    """直连 HuggingFace 是否可用（HTTPS 实测；TCP 握手常被透明代理放行、TLS 才被墙）。"""
+    import urllib.request
+    try:
+        urllib.request.urlopen(
+            'https://huggingface.co/api/models/runwayml/stable-diffusion-inpainting',
+            timeout=timeout).read(1)
+        return True
+    except Exception:
+        return False
+
+
+def _ring_hf(obs, mask, margin=SD_TEXTURE_RING):
+    """水印**周边环带**（排除字形框本身）的高频能量——衡量背景纹理复杂度。字形自身
+    边缘也是高频，故必须排除，否则所有图都会被误判为"有纹理"。"""
+    import cv2
+    import numpy as np
+
+    ys, xs = np.nonzero(np.asarray(mask) > 0)
+    if len(xs) == 0:
+        return 0.0
+    h, w = mask.shape
+    x1, x2 = max(0, int(xs.min()) - margin), min(w, int(xs.max()) + 1 + margin)
+    y1, y2 = max(0, int(ys.min()) - margin), min(h, int(ys.max()) + 1 + margin)
+    reg = obs[y1:y2, x1:x2].astype(np.float32)
+    ring = np.ones(reg.shape[:2], bool)
+    ring[int(ys.min()) - y1:int(ys.max()) + 1 - y1, int(xs.min()) - x1:int(xs.max()) + 1 - x1] = False
+    if not ring.any():
+        return 0.0
+    hf = np.abs(reg - cv2.GaussianBlur(reg, (0, 0), 2.0)).mean(2)
+    return float(hf[ring].mean())
+
+
+def _sd_pipe():
+    """惰性加载 SD 修补管线（fp16 + MPS + LCM-LoRA，少步采样）。进程内单例。"""
+    global _sd_pipe_cache
+    if _sd_pipe_cache is not None:
+        return _sd_pipe_cache
+    # 必须在 import huggingface_hub 之前设置（其 ENDPOINT 常量在 import 时读取环境变量）。
+    if not os.environ.get('HF_ENDPOINT') and not _hf_reachable():
+        # 直连 HuggingFace 不通（常见于国内）时自动走镜像；已缓存模型同样受益。
+        os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+        print('HF unreachable, using HF_ENDPOINT=https://hf-mirror.com')
+    import torch
+    from diffusers import LCMScheduler, StableDiffusionInpaintPipeline
+
+    device = 'mps' if torch.backends.mps.is_available() else 'cpu'
+    dtype = torch.float16 if device == 'mps' else torch.float32
+    pipe = StableDiffusionInpaintPipeline.from_pretrained(
+        SD_MODEL, torch_dtype=dtype, safety_checker=None, requires_safety_checker=False)
+    pipe = pipe.to(device)
+    pipe.set_progress_bar_config(disable=True)
+    pipe.load_lora_weights(SD_LCM_LORA)
+    pipe.fuse_lora()
+    pipe.unload_lora_weights()
+    pipe.scheduler = LCMScheduler.from_config(pipe.scheduler.config)
+    _sd_pipe_cache = (pipe, device)
+    return _sd_pipe_cache
+
+
+def _sd_generator(device, seed):
+    """独立成函数便于回归打桩（CI 无 torch）。"""
+    import torch
+    return torch.Generator(device).manual_seed(seed)
+
+
+def _sd_inpaint(names, texture_min=SD_TEXTURE_MIN):
+    """对**背景有高频纹理**的图用 SD 生成式修补水印区（平滑图跳过，仍走 MAT）。
+    自裁 ≤512 方块推理，只把 **mask 像素** 贴回（mask 外逐字节不变），写回 LAMA。"""
+    import numpy as np
+
+    routed = []
+    for name in names:
+        mask_path = MASKS / name
+        if not mask_path.exists() or not (SOURCE / name).exists():
+            continue
+        mask = np.array(Image.open(mask_path).convert('L'))
+        if mask.max() == 0:
+            continue
+        with Image.open(SOURCE / name) as im:
+            obs = np.array(im.convert('RGB'))
+        hf = _ring_hf(obs, mask)
+        if hf >= texture_min:
+            routed.append((name, hf))
+    if not routed:
+        print(f'sd: no textured image (all background hf < {texture_min:g}), keep MAT')
+        return set()
+    print('sd routing (textured background): '
+          + ', '.join(f'{n} (hf {v:.1f})' for n, v in routed))
+    pipe, device = _sd_pipe()
+    applied = set()
+    for name, hf in routed:
+        with Image.open(SOURCE / name) as im:
+            rgb = im.convert('RGB')
+            w, h = rgb.size
+        mask = np.array(Image.open(MASKS / name).convert('L'))
+        box = _crop_box(mask, w, h)
+        if box is None:
+            continue
+        X1, Y1, X2, Y2 = box
+        crop = rgb.crop(box)
+        cmask = Image.fromarray(mask[Y1:Y2, X1:X2])
+        side = (X2 - X1, Y2 - Y1)
+        if side != (512, 512):
+            crop = crop.resize((512, 512))
+            cmask = cmask.resize((512, 512))
+        out = pipe(
+            prompt=SD_PROMPT, image=crop, mask_image=cmask,
+            num_inference_steps=SD_STEPS, guidance_scale=SD_GUIDANCE,
+            output_type='np', generator=_sd_generator(device, SD_SEED),
+        ).images[0]
+        out = Image.fromarray((out * 255).round().astype('uint8'))
+        if side != (512, 512):
+            out = out.resize(side)
+        out = np.array(out)
+        base = np.array(Image.open(LAMA / name).convert('RGB'))
+        sel = mask[Y1:Y2, X1:X2] > 0
+        region = base[Y1:Y2, X1:X2]
+        region[sel] = out[sel]
+        base[Y1:Y2, X1:X2] = region
+        Image.fromarray(base).save(LAMA / name)
+        (MASKS / f'{name}.sd').write_text('')
+        applied.add(name)
+        print(f'{name}: sd applied (bg hf {hf:.1f}, {SD_STEPS} steps)')
+    return applied
 
 
 def _expand_mask(mask_path, kernel=RETRY_DILATE):
@@ -1580,7 +1721,8 @@ def _overshoot_retry(names, model, skip=()):
             print(f'{name}: after overshoot retry foot-gap {ov:.1f}')
 
 
-def inpaint(model='mat', inverse=False, retry=True, use_profile=True):
+def inpaint(model='mat', inverse=False, retry=True, use_profile=True, sd=False,
+            sd_threshold=SD_TEXTURE_MIN):
     if not IOPAINT.exists():
         raise SystemExit('missing project env; run tools/ensure-inpaint-env.sh (or .ps1 on Windows) first')
     try:
@@ -1609,6 +1751,10 @@ def inpaint(model='mat', inverse=False, retry=True, use_profile=True):
     # 代价是推理约慢 12 倍（单图 ~2 分钟 vs ~10 秒）。lama 可用 --model lama 回退。
     # 自裁小块推理（见 _iopaint_batch）：MAT 补齐成 512²，避开整图补到 1024² 的非线性耗时。
     _iopaint_batch(active_names, model, SOURCE, MASKS, LAMA)
+    # 扩散修补（可选）：水印压在高频纹理（花丛等）上时 MAT 会糊，改用 SD 生成式修补。
+    sd_done = set()
+    if sd:
+        sd_done = _sd_inpaint(active_names, sd_threshold)
     inverse_done = set()
     if inverse:
         # inverse（默认开，逐图自动择优）：模板命中且纹理复杂的 scale≈1.0 图用
@@ -1617,6 +1763,8 @@ def inpaint(model='mat', inverse=False, retry=True, use_profile=True):
         applied = []
         for sidecar in sorted(MASKS.glob('*.tpl')):
             name = sidecar.stem
+            if name in sd_done:  # SD 已生成式修补（保纹理），不再叠逆解
+                continue
             obs_path, mat_path = SOURCE / name, LAMA / name
             if not obs_path.exists() or not mat_path.exists():
                 continue
@@ -1659,6 +1807,8 @@ def inpaint(model='mat', inverse=False, retry=True, use_profile=True):
         applied = []
         for sidecar in sorted(MASKS.glob('*.wprof')):
             name = sidecar.stem
+            if name in sd_done:
+                continue
             obs_path, mat_path = SOURCE / name, LAMA / name
             if not obs_path.exists() or not mat_path.exists():
                 continue
@@ -1689,13 +1839,13 @@ def inpaint(model='mat', inverse=False, retry=True, use_profile=True):
             print('profile inverse applied: ' + '; '.join(applied))
     if retry:
         # 暗字形（过冲）优先重试：mask 不足导致 MAT 保留水的暗边，先扩 mask 重画。
-        _overshoot_retry(active_names, model, skip=inverse_done)
+        _overshoot_retry(active_names, model, skip=inverse_done | sd_done)
     if retry:
         # 自校验不完美 → 重新处理（最多 1 轮）：见 _residual_retry。
         # 逆解成功的图不重试：逆解是精确物理恢复（已覆盖 MAT），retry 会用生成式
         # MAT 把它重新糊掉；且 gap-score 对逆解恢复的真实背景仍有残余响应（6.png
         # 逆解后 12.0，被判"残留"），据此重试会破坏逆解。
-        _residual_retry(active_names, model, skip=inverse_done)
+        _residual_retry(active_names, model, skip=inverse_done | sd_done)
 
 
 def review_lama(names, emit=True, root=None, verify=True):
@@ -1823,10 +1973,11 @@ def learn_auto(names, root, label, custom_box=None, any_position=False, ref_shor
     print(f'saved profile {profile.id} -> {base}')
 
 
-def run_all(names, custom_box, keep_work, root, model='mat', refine=False, any_position=False, inverse=False, force=False, retry=True, use_profile=True):
+def run_all(names, custom_box, keep_work, root, model='mat', refine=False, any_position=False, inverse=False, force=False, retry=True, use_profile=True, sd=False, sd_threshold=SD_TEXTURE_MIN):
     prepare(names, custom_box, root, emit=False, model=model, refine=refine,
             any_position=any_position, use_profile=use_profile)
-    inpaint(model, inverse=inverse, retry=retry, use_profile=use_profile)
+    inpaint(model, inverse=inverse, retry=retry, use_profile=use_profile,
+            sd=sd, sd_threshold=sd_threshold)
     candidate_review = review_lama(names, emit=False, root=root)
     final_review, skipped = overwrite_review(names, root, emit=False, force=force)
     skipped_set = set(skipped)
@@ -1893,6 +2044,24 @@ def main():
              'can leave dark-glyph/streak artifacts that plain MAT does not)',
     )
     parser.add_argument(
+        '--sd',
+        dest='sd',
+        action='store_true',
+        default=False,
+        help='enable Stable Diffusion generative inpainting for images whose watermark '
+             'sits on a high-frequency background (flowers/foliage), where MAT leaves a '
+             'visible smear. OFF by default: it needs a ~4GB model download and costs '
+             'minutes per image (M1 8GB: LCM 6 steps ~2-4min vs MAT ~10s), so smooth '
+             'backgrounds still use MAT. Route is chosen per image by background texture.',
+    )
+    parser.add_argument(
+        '--sd-threshold',
+        type=float,
+        default=SD_TEXTURE_MIN,
+        help=f'--sd routing threshold: watermark-surround background high-frequency energy '
+             f'(default {SD_TEXTURE_MIN:g}). Lower routes more images to SD (slower).',
+    )
+    parser.add_argument(
         '--no-retry',
         dest='retry',
         action='store_false',
@@ -1956,12 +2125,13 @@ def main():
     if args.command == 'run':
         run_all(names, args.mask_box, args.keep_work, root, args.model, args.refine,
                 args.any_position, args.inverse, force=args.force, retry=args.retry,
-                use_profile=args.profile)
+                use_profile=args.profile, sd=args.sd, sd_threshold=args.sd_threshold)
     elif args.command == 'prepare':
         prepare(names, args.mask_box, root, model=args.model, refine=args.refine,
                 any_position=args.any_position, use_profile=args.profile)
     elif args.command == 'inpaint':
-        inpaint(args.model, inverse=args.inverse, retry=args.retry, use_profile=args.profile)
+        inpaint(args.model, inverse=args.inverse, retry=args.retry, use_profile=args.profile,
+                sd=args.sd, sd_threshold=args.sd_threshold)
     elif args.command == 'review-lama':
         review_lama(names, root=root)
     elif args.command == 'overwrite-review':

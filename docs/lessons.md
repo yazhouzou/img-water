@@ -103,3 +103,10 @@
 - **真瓶颈是 iopaint/MAT 的输入补齐**：`Mat` 类固定 `min_size=512 / pad_mod=512 / pad_to_square=True`（`iopaint/model/mat.py`）——任何输入都会向上补齐成 **512 的方形**。水印 bbox 287×99 + 默认 `hd_strategy_crop_margin=128` → 543×355 → 被补成 **1024²**；而 MAT 耗时随边长非线性暴涨（同机同图实测：整图/1024² ~80–95s，**512² 仅 8–9s**，约 **10x**，且可复现）。
 - **解法＝自己裁 ≤512 的方块再跑**（`_iopaint_batch`）：按 mask 包围盒居中取 `CROP_SIDE_MAX=512` 的方块（`_crop_box`，保证含完整水印；核心 >512 的极端图退化为大块，正确性优先），跑到临时目录再**只把 mask 像素贴回原图** → mask 外逐字节不变（满足硬约束），`verify_paths` 报 `outside changed 0`。命门：iopaint 的 CROP 策略默认本就只在 mask 周围裁 128px，故自裁几乎不减少上下文，画质与整图路径相当（1.png 地毯肉眼对比无暗字形/糊块）。
 - **别被首轮计时误导**：MAT 的 Metal kernel 首次编译/机器热态会让同一任务在 2s~95s 间抖动；判据要多次重复取稳定值。
+
+## 15. SD 生成式修补：MAT 对高频纹理只会糊（--sd，可选）
+- **失败模式**：水印压在**高频纹理**上（6.png 花丛）时，MAT/LaMa 是"平滑填充器"——只会从周围插值，把花瓣抹平成一块红色渐变。这是模型能力的**固有上限**，不是 mask/阈值问题：mask 已精确到字形笔画，但被遮挡的纹理信息本就不存在。
+- **对照实验（6.png 花墙）**：① MAT → 红块糊；② 逆解 unmix（obs=αC+(1−α)bg）→ 花瓣纹理保住了，但留**彩色鬼影**（gain=1.0 黄色字形、0.7 变淡不消失；实测 C_eff≈[239,216,195] 暖白 vs 资产纯白）→ 豆包水印**不是单层 α·C 模型**，单层反解不可能干净；③ **SD 生成式修补 → 花瓣纹理自然、模板残留 57.1→1.9、mask 外 0 改动**。故对高频纹理只有生成式可行。
+- **实现**：`_sd_inpaint`（自裁 ≤512 方块 → diffusers `StableDiffusionInpaintPipeline` + **LCM-LoRA 6 步**（`latent-consistency/lcm-lora-sdv1-5`，4–8 步≈25 步质量）→ 只贴 mask 像素）。路由用 `_ring_hf`（**水印周边环带**高频能量，必须**排除字形框本身**——否则字形边缘也是高频、所有图都误判"有纹理"）。SD 图写 `.sd` 侧车、跳过逆解与两轮重试。
+- **速度/环境坑**：① iopaint 在 MPS 上强制 **fp32**（`get_torch_dtype`：fp16+attention_slicing 会黑图），比 fp16 慢一倍——故 SD 走**自建 diffusers 管线**用 fp16（实测不黑）；② 8GB M1 上 LCM 6 步单图 2–6min 且受**内存压力**影响抖动大；③ 直连 `huggingface.co` 常被墙（TCP 握手被透明代理放行、**TLS 才失败**）→ `_hf_reachable` 必须发 **HTTPS 请求**判定，且 `HF_ENDPOINT` 要在 **import `huggingface_hub` 之前**设置（其 `ENDPOINT` 常量 import 时读取），否则 `load_lora_weights` 的 `model_info` 仍打 huggingface.co 超时。
+- **回归**：`run_sd_checks`（打桩 `_sd_pipe`/`_sd_generator`，CI 无 torch 也能跑）：① `_ring_hf` 排除字形框；② 只路由高纹理、只贴 mask、平滑图跳过。
