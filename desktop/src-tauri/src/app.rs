@@ -11,6 +11,8 @@ const EVENT_LOG: &str = "pipeline-log";
 const EVENT_EXIT: &str = "pipeline-exit";
 const EVENT_MODEL_PROGRESS: &str = "model-progress";
 const EVENT_PROGRESS: &str = "pipeline-progress";
+/// 处理中用户尝试关窗：窗口被拦下，前端提示"任务进行中"。
+const EVENT_QUIT_BLOCKED: &str = "quit-blocked";
 
 use crate::i18n::{load as lang_of, tr};
 
@@ -27,7 +29,40 @@ fn finish(app: &AppHandle, payload: serde_json::Value) {
     if let Some(state) = app.try_state::<AppStorage>() {
         state.running.store(false, Ordering::SeqCst);
     }
+    clear_dock_progress(app);
 }
+
+/// 清除 Dock/任务栏进度条（macOS 上进度条是应用级，任务结束必须显式收回）。
+#[cfg(desktop)]
+fn clear_dock_progress(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_progress_bar(tauri::window::ProgressBarState {
+            status: Some(tauri::window::ProgressBarStatus::None),
+            progress: Some(0),
+        });
+    }
+}
+
+#[cfg(not(desktop))]
+fn clear_dock_progress(_app: &AppHandle) {}
+
+/// 处理中在 Dock/任务栏显示进度（不支持进度条的平台静默忽略）。
+#[cfg(desktop)]
+fn set_dock_progress(app: &AppHandle, done: usize, total: usize) {
+    if total == 0 {
+        return;
+    }
+    if let Some(window) = app.get_webview_window("main") {
+        let pct = ((done * 100) / total).min(100) as u64;
+        let _ = window.set_progress_bar(tauri::window::ProgressBarState {
+            status: Some(tauri::window::ProgressBarStatus::Normal),
+            progress: Some(pct),
+        });
+    }
+}
+
+#[cfg(not(desktop))]
+fn set_dock_progress(_app: &AppHandle, _done: usize, _total: usize) {}
 
 #[derive(Serialize)]
 struct EnvStatus {
@@ -341,6 +376,7 @@ fn run_pipeline(
         };
         let progress_app = app_handle.clone();
         let progress = move |stage: &str, done: usize, total: usize, name: &str| {
+            set_dock_progress(&progress_app, done, total);
             let _ = progress_app.emit(
                 EVENT_PROGRESS,
                 serde_json::json!({ "stage": stage, "done": done, "total": total, "name": name }),
@@ -488,6 +524,19 @@ fn do_share(
     _paths: &[String],
 ) -> Result<usize, String> {
     Err("Sharing is only available on Android".to_string())
+}
+
+/// 撤销「替换原图」：把 original-watermark-backup/ 里的原图恢复回 root。
+#[tauri::command]
+fn restore_backup(root: String, lang: Option<String>) -> Result<usize, String> {
+    let lang = lang_of(lang);
+    pipeline::restore_backup(&PathBuf::from(&root)).map_err(|e| {
+        tr(
+            &lang,
+            &format!("没有可恢复的原图备份（{}）", e),
+            &format!("No original backup to restore ({})", e),
+        )
+    })
 }
 
 #[tauri::command]
@@ -744,6 +793,7 @@ pub fn run_tauri_app() {
     }
     builder
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(AppStorage::default())
         .setup(|app| {
             if cfg!(target_os = "android") || cfg!(target_os = "ios") {
@@ -774,6 +824,7 @@ pub fn run_tauri_app() {
             cancel_pipeline,
             open_path,
             cleanup_pipeline,
+            restore_backup,
             export_results,
             share_results,
             read_image_base64,
@@ -781,12 +832,47 @@ pub fn run_tauri_app() {
             reveal_path,
             write_text_file
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let running = window
+                    .app_handle()
+                    .try_state::<AppStorage>()
+                    .map(|s| s.running.load(Ordering::SeqCst))
+                    .unwrap_or(false);
+                if running {
+                    // 处理中不许关：否则进程被杀在写一半，留下半成品结果与半截备份。
+                    api.prevent_close();
+                    let _ = window.show();
+                    #[cfg(desktop)]
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                    let _ = window.app_handle().emit(EVENT_QUIT_BLOCKED, ());
+                } else {
+                    // 关窗即退出。macOS 默认"关最后一个窗口不退出进程"，会留下一个
+                    // 没有窗口、仍占着 ONNX 模型内存的后台进程（点 Dock 也回不来）。
+                    window.app_handle().exit(0);
+                }
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app, event| {
-            // 退出前清理保留的临时复查产物（/tmp/doubao-watermark-review）
-            if matches!(event, tauri::RunEvent::Exit { .. }) {
-                let _ = pipeline::cleanup_preserved();
+        .run(|app, event| {
+            let _ = app;
+            match event {
+                // 退出前清理保留的临时复查产物（/tmp/doubao-watermark-review）
+                tauri::RunEvent::Exit { .. } => {
+                    let _ = pipeline::cleanup_preserved();
+                }
+                // macOS：点 Dock 图标（或 Cmd+H 后回来）时把窗口带回前台，否则看起来像卡死
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen { .. } => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                }
+                _ => {}
             }
         });
 }

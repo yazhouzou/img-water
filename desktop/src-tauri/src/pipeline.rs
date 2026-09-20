@@ -2192,6 +2192,38 @@ pub fn cleanup(options: &PipelineOptions, names: &[String]) -> Result<(), String
     Ok(())
 }
 
+/// 只清临时工作目录，保留 original-watermark-backup/（覆盖模式要留作"撤销"依据）。
+pub fn cleanup_work_only() -> Result<(), String> {
+    let work = crate::workdir();
+    if work.exists() {
+        fs::remove_dir_all(&work).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 把 `original-watermark-backup/` 里的原图恢复回 `root`，成功后删除备份目录。
+/// 返回恢复的张数；没有备份时报错（前端据此提示"无可恢复内容"）。
+pub fn restore_backup(root: &Path) -> Result<usize, String> {
+    let backup = backup_dir(root);
+    if !backup.is_dir() {
+        return Err("no backup to restore".to_string());
+    }
+    let mut restored = 0usize;
+    for entry in fs::read_dir(&backup).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        fs::copy(&path, root.join(entry.file_name())).map_err(|e| e.to_string())?;
+        restored += 1;
+    }
+    if restored > 0 {
+        fs::remove_dir_all(&backup).map_err(|e| e.to_string())?;
+    }
+    Ok(restored)
+}
+
 pub fn cleanup_preserved() -> Result<(), String> {
     let preserved = preserved_review_dir();
     if preserved.exists() {
@@ -2270,12 +2302,22 @@ pub fn run(
     }
     let (source_review, candidate_review, final_review) =
         preserve_reviews(&source_review, &candidate_review, &final_review)?;
-    cleanup(options, &names)?;
-    log(&format!(
-        "cleaned: {} and {}",
-        backup_dir(&options.root).display(),
-        crate::workdir().display()
-    ));
+    if options.overwrite_original {
+        // 覆盖模式保留 original-watermark-backup/：让"替换原图"可撤销（前端可一键恢复）。
+        // prepare 在备份存在时以它为 origin，因此重复覆盖同一文件夹仍基于最初原图，结果幂等。
+        cleanup_work_only()?;
+        log(&format!(
+            "kept backup for undo: {}",
+            backup_dir(&options.root).display()
+        ));
+    } else {
+        cleanup(options, &names)?;
+        log(&format!(
+            "cleaned: {} and {}",
+            backup_dir(&options.root).display(),
+            crate::workdir().display()
+        ));
+    }
     Ok(RunSummary {
         source_review,
         candidate_review,
@@ -2632,6 +2674,21 @@ mod tests {
         assert_eq!(output_dir(&options), custom);
         let options = PipelineOptions { overwrite_original: true, ..options };
         assert_eq!(output_dir(&options), root, "覆盖模式必须忽略自定义目录");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn restore_backup_copies_originals_back() {
+        let root = temp_root("restore");
+        fs::write(root.join("a.png"), b"cleaned").unwrap();
+        let backup = root.join("original-watermark-backup");
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("a.png"), b"original").unwrap();
+        assert_eq!(restore_backup(&root).unwrap(), 1);
+        assert_eq!(fs::read(root.join("a.png")).unwrap(), b"original");
+        assert!(!backup.exists(), "恢复后应删除备份目录，避免重复恢复");
+        // 没有备份时必须是 Err（前端据此提示"无可恢复内容"），不能静默成功
+        assert!(restore_backup(&root).is_err());
         fs::remove_dir_all(&root).unwrap();
     }
 

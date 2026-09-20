@@ -31,6 +31,7 @@ ab_glyph = "0.2"
 ureq = { version = "2", features = ["rustls"] }
 tauri-plugin-single-instance = "2.4.4"
 tauri-plugin-window-state = "2.4.1"
+tauri-plugin-notification = "2.4.0"
 
 [profile.release]
 strip = true

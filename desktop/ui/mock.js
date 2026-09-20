@@ -81,6 +81,9 @@
       case 'write_text_file':
         console.log('[mock] write_text_file:', args && args.path);
         return Promise.resolve();
+      case 'restore_backup':
+        console.log('[mock] restore_backup:', args && args.root);
+        return Promise.resolve(1);
       case 'list_watermarks':
         return Promise.resolve([
           { id: 'qwen', label: 'qwen', created: '', source: 'builtin', width: 82, height: 428, builtin: true },
@@ -135,6 +138,11 @@
       save: async (opts) => (opts && opts.defaultPath) || '/mock/watermark-cleaner-log.txt',
       confirm: async () => true,
       message: async () => {},
+    },
+    notification: {
+      isPermissionGranted: async () => false,
+      requestPermission: async () => 'denied',
+      sendNotification: async (opts) => console.log('[mock] notify:', opts && opts.title),
     },
   };
 

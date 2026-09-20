@@ -529,6 +529,28 @@ const thumbQueue = [];
 let thumbActive = 0;
 const THUMB_CONCURRENCY = 3;
 
+// 桌面完成通知：批量任务要几分钟，用户多半已经切走去看别的
+const notif = !isMobile && window.__TAURI__.notification ? window.__TAURI__.notification : null;
+let notifGranted = false;
+
+async function initNotifications() {
+  if (!notif) return;
+  try {
+    notifGranted = await notif.isPermissionGranted();
+    if (!notifGranted) notifGranted = (await notif.requestPermission()) === 'granted';
+  } catch (_) {
+    notifGranted = false;
+  }
+}
+
+async function notifyDone(title, body) {
+  if (!notif || !notifGranted || !title) return;
+  if (document.hasFocus()) return; // 用户正看着窗口就不打扰
+  try {
+    await notif.sendNotification({ title, body: body || '' });
+  } catch (_) { /* 通知失败不影响主流程 */ }
+}
+
 function clearResultList() {
   resultPaths = [];
   thumbQueue.length = 0;
@@ -680,6 +702,32 @@ function renderExitBanner(payload) {
       wrap.appendChild(mk(t('shareResults'), 'share_results', t('shareDone'), t('shareFailed'), t('shareNone')));
       els.resultBanner.appendChild(wrap);
     }
+    // 覆盖模式：备份保留在 original-watermark-backup/，给一个"后悔药"
+    if (payload.overwritten && targetRoot) {
+      const restore = document.createElement('button');
+      restore.className = 'btn small';
+      restore.type = 'button';
+      restore.textContent = t('restoreOriginal');
+      restore.addEventListener('click', async () => {
+        const ok = await confirm(t('restoreConfirm'), { title: t('restoreOriginal'), kind: 'warning' });
+        if (!ok) return;
+        try {
+          const n = await invoke('restore_backup', { root: targetRoot, lang: window.i18n.lang });
+          logLine(t('restoreDone')(n));
+          clearResultList();
+          els.resultBanner.className = 'result-banner ok';
+          els.resultBanner.innerHTML = '';
+          const box = document.createElement('div');
+          box.className = 'banner-main';
+          box.textContent = `✓ ${t('restoreDone')(n)}`;
+          els.resultBanner.appendChild(box);
+          await refreshFiles();
+        } catch (err) {
+          logLine(t('restoreFailed')(String(err)));
+        }
+      });
+      els.resultBanner.appendChild(restore);
+    }
   } else if (payload.cancelled) {
     els.resultBanner.textContent = t('cancelledBanner');
   } else {
@@ -698,6 +746,10 @@ function handleExit(payload) {
     } else {
       logLine(t('logModelFailed')(payload.error || ''));
     }
+    notifyDone(
+      payload.success ? t('notifyModelDoneTitle') : t('notifyModelFailTitle'),
+      payload.success ? t('notifyModelDoneBody') : (payload.error || '')
+    );
     refreshEnv();
     return;
   }
@@ -707,6 +759,12 @@ function handleExit(payload) {
   renderExitBanner(payload);
   renderResultList(payload.success ? payload.outputs : []);
   setState('done');
+  if (!payload.cancelled) {
+    notifyDone(
+      payload.success ? t('notifyDoneTitle') : t('notifyFailTitle'),
+      payload.success ? t('notifyDoneBody')(lastRunCount) : (payload.error || `exit ${payload.code}`)
+    );
+  }
   const logText = els.log.textContent;
   const lastMatch = (re) => [...logText.matchAll(re)].pop();
   const sourceMatch = lastMatch(/source review: (.+)/g);
@@ -784,6 +842,12 @@ async function init() {
 
   listen('pipeline-log', (event) => logLine(event.payload));
   listen('pipeline-exit', (event) => handleExit(event.payload));
+  // 处理中尝试关窗被原生拦下：把窗口带回前台并说明原因
+  listen('quit-blocked', () => {
+    els.logBox.open = true;
+    logLine(t('quitBlockedLog'));
+  });
+  initNotifications();
   listen('model-progress', (event) => setModelProgress(event.payload.done, event.payload.total));
   listen('pipeline-progress', (event) => {
     const p = event.payload;
@@ -1063,6 +1127,9 @@ async function init() {
   });
 
   els.btnCleanup.addEventListener('click', async () => {
+    // 覆盖模式下这个动作会删掉 original-watermark-backup/（也就失去"恢复原图"），先确认
+    const ok = await confirm(t('cleanupConfirm'), { title: t('cleanup'), kind: 'warning' });
+    if (!ok) return;
     els.btnCleanup.disabled = true;
     try {
       await invoke('cleanup_pipeline', { lang: window.i18n.lang });
