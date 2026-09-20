@@ -10,6 +10,7 @@
   --primary-soft: #eef0ff;
   --danger: #dc2626;
   --ok: #16a34a;
+  --warn: #b45309;
   --radius: 12px;
   --shadow: 0 1px 3px rgba(16, 24, 40, 0.07), 0 1px 2px rgba(16, 24, 40, 0.04);
 }
@@ -328,10 +329,13 @@ body {
 }
 .result-banner.ok { background: #e8f7ee; color: var(--ok); }
 .result-banner.err { background: #fdecec; color: var(--danger); }
+.result-banner.warn { background: #fff4e5; color: var(--warn); }
+.banner-sub.warn { opacity: 1; }
 .banner-actions { display: flex; gap: 8px; margin-top: 8px; }
 .banner-actions .btn { flex: 1; }
 html[data-theme='dark'] .result-banner.ok { background: #16301f; }
 html[data-theme='dark'] .result-banner.err { background: #3a1d1d; }
+html[data-theme='dark'] .result-banner.warn { background: #3a2c14; }
 
 /* 结果列表：逐张缩略图（点击大图预览 / 定位文件） */
 .result-list {

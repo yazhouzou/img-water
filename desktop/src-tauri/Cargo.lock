@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "doubao-watermark-remover"
-version = "0.1.0"
+version = "0.5.5"
 dependencies = [
  "ab_glyph",
  "base64 0.22.1",
@@ -1024,6 +1024,7 @@ dependencies = [
  "imageproc",
  "jni",
  "ort",
+ "png 0.17.16",
  "serde",
  "serde_json",
  "tauri",

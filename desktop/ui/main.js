@@ -20,6 +20,7 @@ const els = {
   keepWork: document.getElementById('keep-work'),
   anyPosition: document.getElementById('any-position'),
   refine: document.getElementById('refine'),
+  inverse: document.getElementById('inverse'),
   profileSelect: document.getElementById('profile-select'),
   profileLabel: document.getElementById('profile-label'),
   btnLearn: document.getElementById('btn-learn'),
@@ -127,6 +128,73 @@ function renderOutputDir() {
   els.btnOutputDirReset.hidden = !custom;
 }
 
+// 用户设置持久化（纯 localStorage，零后端）：语言/主题各自另存，其余集中一个 JSON。
+// 只存"跨会话仍成立"的偏好，不存与单张图绑定的状态（如手动框选）。
+const SETTINGS_KEY = 'wm-settings';
+const LAST_ROOT_KEY = 'wm-last-root';
+
+function readSettings() {
+  try {
+    return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function applySettings() {
+  const s = readSettings();
+  if (s.outputMode === 'overwrite') {
+    const radio = els.outputRow.querySelector('input[name=output-mode][value=overwrite]');
+    if (radio) radio.checked = true;
+  }
+  if (typeof s.anyPosition === 'boolean') els.anyPosition.checked = s.anyPosition;
+  if (typeof s.refine === 'boolean') els.refine.checked = s.refine;
+  if (typeof s.inverse === 'boolean') els.inverse.checked = s.inverse;
+  if (typeof s.keepWork === 'boolean') els.keepWork.checked = s.keepWork;
+  // 档案 id 待 refreshProfiles() 后校验；已被删除的会在 renderProfiles 里回落成自动
+  if (s.profileId) selectedProfileId = s.profileId;
+  if (s.outputDir) outputDirOverride = s.outputDir;
+  renderOutputHint();
+  renderOutputDir();
+}
+
+function persistSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+      outputMode: overwriteMode() ? 'overwrite' : 'save',
+      anyPosition: els.anyPosition.checked,
+      refine: els.refine.checked,
+      inverse: els.inverse.checked,
+      keepWork: els.keepWork.checked,
+      profileId: selectedProfileId || '',
+      outputDir: outputDirOverride || '',
+    }));
+  } catch (_) { /* 隐私模式等禁用存储时忽略 */ }
+}
+
+function rememberRoot(root) {
+  if (isMobile || !root) return;
+  try { localStorage.setItem(LAST_ROOT_KEY, root); } catch (_) {}
+}
+
+// 启动时恢复上次目录；目录已被删/移动就清掉记录，不打扰用户
+async function restoreLastFolder() {
+  if (isMobile) return;
+  const lastRoot = localStorage.getItem(LAST_ROOT_KEY);
+  if (!lastRoot) return;
+  try {
+    const names = await invoke('list_pngs', { root: lastRoot, lang: window.i18n.lang });
+    targetRoot = lastRoot;
+    els.btnRefresh.disabled = false;
+    els.btnCleanup.disabled = running;
+    clearMaskSelection();
+    renderFolderPath();
+    renderFiles(names);
+  } catch (_) {
+    try { localStorage.removeItem(LAST_ROOT_KEY); } catch (_) {}
+  }
+}
+
 const STAGE_LABEL = () => ({ prepare: t('stagePrepare'), inpaint: t('stageInpaint'), save: t('stageSave') });
 
 function setRunProgress(stage, done, total, name) {
@@ -144,7 +212,8 @@ function logLine(text) {
 
 function showReview(container, path) {
   invoke('read_image_base64', { path, lang: window.i18n.lang })
-    .then((dataUrl) => {
+    .then((preview) => {
+      const dataUrl = preview.data_url;
       container.innerHTML = '';
       const img = document.createElement('img');
       img.src = dataUrl;
@@ -201,12 +270,12 @@ function escapeHtml(text) {
 // 前后对比 slider：左拖右滑看处理前/后差异（两张复查拼图尺寸一致）
 async function setupCompare(sourcePath, finalPath) {
   try {
-    const [sourceUrl, finalUrl] = await Promise.all([
+    const [sourcePreview, finalPreview] = await Promise.all([
       invoke('read_image_base64', { path: sourcePath, lang: window.i18n.lang }),
       invoke('read_image_base64', { path: finalPath, lang: window.i18n.lang }),
     ]);
-    els.compareSource.src = sourceUrl;
-    els.compareFinal.src = finalUrl;
+    els.compareSource.src = sourcePreview.data_url;
+    els.compareFinal.src = finalPreview.data_url;
     els.compareBox.hidden = false;
     setComparePos(50);
   } catch (_) {
@@ -428,7 +497,9 @@ function updateMaskUi() {
 }
 
 // —— 手动框选水印区域 ——
-let maskSel = null; // 原图像素坐标 { x1, y1, x2, y2 }
+let maskSel = null;
+// 预览可能被缩小（大图），框选坐标要按它映射回原图尺寸
+let maskOrigin = null; // 原图像素坐标 { x1, y1, x2, y2 }
 
 function maskImgPoint(ev) {
   const img = els.maskImg;
@@ -461,8 +532,9 @@ function setMaskButtons() {
   els.btnMaskOk.disabled = !maskSel;
   els.btnMaskReset.disabled = !maskSel;
   if (maskSel) {
-    const w = Math.round(Math.abs(maskSel.x2 - maskSel.x1));
-    const h = Math.round(Math.abs(maskSel.y2 - maskSel.y1));
+    const k = maskOrigin && els.maskImg.naturalWidth ? maskOrigin.w / els.maskImg.naturalWidth : 1;
+    const w = Math.round(Math.abs(maskSel.x2 - maskSel.x1) * k);
+    const h = Math.round(Math.abs(maskSel.y2 - maskSel.y1) * k);
     els.maskHint.textContent = t('maskHintSelected')(w, h);
   } else {
     els.maskHint.textContent = t('maskHint');
@@ -475,11 +547,15 @@ async function openMaskEditor() {
   const path = targetRoot.replace(/\/+$/, '') + '/' + files[0];
   els.maskRect.hidden = true;
   maskSel = null;
+  maskOrigin = null;
   setMaskButtons();
   els.maskImg.src = '';
   els.maskOverlay.hidden = false;
   try {
-    els.maskImg.src = await invoke('read_image_base64', { path, lang: window.i18n.lang });
+    // 大图只取缩略图（原 10MB 上限会让大图直接无法框选）；原图尺寸用于坐标映射
+    const preview = await invoke('read_image_base64', { path, max: 2048, lang: window.i18n.lang });
+    maskOrigin = { w: preview.width, h: preview.height };
+    els.maskImg.src = preview.data_url;
   } catch (err) {
     els.maskOverlay.hidden = true;
     logLine(t('logMaskFailed')(String(err)));
@@ -492,13 +568,15 @@ function closeMaskEditor() {
 }
 
 function confirmMaskSelection() {
-  if (!maskSel) return;
+  if (!maskSel || !maskOrigin) return;
   const img = els.maskImg;
+  // 预览若是缩小过的，先把框选坐标换算回原图像素
+  const k = img.naturalWidth ? maskOrigin.w / img.naturalWidth : 1;
   manualMask = {
-    dx1: Math.round(Math.min(maskSel.x1, maskSel.x2) - img.naturalWidth),
-    dy1: Math.round(Math.min(maskSel.y1, maskSel.y2) - img.naturalHeight),
-    dx2: Math.round(Math.max(maskSel.x1, maskSel.x2) - img.naturalWidth),
-    dy2: Math.round(Math.max(maskSel.y1, maskSel.y2) - img.naturalHeight),
+    dx1: Math.round(Math.min(maskSel.x1, maskSel.x2) * k - maskOrigin.w),
+    dy1: Math.round(Math.min(maskSel.y1, maskSel.y2) * k - maskOrigin.h),
+    dx2: Math.round(Math.max(maskSel.x1, maskSel.x2) * k - maskOrigin.w),
+    dy2: Math.round(Math.max(maskSel.y1, maskSel.y2) * k - maskOrigin.h),
   };
   updateMaskUi();
   logLine(`[${t('maskSetLog')}] ${manualMask.dx1}, ${manualMask.dy1}, ${manualMask.dx2}, ${manualMask.dy2}`);
@@ -651,20 +729,30 @@ let lastExitPayload = null;
 
 function renderExitBanner(payload) {
   els.resultBanner.hidden = false;
-  els.resultBanner.className = 'result-banner ' + (payload.success ? 'ok' : 'err');
+  const skipped = payload.success ? (payload.skipped || []) : [];
+  els.resultBanner.className =
+    'result-banner ' + (!payload.success ? 'err' : skipped.length ? 'warn' : 'ok');
   els.resultBanner.innerHTML = '';
   if (payload.success) {
     const dir = payload.outputDir || 'watermark-cleaned/';
     const main = document.createElement('div');
     main.className = 'banner-main';
+    const written = typeof payload.processed === 'number' ? payload.processed : lastRunCount;
     const title = document.createElement('div');
     title.className = 'banner-title';
-    title.textContent = `✓ ${t('doneBanner')} · ${t('fileCount')(lastRunCount)}`;
+    title.textContent = `✓ ${t('doneBanner')} · ${t('fileCount')(written)}`;
     const sub = document.createElement('div');
     sub.className = 'banner-sub';
     sub.textContent = payload.overwritten ? t('doneSubOverwrite') : t('doneSubSave')(dir);
     main.appendChild(title);
     main.appendChild(sub);
+    // 未过自检的图不写坏结果：明确告诉用户"这几张还是带水印的原图"
+    if (skipped.length) {
+      const warn = document.createElement('div');
+      warn.className = 'banner-sub warn';
+      warn.textContent = t('skippedBanner')(skipped.length, skipped.map((s) => s.name).join('、'));
+      main.appendChild(warn);
+    }
     els.resultBanner.appendChild(main);
     if (!isMobile && payload.outputDir) {
       const btn = document.createElement('button');
@@ -762,7 +850,9 @@ function handleExit(payload) {
   if (!payload.cancelled) {
     notifyDone(
       payload.success ? t('notifyDoneTitle') : t('notifyFailTitle'),
-      payload.success ? t('notifyDoneBody')(lastRunCount) : (payload.error || `exit ${payload.code}`)
+      payload.success
+        ? t('notifyDoneBody')(typeof payload.processed === 'number' ? payload.processed : lastRunCount)
+        : (payload.error || `exit ${payload.code}`)
     );
   }
   const logText = els.log.textContent;
@@ -778,6 +868,7 @@ function handleExit(payload) {
 }
 
 async function init() {
+  applySettings();
   const ready = await refreshEnv();
   await refreshProfiles();
 
@@ -985,6 +1076,7 @@ async function init() {
     const picked = await open({ directory: true, multiple: false, title: t('pickFolderTitle') });
     if (!picked) return;
     targetRoot = picked;
+    rememberRoot(picked);
     els.btnRefresh.disabled = false;
     els.btnCleanup.disabled = running;
     clearReviews();
@@ -996,7 +1088,7 @@ async function init() {
   if (!isMobile && window.__TAURI__.window) {
     try {
       const { getCurrentWindow } = window.__TAURI__.window;
-      getCurrentWindow().onDragDropEvent((event) => {
+      getCurrentWindow().onDragDropEvent(async (event) => {
         const payload = event.payload;
         if (running) {
           els.dropOverlay.hidden = true;
@@ -1013,14 +1105,37 @@ async function init() {
         if (payload.type === 'drop') {
           els.dropOverlay.hidden = true;
           const all = Array.isArray(payload.paths) ? payload.paths : [];
-          const paths = all.filter((p) => /\.(png|jpe?g|webp)$/i.test(p));
-          if (paths.length > 0) importPaths(paths);
-          else if (all.length > 0) logLine(t('dropNoImage'));
+          const images = all.filter((p) => /\.(png|jpe?g|webp)$/i.test(p));
+          const others = all.filter((p) => !images.includes(p));
+          // 拖进来的可能是**文件夹**：桌面端直接把它当作处理目录（原地处理、可覆盖原图），
+          // 与「选择文件夹」按钮同一语义（复制副本只用于移动端的文件导入）。
+          let dir = null;
+          if (!isMobile) {
+            for (const p of others) {
+              if (await invoke('is_directory', { path: p })) { dir = p; break; }
+            }
+          }
+          if (dir) {
+            targetRoot = dir;
+            rememberRoot(dir);
+            els.btnRefresh.disabled = false;
+            els.btnCleanup.disabled = running;
+            clearReviews();
+            clearMaskSelection();
+            await refreshFiles();
+          } else if (images.length > 0) {
+            importPaths(images);
+          } else if (all.length > 0) {
+            logLine(t('dropNoImage'));
+          }
         }
       });
     } catch (_) { /* 旧版本 API 缺失时忽略 */ }
   }
 
+  for (const el of [els.anyPosition, els.refine, els.inverse, els.keepWork]) {
+    el.addEventListener('change', persistSettings);
+  }
   els.btnRefresh.addEventListener('click', refreshFiles);
   els.btnSelectAll.addEventListener('click', () => {
     els.fileList.querySelectorAll('input[type=checkbox]').forEach((el) => { el.checked = true; });
@@ -1035,17 +1150,22 @@ async function init() {
     if (!running) startModelDownload(false);
   });
 
-  els.outputRow.addEventListener('change', renderOutputHint);
+  els.outputRow.addEventListener('change', () => {
+    renderOutputHint();
+    persistSettings();
+  });
   if (els.btnOutputDir) {
     els.btnOutputDir.addEventListener('click', async () => {
       const picked = await open({ directory: true, multiple: false, title: t('pickOutputDir') });
       if (!picked) return;
       outputDirOverride = Array.isArray(picked) ? picked[0] : picked;
       renderOutputDir();
+      persistSettings();
     });
     els.btnOutputDirReset.addEventListener('click', () => {
       outputDirOverride = null;
       renderOutputDir();
+      persistSettings();
     });
   }
 
@@ -1053,6 +1173,7 @@ async function init() {
     selectedProfileId = els.profileSelect.value || null;
     renderProfileDelete();
     els.learnStatus.textContent = '';
+    persistSettings();
   });
 
   els.btnLearn.addEventListener('click', () => {
@@ -1071,6 +1192,7 @@ async function init() {
       await invoke('delete_watermark', { id: current.id, lang: window.i18n.lang });
       selectedProfileId = null;
       await refreshProfiles();
+      persistSettings();
       els.learnStatus.textContent = '';
     } catch (err) {
       els.learnStatus.textContent = String(err);
@@ -1089,6 +1211,7 @@ async function init() {
       if (!ok) return;
     }
     lastRunCount = files.length;
+    persistSettings();
     setRunning(true);
     setState('running');
     resetReviews();
@@ -1101,6 +1224,7 @@ async function init() {
         overwriteOriginal: overwrite,
         anyPosition: els.anyPosition.checked,
         refine: els.refine.checked,
+        inverse: els.inverse.checked,
         profileId: selectedProfileId,
         outputDir: overwrite ? null : outputDirOverride,
         lang: window.i18n.lang,
@@ -1146,6 +1270,7 @@ async function init() {
   }
   setState('empty');
   renderEmptyState();
+  await restoreLastFolder();
 }
 
 init();

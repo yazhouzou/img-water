@@ -308,8 +308,9 @@ pub struct PipelineOptions {
     /// false（默认）：结果级验证 FAIL（如 mask 外被改动）时拒绝落盘。
     /// true：跳过拒绝，强制写入（对应 CLI `--force`）。
     pub force: bool,
-    /// true（默认）：模板命中后做豆包 stamp 逐像素解析逆解（还原真实背景）；
-    /// false 只用生成式结果（对应 CLI `--no-inverse`）。
+    /// false（默认，与 Python 对齐）：只用生成式结果（LaMa），不做豆包 stamp 逐像素
+    /// 逆解——实拍图上逆解与资产 α/C 不完全一致，会留白线/彩点/暗字形伪影。
+    /// true：模板命中后做 stamp 逆解（还原真实背景；需要保纹理的复杂背景可开）。
     pub inverse: bool,
     /// true（默认）：结果残留时膨胀 mask 隔离重跑一轮（对应 CLI `--no-retry`）。
     pub retry: bool,
@@ -343,15 +344,27 @@ fn image_format_for(name: &str) -> image::ImageFormat {
     }
 }
 
-/// 按原文件格式保存结果（JPEG 质量 92，其余走默认编码器）。
-fn save_result(image: DynamicImage, path: &Path) -> Result<(), String> {
+/// 按原文件格式保存结果（JPEG 质量 92，其余走默认编码器），并把原图的 EXIF/ICC 搬回。
+fn save_result(image: DynamicImage, path: &Path, meta: &crate::photo_meta::CarryMeta) -> Result<(), String> {
     let format = image_format_for(path.file_name().unwrap_or_default().to_string_lossy().as_ref());
     if format == image::ImageFormat::Jpeg {
         let rgb = image.to_rgb8();
-        let file = fs::File::create(path).map_err(|e| e.to_string())?;
-        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 92);
-        rgb.write_with_encoder(encoder).map_err(|e| e.to_string())
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 92);
+            rgb.write_with_encoder(encoder).map_err(|e| e.to_string())?;
+        }
+        let merged = meta.splice_jpeg(buf);
+        fs::write(path, merged).map_err(|e| e.to_string())
+    } else if format == image::ImageFormat::Png {
+        let mut buf: Vec<u8> = Vec::new();
+        image
+            .write_with_encoder(image::codecs::png::PngEncoder::new(&mut buf))
+            .map_err(|e| e.to_string())?;
+        let merged = meta.splice_png(buf);
+        fs::write(path, merged).map_err(|e| e.to_string())
     } else {
+        // WebP：`image` 只有无损编码器（有损需要 libwebp 这个 C 依赖），ICC/EXIF 不搬
         image.save_with_format(path, format).map_err(|e| e.to_string())
     }
 }
@@ -652,6 +665,18 @@ fn morph_max(gray: &[u8], rw: usize, rh: usize, se: &[bool], r: usize) -> Vec<u8
     out
 }
 
+/// 字符高度（相对短边）判据：水印随短边等比缩放，字形高度稳定落在带内——
+/// 豆包 stamp ≈ 3.5% 短边、合成通用文字 ≈ 3.4% 短边；而"已去水印图"右下角的
+/// 背景亮斑/纹理碎块只有 1.3%~2.0% 短边。旧下限 1.2%*H 太低 → 兜底检测把背景
+/// 当水印硬修（地毯/纸面/花丛），收紧到 2.6%~5.0% 短边后真实水印仍稳过。
+const CORNER_CHAR_H_MIN_REL: f64 = 0.026;
+const CORNER_CHAR_H_MAX_REL: f64 = 0.050;
+const CORNER_ROW_H_MIN_REL: f64 = 0.026;
+const CORNER_ROW_H_MAX_REL: f64 = 0.046;
+/// 行块模式合并后的整行宽高比上限：水印行块实测 4.0~4.6（豆包）/ 4.6~9（通用
+/// 文字），背景亮斑成行后 6.8~10.8（已去水印图 6.png 花丛 859x79）→ 上限 8。
+const CORNER_ROW_ASPECT_MAX: f64 = 8.0;
+
 /// 字符行分析：从二值图中找“高度一致的字符序列”（水印是单行文字，
 /// 字符高度统一；沙滩亮斑/花影粘连块高度杂乱或超高，不成行即排除）。
 fn corner_text_boxes(
@@ -702,9 +727,10 @@ fn corner_text_boxes(
                 }
             }
             let (cw, ch) = (maxx - minx + 1, maxy - miny + 1);
-            // 字符级组件：高度占图高 1.2%~4.5%（豆包水印 ~2.9%），宽高比合理
+            // 字符级组件：高度占短边 2.6%~5.0%（豆包水印 ~3.5%），宽高比合理
             let chf = ch as f64;
-            if (chf < h as f64 * 0.012) || (chf > h as f64 * 0.045) {
+            let short = h.min(w) as f64;
+            if (chf < short * CORNER_CHAR_H_MIN_REL) || (chf > short * CORNER_CHAR_H_MAX_REL) {
                 continue;
             }
             if (cw as f64) < chf * 0.25 || (cw as f64) > chf * 7.0 || area < 120 {
@@ -823,7 +849,8 @@ fn detect_corner_faded(image: &DynamicImage) -> Vec<(i64, i64, i64, i64)> {
 
 /// 行块模式：9x3 膨胀两次直接合并字符成行（水印字符与背景亮斑粘连、
 /// 字符级分离失败时——如雪景雪点——仍能定位整行）。防御：
-/// 1) 行框高度上限 6% 图高（排除大面积粘连块，如 1.png 沙滩亮斑 12%）；
+/// 1) 行框高度须落在水印字形高度带（相对短边 2.6%~4.6%）内、宽高比 ≤8
+///    （排除大面积粘连块，如 1.png 沙滩亮斑 12%、已去水印图背景碎块）；
 /// 2) 组件必须整体位于 corner 检测区内（排除从区外伸进来的画面内容）；
 /// 3) 文字性验证 + 贴边约束同字符行模式。
 fn corner_row_boxes(
@@ -878,14 +905,16 @@ fn corner_row_boxes(
                 (x0 + maxx + 1) as i64,
                 (y0 + maxy + 1) as i64,
             );
-            if area < 400 || cw < ch || cw / ch > 20 {
+            if area < 400 || cw < ch || (cw as f64 / ch as f64) > CORNER_ROW_ASPECT_MAX {
                 continue;
             }
             let fill = area as f64 / (cw as f64 * ch as f64);
             if !(0.15..=0.95).contains(&fill) {
                 continue;
             }
-            if ch as f64 > h as f64 * 0.06 {
+            let short = h.min(w) as f64;
+            let chf = ch as f64;
+            if chf < short * CORNER_ROW_H_MIN_REL || chf > short * CORNER_ROW_H_MAX_REL {
                 continue;
             }
             let gx1 = (x0 + minx) as i64;
@@ -1071,14 +1100,24 @@ fn ensure_dirs(root: &Path, with_backup: bool) -> Result<(PathBuf, PathBuf, Path
     Ok((source, masks, lama, review))
 }
 
+/// 按**内容**识别格式解码，不信任扩展名。
+/// 工作目录里 mask 是"PNG 内容 + 原扩展名"（`save_png` 写到 `masks/<name>`，名字带 `.jpg`），
+/// EXIF 方向转正后的 `source/<name>` 同理；按扩展名解码会直接失败（老 bug：JPEG 输入跑不通）。
+/// 扩展名与内容一致的普通文件走同一条解码器，行为不变。
+fn open_any(path: &Path) -> Result<DynamicImage, String> {
+    let reader = image::ImageReader::open(path).map_err(|e| e.to_string())?;
+    let reader = reader.with_guessed_format().map_err(|e| e.to_string())?;
+    reader.decode().map_err(|e| e.to_string())
+}
+
 fn load_image(path: &Path) -> Result<DynamicImage, String> {
-    image::open(path).map_err(|e| format!("打开图片失败 {}: {}", path.display(), e))
+    open_any(path).map_err(|e| format!("打开图片失败 {}: {}", path.display(), e))
 }
 
 fn review_box(mask_path: &Path, width: u32, height: u32) -> (u32, u32, u32, u32) {
     let mut bbox: Option<(u32, u32, u32, u32)> = None;
     if mask_path.exists() {
-        if let Ok(mask) = image::open(mask_path) {
+        if let Ok(mask) = open_any(mask_path) {
             let gray = mask.to_luma8();
             let mut x1 = width;
             let mut y1 = height;
@@ -1163,6 +1202,19 @@ fn save_png(image: DynamicImage, path: &Path) -> Result<(), String> {
     image.save_with_format(path, image::ImageFormat::Png).map_err(|e| e.to_string())
 }
 
+/// 逐字节比较两个文件（先比尺寸，再读内容；无哈希依赖）。用于检测"备份与当前文件
+/// 是否同一份"，等价于 Python 侧的 `_md5` 比较。
+fn files_equal(a: &Path, b: &Path) -> bool {
+    match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) if ma.len() == mb.len() => {}
+        _ => return false,
+    }
+    match (fs::read(a), fs::read(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
 pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Result<(), String> {
     let work = crate::workdir();
     if work.exists() {
@@ -1183,7 +1235,25 @@ pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Resu
         let current = options.root.join(name);
         let origin = if options.overwrite_original {
             let backup = backup_root.join(name);
-            if !backup.exists() {
+            if backup.exists() && !files_equal(&backup, &current) {
+                // 备份与当前文件不一致：用户换了一批图 / 改了同名文件。备份语义是"本轮
+                // 处理前的原图"（可撤销）。沿用旧备份当 origin 会一直在**错的图**上跑，
+                // 最后被覆盖/验证拒绝——用户看到"跑完但一张都没去水印"。把旧备份挪到
+                // .previous/ 留档后，用当前文件刷新（幂等：旧备份留存不覆盖）。
+                let stale = backup_root.join(".previous").join(name);
+                if let Some(parent) = stale.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                if !stale.exists() {
+                    fs::copy(&backup, &stale).map_err(|e| e.to_string())?;
+                }
+                fs::copy(&current, &backup).map_err(|e| e.to_string())?;
+                log(&format!(
+                    "{}: backup differs from the current file — refreshed (previous copy kept at {})",
+                    name,
+                    stale.display()
+                ));
+            } else if !backup.exists() {
                 fs::copy(&current, &backup).map_err(|e| e.to_string())?;
             }
             backup
@@ -1191,8 +1261,16 @@ pub fn prepare(options: &PipelineOptions, names: &[String], log: Logger) -> Resu
             current.clone()
         };
         fs::copy(&origin, source.join(name)).map_err(|e| e.to_string())?;
+        // EXIF 方向烤进工作副本：手机竖拍图（存储横向 + Orientation=6）的水印在视觉右下角、
+        // 不在存储右下角，不转正就检测不到或找偏。备份保持原始字节，不受影响。
+        if crate::photo_meta::bake_orientation_into(&origin, &source.join(name))? {
+            log(&format!(
+                "{}: baked EXIF orientation into working copy (backup keeps original bytes)",
+                name
+            ));
+        }
 
-        let image = load_image(&origin)?;
+        let image = load_image(&source.join(name))?;
         let (width, height) = (image.width(), image.height());
         let mut tpl_mask: Option<GrayImage> = None;
         let boxes: Vec<(i64, i64, i64, i64)> = match options.mask_box {
@@ -1502,22 +1580,30 @@ fn inpaint_one(
     }
     log(&format!("inpainting {}...", name));
     let mut result = engine.inpaint_image(&image, &mask, log)?;
-    // 逆解：命中档案（.wprof）走档案逆解；否则豆包模板命中（.tpl）或框选精分割
-    // （.refinebox，内部仍靠模板自定位）走 stamp 逆解。
+    // 逆解（`inverse`，默认关，与 Python 对齐）：命中档案（.wprof）走档案逆解；否则
+    // 豆包模板命中（.tpl）或框选精分割（.refinebox，内部仍靠模板自定位）走 stamp 逆解。
     // 都在生成式结果之上做逐像素解析还原真实背景，门控不过则保留生成式结果。
-    let sidecar = masks.join(format!("{}.wprof", name));
-    if sidecar.exists() {
-        match apply_profile_inverse(&image, &result, &sidecar, log, &name) {
-            Ok(Some(inv)) => result = inv,
-            Ok(None) => {}
-            Err(err) => log(&format!("{}: profile inverse skipped ({}), keep generative result", name, err)),
-        }
-    } else if inverse
-        && (masks.join(format!("{}.tpl", name)).exists()
-            || masks.join(format!("{}.refinebox", name)).exists())
-    {
-        if let Some(inv) = apply_stamp_inverse(&image, &result, &mask, &name, log) {
-            result = inv;
+    // 逆解成功写 `.inv`：① verify 对逆解结果放宽模板残留判据（gap-score 对逆解恢复的
+    // 真实纹理同样有响应，会误报）；② 自动重试跳过逆解图（精确解别被生成式盖掉）。
+    if inverse {
+        let inv_mark = masks.join(format!("{}.inv", name));
+        let sidecar = masks.join(format!("{}.wprof", name));
+        if sidecar.exists() {
+            match apply_profile_inverse(&image, &result, &sidecar, log, &name) {
+                Ok(Some(inv)) => {
+                    result = inv;
+                    let _ = fs::write(&inv_mark, b"");
+                }
+                Ok(None) => {}
+                Err(err) => log(&format!("{}: profile inverse skipped ({}), keep generative result", name, err)),
+            }
+        } else if masks.join(format!("{}.tpl", name)).exists()
+            || masks.join(format!("{}.refinebox", name)).exists()
+        {
+            if let Some(inv) = apply_stamp_inverse(&image, &result, &mask, &name, log) {
+                result = inv;
+                let _ = fs::write(&inv_mark, b"");
+            }
         }
     }
     save_png(DynamicImage::ImageRgb8(result), &lama_dir.join(&name))?;
@@ -1610,15 +1696,15 @@ pub fn verify_paths(
     if !(orig_path.exists() && res_path.exists() && mask_path.exists()) {
         return None;
     }
-    let orig_img = image::open(orig_path).ok()?;
-    let res_img = image::open(res_path).ok()?;
+    let orig_img = open_any(orig_path).ok()?;
+    let res_img = open_any(res_path).ok()?;
     let orig = orig_img.to_rgb8();
     let res = res_img.to_rgb8();
     if orig.dimensions() != res.dimensions() {
         return None;
     }
     let (w, h) = orig.dimensions();
-    let m = image::open(mask_path).ok()?.to_luma8();
+    let m = open_any(mask_path).ok()?.to_luma8();
     let m = if m.dimensions() != (w, h) {
         image::imageops::resize(&m, w, h, FilterType::Nearest)
     } else {
@@ -1749,10 +1835,15 @@ pub fn format_verify(report: &VerifyReport) -> String {
 /// 框选精分割只写 `.refinebox`（不强制），交由 verify_paths 按 scale/分数自动判定。
 fn verify_repaired(name: &str, root: &Path) -> Option<VerifyReport> {
     let (source, masks, lama, _) = work_dirs();
+    // 工作副本 source/ 是"视觉方向 + 未经改动"的输入，必须优先：备份是**存储方向**的原始
+    // 字节，EXIF 方向非 1 时与 mask/lama 尺寸不一致 → 验证会直接返回 None（静默失效）。
+    // 方向为 1（绝大多数图）时两者逐字节相同，行为不变。
+    let src = source.join(name);
     let backup = backup_dir(root).join(name);
-    let orig = if backup.exists() { backup } else { source.join(name) };
-    let applied = masks.join(format!("{}.tpl", name)).exists().then_some(true);
-    verify_paths(&orig, &lama.join(name), &masks.join(name), applied)
+    let orig = if src.exists() { src } else { backup };
+    let applied = masks.join(format!("{}.tpl", name)).exists()
+        && !masks.join(format!("{}.inv", name)).exists();
+    verify_paths(&orig, &lama.join(name), &masks.join(name), Some(applied))
 }
 
 /// 打印验证结果（仅报告，不拒绝）。返回是否有 FAIL。
@@ -1778,6 +1869,71 @@ fn report_verify(names: &[String], root: &Path, log: Logger) -> bool {
 // ---------------------------------------------------------------------------
 
 const RETRY_DILATE: (usize, usize) = (5, 5);
+/// 暗字形（过冲）判据与重试膨胀核，对齐 Python `INVERSE_OVERSHOOT_MAX` / `OVERSHOOT_DILATE`。
+const INVERSE_OVERSHOOT_MAX: f64 = 10.0;
+const OVERSHOOT_DILATE: (usize, usize) = (15, 15);
+
+/// 结果图的暗字形（过冲）指标：用 SOURCE（本轮未改动原图）定位水印——结果图已无水印，
+/// 模板定位会失败——再量当前修复结果在 stamp 笔画区相对间隙区的低频亮度差（负值=笔画
+/// 偏暗=暗字形）。仅对模板命中的图有意义。对齐 Python `_overshoot_footgap`。
+fn overshoot_footgap(name: &str) -> Option<f64> {
+    let (source, _, lama_dir, _) = work_dirs();
+    let src = open_any(&source.join(name)).ok()?;
+    let hit = template_stroke_mask(&src).ok()??;
+    let out = open_any(&lama_dir.join(name)).ok()?.to_rgb8();
+    crate::watermark_profiles::result_overshoot_score(&out, hit.px, hit.py)
+}
+
+/// 暗字形（过冲）自动重试（默认开、最多 1 轮）：mask 盖不住水印的淡边缘/暗描边时，
+/// 生成式结果会把残留暗边当内容保留 → 字形区比周围暗。判据只看结果自身、与图无关，
+/// 命中即把 mask 膨胀到 OVERSHOOT_DILATE 重跑（换一张图也成立的兜底）。逆解图跳过。
+pub fn overshoot_retry(
+    options: &PipelineOptions,
+    names: &[String],
+    model_path: &Path,
+    log: Logger,
+) -> Result<(), String> {
+    let masks = work_dirs().1;
+    let mut candidates: Vec<String> = Vec::new();
+    for name in names {
+        if masks.join(format!("{}.inv", name)).exists() {
+            continue;
+        }
+        if !masks.join(format!("{}.tpl", name)).exists() {
+            continue;
+        }
+        if let Some(ov) = overshoot_footgap(name) {
+            if ov < -INVERSE_OVERSHOOT_MAX {
+                log(&format!(
+                    "{}: dark glyph detected (foot-gap {:.1}) — expanding mask and retrying",
+                    name, ov
+                ));
+                candidates.push(name.clone());
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    for name in &candidates {
+        let mask_path = masks.join(name);
+        let m = load_image(&mask_path)?.to_luma8();
+        let grown = dilate_gray_rect(&m, OVERSHOOT_DILATE.0, OVERSHOOT_DILATE.1);
+        let added = grown.iter().zip(m.iter()).filter(|(a, b)| a > b).count();
+        log(&format!(
+            "{}: overshoot retry mask +{}px (dilate {}x{})",
+            name, added, OVERSHOOT_DILATE.0, OVERSHOOT_DILATE.1
+        ));
+        save_png(DynamicImage::ImageLuma8(grown), &mask_path)?;
+    }
+    inpaint_subset(model_path, &candidates, options.inverse, log)?;
+    for name in &candidates {
+        if let Some(ov) = overshoot_footgap(name) {
+            log(&format!("{}: after overshoot retry foot-gap {:.1}", name, ov));
+        }
+    }
+    Ok(())
+}
 
 /// 灰度图矩形核（kw x kh）膨胀：横向 + 纵向两次一维最大。
 fn dilate_gray_rect(src: &GrayImage, kw: usize, kh: usize) -> GrayImage {
@@ -2040,12 +2196,15 @@ pub fn residual_retry(
     log: Logger,
 ) -> Result<(), String> {
     let masks = work_dirs().1;
+    // 逆解已成功的图不参与生成式重试（精确解会被重新糊掉；且 gap-score 对逆解恢复的
+    // 真实纹理仍有残余响应，会被误判"残留"）——对齐 Python `_residual_retry` 的 skip。
     let candidates: Vec<String> = names
         .iter()
         .filter(|name| {
-            verify_repaired(name, &options.root)
-                .map(|r| r.residual)
-                .unwrap_or(false)
+            !masks.join(format!("{}.inv", name)).exists()
+                && verify_repaired(name, &options.root)
+                    .map(|r| r.residual)
+                    .unwrap_or(false)
         })
         .cloned()
         .collect();
@@ -2121,54 +2280,113 @@ pub fn review_lama(names: &[String], root: &Path) -> Result<PathBuf, String> {
 }
 
 /// 把修复结果按原格式写入输出目录（覆盖模式=原图位置，另存模式=watermark-cleaned/）。
-pub fn finalize_outputs(options: &PipelineOptions, names: &[String], log: Logger) -> Result<PathBuf, String> {
+/// 单张未通过自检而被跳过的图：**不写入坏结果**（覆盖模式下该图仍是原图）。
+pub struct Skipped {
+    pub name: String,
+    pub reasons: Vec<String>,
+}
+
+pub struct FinalizeOutcome {
+    pub review: PathBuf,
+    /// 真正落盘的文件名（顺序同 names，已剔除被跳过的）。
+    pub written: Vec<String>,
+    pub skipped: Vec<Skipped>,
+}
+
+pub fn finalize_outputs(
+    options: &PipelineOptions,
+    names: &[String],
+    log: Logger,
+) -> Result<FinalizeOutcome, String> {
     let (_, _, lama_dir, review_dir) = work_dirs();
     let dest_dir = output_dir(options);
     if !options.overwrite_original {
         fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
     }
-    // 验证闭环：落盘前客观自检，FAIL 拒绝写入（--force 强制），WARN 提示
-    if !options.force {
-        let mut failures: Vec<&String> = Vec::new();
-        for name in names {
+    // 验证闭环：落盘前逐张客观自检。**逐张判定**——FAIL 的图不落盘（覆盖模式下保持原图、
+    // 另存模式下该图不产出），其余图照常写入：单张异常不再拖垮整批（旧行为是任何一张
+    // FAIL 就整批拒绝、一张都不写）。WARN 只提示。`--force` 跳过自检、全部照写。
+    let mut written: Vec<String> = Vec::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
+    let backup_root = backup_dir(&options.root);
+    let mut webp_noted = false;
+    for name in names {
+        if !options.force {
             if let Some(report) = verify_repaired(name, &options.root) {
                 log(&format!("verify {}: {}", name, format_verify(&report)));
                 for reason in &report.reasons {
                     log(&format!("verify {}: {}", name, reason));
                 }
                 if report.verdict == "FAIL" {
-                    failures.push(name);
+                    log(&format!(
+                        "skip {}: failed self-check, kept original (review the candidate image, or use --force)",
+                        name
+                    ));
+                    skipped.push(Skipped {
+                        name: name.clone(),
+                        reasons: report.reasons.clone(),
+                    });
+                    continue;
                 }
             }
         }
-        if !failures.is_empty() {
-            let list = failures
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "verification FAILED for {list} — refusing to write output (use --force to override, or review manually)"
-            ));
+        // 原图（未经改动）：覆盖模式在备份里，另存模式就是原文件本身
+        let orig = if backup_root.join(name).exists() {
+            backup_root.join(name)
+        } else {
+            options.root.join(name)
+        };
+        let mut meta = crate::photo_meta::CarryMeta::read(&orig);
+        // 像素已在 prepare 按 EXIF 方向转正 → 方向标记清零（否则看图软件再转一次）；
+        // 方向原本就是 1（绝大多数图）时这是 no-op，元数据逐字节不变。
+        if !meta.is_empty() {
+            meta.clear_orientation();
         }
-    }
-    for name in names {
+        if !webp_noted && image_format_for(name) == image::ImageFormat::WebP {
+            log("webp: encoded lossless (pure-Rust lossy webp needs libwebp); file may grow");
+            webp_noted = true;
+        }
         let result = load_image(&lama_dir.join(name))?;
-        save_result(result, &dest_dir.join(name))?;
+        save_result(result, &dest_dir.join(name), &meta)?;
+        written.push(name.clone());
+    }
+    if written.is_empty() && !skipped.is_empty() {
+        // 全部未过自检：整体报错（CLI 非零退出、App 走"拒绝写入"提示），不产出空结果
+        let list = skipped
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "verification FAILED for {list} — refusing to write output (use --force to override, or review manually)"
+        ));
+    }
+    if !skipped.is_empty() {
+        log(&format!(
+            "partial: wrote {} image(s), skipped {} failing self-check: {}",
+            written.len(),
+            skipped.len(),
+            skipped.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+        ));
     }
     if options.overwrite_original {
         log("outputs written in place (originals overwritten)");
     } else {
         log(&format!("outputs saved to: {}", dest_dir.display()));
     }
-    let output = review(&dest_dir, &review_dir, "overwritten-corner-review.png", names)?;
+    // 复查拼图只拼真正落盘的图：被跳过的图在另存模式下根本没有输出文件。
+    let output = review(&dest_dir, &review_dir, "overwritten-corner-review.png", &written)?;
     println!("{}", output.display());
-    Ok(output)
+    Ok(FinalizeOutcome {
+        review: output,
+        written,
+        skipped,
+    })
 }
 
 /// 兼容旧 CLI 命令名：等价于 finalize_outputs。
 pub fn overwrite_review(options: &PipelineOptions, names: &[String]) -> Result<PathBuf, String> {
-    finalize_outputs(options, names, &|_| {})
+    finalize_outputs(options, names, &|_| {}).map(|o| o.review)
 }
 
 pub fn cleanup(options: &PipelineOptions, names: &[String]) -> Result<(), String> {
@@ -2259,10 +2477,13 @@ pub struct RunSummary {
     pub final_review: PathBuf,
     pub kept_work: bool,
     pub cancelled: bool,
+    /// 真正落盘的张数（未过自检被跳过的图不计入）。
     pub processed: usize,
     pub output_dir: PathBuf,
     /// 落盘后的结果文件绝对路径（供移动端「保存到相册/分享」直接使用）。
     pub outputs: Vec<PathBuf>,
+    /// (文件名, 原因) —— 未过自检被跳过、保留原图的图。
+    pub skipped: Vec<(String, String)>,
 }
 
 pub fn run(
@@ -2282,12 +2503,25 @@ pub fn run(
     let source_review = review_dir.join("source-corner-review.png");
     inpaint(model_path, options.inverse, log, progress, is_cancelled)?;
     if options.retry && !is_cancelled() {
+        // 暗字形（过冲）优先重试：mask 不足导致生成式结果保留水印暗边，先扩 mask 重画。
+        overshoot_retry(options, &names, model_path, log)?;
         residual_retry(options, &names, model_path, log)?;
     }
     let candidate_review = review_lama(&names, &options.root)?;
-    let final_review = finalize_outputs(options, &names, log)?;
+    let outcome = finalize_outputs(options, &names, log)?;
+    let final_review = outcome.review;
     let output_dir_path = output_dir(options);
-    let outputs: Vec<PathBuf> = names.iter().map(|n| output_dir_path.join(n)).collect();
+    let outputs: Vec<PathBuf> = outcome
+        .written
+        .iter()
+        .map(|n| output_dir_path.join(n))
+        .collect();
+    let processed = outcome.written.len();
+    let skipped: Vec<(String, String)> = outcome
+        .skipped
+        .iter()
+        .map(|s| (s.name.clone(), s.reasons.join("; ")))
+        .collect();
     if options.keep_work {
         return Ok(RunSummary {
             source_review,
@@ -2295,9 +2529,10 @@ pub fn run(
             final_review,
             kept_work: true,
             cancelled: false,
-            processed: names.len(),
+            processed,
             output_dir: output_dir_path,
             outputs,
+            skipped,
         });
     }
     let (source_review, candidate_review, final_review) =
@@ -2324,9 +2559,10 @@ pub fn run(
         final_review,
         kept_work: false,
         cancelled: false,
-        processed: names.len(),
+        processed,
         output_dir: output_dir_path,
         outputs,
+        skipped,
     })
 }
 
@@ -2335,7 +2571,7 @@ pub const WINDOW_SIZE: u32 = WINDOW;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::Rgb;
+    use image::{GenericImageView, Rgb};
 
     fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("dwm-test-{}-{}", tag, std::process::id()));
@@ -2526,6 +2762,73 @@ mod tests {
     }
 
     #[test]
+    fn detect_corner_ignores_sub_band_background_specks() {
+        // 已去水印图右下角的背景碎块（地毯/纸面/花丛）实测字形高只有 1.3%~2.0%
+        // 短边，旧判据下限 1.2%*H 会把它们聚成"字符行"误检硬修；字符高带收紧到
+        // 2.6%~5.0% 短边后应返回空。这里用 26px 高（1.63%）+ 5x5 膨胀 → 30px，
+        // 仍低于下限 41.6px，与 Python 侧判据一致。
+        let root = temp_root("detect-specks");
+        let path = root.join("cleaned.png");
+        let (w, h) = (2848u32, 1600u32);
+        let mut img = RgbImage::from_pixel(w, h, Rgb([236, 233, 228]));
+        for y in (0..h).step_by(53) {
+            for x in 0..w {
+                img.put_pixel(x, y, Rgb([226, 222, 216]));
+            }
+        }
+        let y1 = h as i64 - 45;
+        for i in 0..6i64 {
+            let x1 = w as i64 - 40 - 30 * i - 22;
+            for y in y1..y1 + 26 {
+                for x in x1..x1 + 22 {
+                    img.put_pixel(x as u32, y as u32, Rgb([250, 248, 244]));
+                }
+            }
+        }
+        save_png(DynamicImage::ImageRgb8(img), &path).unwrap();
+        let boxes = detect_watermark_boxes(&image::open(&path).unwrap());
+        assert!(
+            boxes.is_empty(),
+            "sub-band background specks must not be detected, got {:?}",
+            boxes
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn result_overshoot_score_flags_dark_glyph() {
+        use image::Rgb;
+        let (w, h) = (1600u32, 1600u32);
+        let (px, py) = (200usize, 1300usize);
+        // 干净背景：字形区与间隙区同分布 → 不应判为过冲
+        let clean = RgbImage::from_pixel(w, h, Rgb([200, 200, 200]));
+        let ov_clean =
+            crate::watermark_profiles::result_overshoot_score(&clean, px, py).expect("score");
+        assert!(
+            ov_clean > -INVERSE_OVERSHOOT_MAX,
+            "clean image must not look overshot: {ov_clean}"
+        );
+        // 暗字形：把 stamp 笔画区涂暗 → 强烈过冲（应能被判出）
+        let stamp = crate::watermark_profiles::doubao_stamp().unwrap();
+        let scale = (w.min(h) as f64) / stamp.ref_short_side;
+        let (alpha, _c, tw, th) = crate::watermark_profiles::scaled_layers(&stamp, scale);
+        let mut dark = clean.clone();
+        for y in 0..th {
+            for x in 0..tw {
+                if alpha[y * tw + x] > 0.5 {
+                    dark.put_pixel((px + x) as u32, (py + y) as u32, Rgb([120, 120, 120]));
+                }
+            }
+        }
+        let ov_dark =
+            crate::watermark_profiles::result_overshoot_score(&dark, px, py).expect("score");
+        assert!(
+            ov_dark < -INVERSE_OVERSHOOT_MAX,
+            "dark glyph must be flagged: {ov_dark}"
+        );
+    }
+
+    #[test]
     fn detect_watermark_boxes_multi_position() {
         let root = temp_root("detect-multi");
         let path = root.join("multi.png");
@@ -2710,6 +3013,196 @@ mod tests {
     /// 两个测试都要改 DOUBAO_WATERMARK_WORKDIR 环境变量，必须串行执行
     static WORKDIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// JPEG 输入全链路：EXIF 方向必须真的转正（水印在视觉右下角），落盘后 EXIF/ICC 不丢、
+    /// 方向标记清零（否则看图软件再转一次）。旧代码按扩展名解码，JPEG 输入连 mask 都读不出来。
+    #[test]
+    fn jpeg_input_bakes_orientation_and_keeps_exif_icc() {
+        let _guard = WORKDIR_ENV_LOCK.lock().unwrap();
+        let prev_work = std::env::var("DOUBAO_WATERMARK_WORKDIR").ok();
+        let root = temp_root("jpgorient");
+        std::env::set_var("DOUBAO_WATERMARK_WORKDIR", temp_root("jpgorient-work"));
+        let icc = b"fake-icc-profile-bytes".to_vec();
+        // 存储 60x30 + Orientation=6（顺时针 90°）→ 视觉 30x60
+        crate::photo_meta::testutil::write_jpeg_with_meta(&root.join("a.jpg"), 60, 30, 6, &icc);
+
+        let options = PipelineOptions { root: root.clone(), files: vec![], keep_work: false, mask_box: Some(MaskBox { x1: 10, y1: 20, x2: 28, y2: 50 }), any_position: false, overwrite_original: true, use_profile: true, force: false, inverse: true, retry: false, refine: false, forced_profile: None, output_dir_override: None };
+        let names = target_names(&root, &[]).unwrap();
+        let noop_log: Logger = &|_| {};
+        prepare(&options, &names, &noop_log).unwrap();
+        let (source, masks, lama, _) = work_dirs();
+
+        let oriented = load_image(&source.join("a.jpg")).unwrap();
+        assert_eq!(
+            oriented.dimensions(),
+            (30, 60),
+            "工作副本必须已按 EXIF 方向转正（否则水印不在视觉右下角）"
+        );
+        assert!(masks.join("a.jpg").exists(), "mask 文件名沿用原扩展名");
+
+        // 伪造推理输出：只在 mask 内改像素
+        let mut fake = oriented.to_rgb8();
+        let pattern = load_image(&masks.join("a.jpg")).unwrap().to_luma8();
+        for (x, y, p) in pattern.enumerate_pixels() {
+            if p.0[0] > 0 {
+                fake.put_pixel(x, y, Rgb([240, 240, 233]));
+            }
+        }
+        save_png(DynamicImage::ImageRgb8(fake), &lama.join("a.jpg")).unwrap();
+
+        let out = finalize_outputs(&options, &names, &noop_log).unwrap();
+        assert_eq!(out.written, vec!["a.jpg".to_string()]);
+        assert!(out.skipped.is_empty());
+
+        let written = root.join("a.jpg");
+        assert_eq!(image::open(&written).unwrap().dimensions(), (30, 60));
+        assert_eq!(
+            crate::photo_meta::read_orientation(&written),
+            Some(image::metadata::Orientation::NoTransforms),
+            "方向已烤进像素，标记必须清零"
+        );
+        assert!(
+            fs::read(&written).unwrap().windows(icc.len()).any(|w| w == icc.as_slice()),
+            "ICC 必须原样搬回"
+        );
+        // 备份仍是"存储方向 + 原方向标记"的真正原图（恢复原图/重复覆盖都以它为准）
+        let backup = root.join("original-watermark-backup/a.jpg");
+        assert_eq!(
+            crate::photo_meta::read_orientation(&backup),
+            Some(image::metadata::Orientation::Rotate90)
+        );
+        assert_eq!(image::open(&backup).unwrap().dimensions(), (60, 30));
+
+        cleanup(&options, &names).unwrap();
+        match prev_work {
+            Some(v) => std::env::set_var("DOUBAO_WATERMARK_WORKDIR", v),
+            None => std::env::remove_var("DOUBAO_WATERMARK_WORKDIR"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 版本号单一来源 = `tauri.conf.json`（`tools/release.sh` 也只改它）。Cargo.toml /
+    /// package.json 必须同步，否则产物版本（macOS CFBundleShortVersionString、Android
+    /// versionName）与 crate 元数据互相矛盾——历史上就漂移成 0.5.3 / 0.1.0。
+    #[test]
+    fn version_manifests_are_in_sync() {
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let conf: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(manifest.join("tauri.conf.json")).unwrap())
+                .unwrap();
+        let conf_v = conf["version"]
+            .as_str()
+            .expect("tauri.conf.json 必须显式写 version（单一来源，release.sh 只改这里）");
+        assert_eq!(
+            env!("CARGO_PKG_VERSION"),
+            conf_v,
+            "Cargo.toml 版本与 tauri.conf.json 不一致"
+        );
+        let pkg: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(manifest.join("../package.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            pkg["version"].as_str().unwrap(),
+            conf_v,
+            "package.json 版本与 tauri.conf.json 不一致"
+        );
+    }
+
+    /// 单张未过自检不能拖垮整批：FAIL 的图不落盘（覆盖模式下仍是原图），其余照写。
+    #[test]
+    fn finalize_skips_only_failing_images() {
+        let _guard = WORKDIR_ENV_LOCK.lock().unwrap();
+        let prev_work = std::env::var("DOUBAO_WATERMARK_WORKDIR").ok();
+        let root = temp_root("skipfail");
+        std::env::set_var("DOUBAO_WATERMARK_WORKDIR", temp_root("skipfail-work"));
+        for name in ["a.png", "b.png"] {
+            make_watermark_image(&root.join(name), 1024, 1024, "AI");
+        }
+        // 用强制遮罩框（不依赖自动检测是否命中模板）保证 mask 非空且位置已知：
+        // a.png 只在框内改像素（应 PASS），b.png 额外在框外 (0,0) 改一个像素（应 FAIL）。
+        let options = PipelineOptions { root: root.clone(), files: vec![], keep_work: false, mask_box: Some(MaskBox { x1: 700, y1: 800, x2: 1000, y2: 950 }), any_position: false, overwrite_original: true, use_profile: true, force: false, inverse: true, retry: false, refine: false, forced_profile: None, output_dir_override: None };
+        let names = target_names(&root, &[]).unwrap();
+        let noop_log: Logger = &|_| {};
+        prepare(&options, &names, &noop_log).unwrap();
+        let (source, masks, lama, _) = work_dirs();
+
+        for name in &names {
+            let img = image::open(source.join(name)).unwrap().to_rgb8();
+            let mut fake = img.clone();
+            let pattern = image::open(masks.join(name)).unwrap().to_luma8();
+            for (x, y, p) in pattern.enumerate_pixels() {
+                if p.0[0] > 0 {
+                    fake.put_pixel(x, y, Rgb([240, 240, 233]));
+                }
+            }
+            if name == "b.png" {
+                // mask 外改动属工程 bug 级 FAIL：只能跳过这张，不能连带 a.png 一起不写
+                fake.put_pixel(0, 0, Rgb([0, 0, 0]));
+            }
+            save_png(DynamicImage::ImageRgb8(fake), &lama.join(name)).unwrap();
+        }
+
+        let out = finalize_outputs(&options, &names, &noop_log).unwrap();
+        assert_eq!(out.written, vec!["a.png".to_string()]);
+        assert_eq!(out.skipped.len(), 1, "只有 b.png 该被跳过");
+        assert_eq!(out.skipped[0].name, "b.png");
+        assert!(
+            out.skipped[0].reasons.iter().any(|r| r.contains("mask 外")),
+            "跳过原因应指出 mask 外被改动: {:?}",
+            out.skipped[0].reasons
+        );
+        let backup = root.join("original-watermark-backup");
+        assert!(
+            fs::read(root.join("a.png")).unwrap() != fs::read(backup.join("a.png")).unwrap(),
+            "a.png 应已替换为修复结果"
+        );
+        assert!(
+            fs::read(root.join("b.png")).unwrap() == fs::read(backup.join("b.png")).unwrap(),
+            "b.png 未过自检，必须保持原图未被写入"
+        );
+
+        cleanup(&options, &names).unwrap();
+        match prev_work {
+            Some(v) => std::env::set_var("DOUBAO_WATERMARK_WORKDIR", v),
+            None => std::env::remove_var("DOUBAO_WATERMARK_WORKDIR"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prepare_refreshes_stale_backup() {
+        // 用户换了一批图（同名不同内容）时，旧备份不能被当成 origin——否则整批在错的图
+        // 上跑、最后全部被拒绝。prepare 应把旧备份挪到 .previous/ 并用当前文件刷新。
+        let _guard = WORKDIR_ENV_LOCK.lock().unwrap();
+        let prev_work = std::env::var("DOUBAO_WATERMARK_WORKDIR").ok();
+        let root = temp_root("stale-backup");
+        std::env::set_var("DOUBAO_WATERMARK_WORKDIR", temp_root("stale-backup-work"));
+        make_watermark_image(&root.join("a.png"), 1024, 1024, "AI");
+        let options = PipelineOptions { root: root.clone(), files: vec!["a.png".to_string()], keep_work: false, mask_box: None, any_position: false, overwrite_original: true, use_profile: true, force: false, inverse: false, retry: false, refine: false, forced_profile: None, output_dir_override: None };
+        let names = target_names(&root, &options.files).unwrap();
+        let noop_log: Logger = &|_| {};
+        prepare(&options, &names, &noop_log).unwrap();
+        let backup = root.join("original-watermark-backup/a.png");
+        let first_backup = fs::read(&backup).unwrap();
+
+        // 换图：同名、不同尺寸/内容
+        make_watermark_image(&root.join("a.png"), 900, 700, "AI GENERATED");
+        let new_root = fs::read(root.join("a.png")).unwrap();
+        prepare(&options, &names, &noop_log).unwrap();
+
+        assert!(files_equal(&backup, &root.join("a.png")), "backup must be refreshed to current");
+        assert_eq!(fs::read(&backup).unwrap(), new_root, "backup equals current file");
+        let stale = root.join("original-watermark-backup/.previous/a.png");
+        assert_eq!(fs::read(&stale).unwrap(), first_backup, "previous copy preserved");
+        let (source, ..) = work_dirs();
+        assert_eq!(fs::read(source.join("a.png")).unwrap(), new_root, "source uses current file");
+
+        match prev_work {
+            Some(v) => std::env::set_var("DOUBAO_WATERMARK_WORKDIR", v),
+            None => std::env::remove_var("DOUBAO_WATERMARK_WORKDIR"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn pipeline_file_flow_without_model() {
         let _guard = WORKDIR_ENV_LOCK.lock().unwrap();
@@ -2807,8 +3300,16 @@ mod tests {
             white_after
         );
 
-        assert!(!root.join("original-watermark-backup").exists(), "backup cleaned");
+        // 覆盖模式保留备份（供「恢复原图」撤销）；workdir 必须清掉
+        assert!(
+            root.join("original-watermark-backup").is_dir(),
+            "覆盖模式必须保留原图备份（撤销依据）"
+        );
         assert!(!crate::workdir().exists(), "workdir cleaned");
+        // 恢复原图：把备份拷回并删除备份目录
+        let restored = restore_backup(&root).expect("restore failed");
+        assert_eq!(restored, 1);
+        assert!(!root.join("original-watermark-backup").exists(), "恢复后备份应被删除");
 
         match prev_work {
             Some(v) => std::env::set_var("DOUBAO_WATERMARK_WORKDIR", v),

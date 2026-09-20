@@ -69,8 +69,13 @@
         return Promise.resolve({ dir: '(mock) /storage/emulated/0/Imported' });
       case 'read_image_base64':
         return new Promise((resolve) =>
-          setTimeout(() => resolve(svgDataUrl('复查图预览（mock）', '#3b5bdb')), 400)
+          setTimeout(
+            () => resolve({ data_url: svgDataUrl('复查图预览（mock）', '#3b5bdb'), width: 1600, height: 1000 }),
+            400
+          )
         );
+      case 'is_directory':
+        return Promise.resolve(/dir|folder/i.test((args && args.path) || ''));
       case 'read_thumbnail_base64':
         return new Promise((resolve) =>
           setTimeout(() => resolve(svgDataUrl('缩略图（mock）', '#0f766e')), 200)

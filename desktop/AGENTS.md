@@ -65,14 +65,18 @@ Python（终端）与 Rust 口径**除修复模型外已对齐**：
 | 模板笔画 mask（连续 α>0.03 + 1px 膨胀） | ✓ | ✓ |
 | 顶帽 gap-score + 阈值 20 | ✓ | ✓ |
 | 结果级验证（mask 外零改动，FAIL 拒绝落盘） | ✓ | ✓（`--force` 强制） |
-| 豆包 stamp 逆解（默认开） | ✓ | ✓（`--no-inverse` 关） |
-| 残留自动重试（1 轮，默认开） | ✓ | ✓（`--no-retry` 关） |
+| 豆包 stamp 逆解（**默认关**，`--inverse` 开；App「逆解还原真实纹理」勾选） | ✓ | ✓ |
+| 水印档案库逆解（**随 `--inverse`**，默认关；档案仍作精确 mask） | ✓ | ✓ |
+| 过冲（暗字形）自动重试（1 轮，默认开） | ✓ | ✓ |
+| 残留自动重试（1 轮，默认开，逆解图跳过） | ✓ | ✓（`--no-retry` 关） |
 | 框选/检测框内笔画精分割（`--refine`，实验性） | ✓ | ✓（`--refine`；App 默认勾选；残留自动退化整框，见下） |
 | `--any-position` / DBNet | ✓ | ✓（macOS v0.5.4） |
-| 水印档案库（α/C + 逆解 + NCC ±35%） | ✓ | ✓（macOS） |
+| 水印档案库（α/C 精确定位与 mask；逆解随 `--inverse`） | ✓ | ✓（macOS） |
 | 修复模型 | 默认 MAT | LaMa ONNX |
 
 **唯一残余差异**：修复模型（MAT vs LaMa ONNX）——两者都是生成式路线，复杂纹理（花墙/花丛）MAT 更稳；`scale≈1.0 + 邻域纹理复杂` 的图会被 stamp 逆解接管，此时模型差异不重要。
+
+**逆解默认关 + 两轮自动兜底（v0.5.5+，与 Python 对齐）**：`options.inverse` 默认 **false**（CLI `--inverse`、App「逆解还原真实纹理」勾选才开）——实拍图上逆解与资产 α/C 不完全一致，会留白线/彩点/暗字形伪影；实测 7 张实拍图纯生成式在 6 张上模板残留更低。逆解成功写 `{name}.inv`：① `verify_repaired` 见到 `.inv` 就关掉模板残留判据（gap-score 对逆解恢复的真实纹理同样有响应，会误报）；② `residual_retry`/`overshoot_retry` 跳过 `.inv` 图（精确解别被生成式重跑盖掉）。两轮兜底在 `run()` 里 order 固定：**先 `overshoot_retry`**（`const INVERSE_OVERSHOOT_MAX=10`、`OVERSHOOT_DILATE=(15,15)`；用 SOURCE 定位水印、量结果图 `watermark_profiles::result_overshoot_score` 的笔画区−间隙区低频差，负得太多=暗字形 → 扩 mask 重画），**再 `residual_retry`**（5x5 膨胀）。
 
 **仅 Rust/App、Python 无对应参数**：`--output-dir <dir>`（App「选择输出目录」）自定义另存目录，`output_dir()` 在**覆盖模式下忽略**该值（否则"以为替换了原图"却写到别处）；`None`（默认）行为与历史版本逐字节一致，回归用例 `output_dir_modes` 已覆盖三种情形。
 

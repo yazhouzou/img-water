@@ -1,6 +1,6 @@
 [package]
 name = "doubao-watermark-remover"
-version = "0.1.0"
+version = "0.5.5"
 description = "Remove Doubao AI watermark from PNG images"
 edition = "2021"
 default-run = "doubao-watermark-remover"
@@ -32,6 +32,10 @@ ureq = { version = "2", features = ["rustls"] }
 tauri-plugin-single-instance = "2.4.4"
 tauri-plugin-window-state = "2.4.1"
 tauri-plugin-notification = "2.4.0"
+
+[dev-dependencies]
+# 仅测试用：手工生成带色彩块的 PNG（image 的 PNG 编码器不写 iCCP/sRGB）+ 与 image 同版本
+png = "0.17"
 
 [profile.release]
 strip = true

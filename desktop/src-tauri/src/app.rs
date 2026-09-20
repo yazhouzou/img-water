@@ -316,6 +316,7 @@ fn run_pipeline(
     mask_box: Option<Vec<i64>>,
     any_position: Option<bool>,
     refine: Option<bool>,
+    inverse: Option<bool>,
     profile_id: Option<String>,
     output_dir: Option<String>,
     lang: Option<String>,
@@ -364,7 +365,7 @@ fn run_pipeline(
             overwrite_original,
             use_profile: true,
             force: false,
-            inverse: true,
+            inverse: inverse.unwrap_or(false),
             retry: true,
             refine: refine.unwrap_or(true),
             forced_profile: profile_id.clone(),
@@ -408,6 +409,7 @@ fn run_pipeline(
                         "outputDir": summary.output_dir.display().to_string(),
                         "outputs": summary.outputs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                         "processed": summary.processed,
+                        "skipped": summary.skipped.iter().map(|(n, r)| serde_json::json!({ "name": n, "reason": r })).collect::<Vec<_>>(),
                         "overwritten": options.overwrite_original,
                     }),
                 );
@@ -561,7 +563,7 @@ fn cleanup_pipeline(storage: State<'_, AppStorage>, lang: Option<String>) -> Res
         overwrite_original: true,
         use_profile: true,
         force: false,
-        inverse: true,
+        inverse: false,
         retry: true,
         refine: false,
         forced_profile: None,
@@ -661,26 +663,85 @@ struct ImportResult {
     names: Vec<String>,
 }
 
+/// 预览图：`width`/`height` 是**原图**尺寸（`data_url` 可能是缩小后的预览）。
+#[derive(Serialize)]
+struct PreviewImage {
+    data_url: String,
+    width: u32,
+    height: u32,
+}
+
+/// 预览图片（data URL）。`max` 给定时等比缩到最长边 ≤ `max`（框选大图用，避免把整张
+/// 几十 MB 的图塞进 data URL）；同时返回**原图**尺寸，前端据此把框选坐标映射回原图。
+/// `max` 为 None 时按原始字节返回（复查图/大图查看要求全分辨率，不能缩）。
 #[tauri::command]
-fn read_image_base64(path: String, lang: Option<String>) -> Result<String, String> {
+fn read_image_base64(
+    path: String,
+    max: Option<u32>,
+    lang: Option<String>,
+) -> Result<PreviewImage, String> {
     let lang = lang_of(lang);
     let file = PathBuf::from(&path);
     if !file.is_file() {
         return Err(tr(&lang, &format!("文件不存在: {}", path), &format!("File not found: {}", path)));
     }
-    if file
-        .file_name()
-        .map(|name| !pipeline::is_supported_image(&name.to_string_lossy()))
-        .unwrap_or(true)
-    {
+    let ext = file
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp") {
         return Err(tr(&lang, "只支持预览 png/jpg/webp 图片", "Only png/jpg/webp images can be previewed"));
     }
-    let bytes = std::fs::read(&file).map_err(|e| e.to_string())?;
-    if bytes.len() > 10 * 1024 * 1024 {
-        return Err(tr(&lang, "图片过大，无法预览", "Image too large to preview"));
-    }
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Ok(format!("data:image/png;base64,{}", encoded))
+    let reader = image::ImageReader::open(&file)
+        .map_err(|e| e.to_string())?
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    let (ow, oh) = reader
+        .into_dimensions()
+        .map_err(|e| tr(&lang, &format!("无法读取图片: {}", e), &format!("Failed to read image: {}", e)))?;
+    let need_resize = max.map(|m| ow.max(oh) > m).unwrap_or(false);
+    let data_url = if need_resize {
+        let limit = max.unwrap_or(2048);
+        let img = image::open(&file).map_err(|e| {
+            tr(&lang, &format!("无法读取图片: {}", e), &format!("Failed to read image: {}", e))
+        })?;
+        let preview = img.thumbnail(limit, limit);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        preview
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .map_err(|e| e.to_string())?;
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
+        )
+    } else {
+        // 全分辨率：直接搬原始字节（不重编码），mime 按扩展名给对
+        let bytes = std::fs::read(&file).map_err(|e| e.to_string())?;
+        if bytes.len() > 64 * 1024 * 1024 {
+            return Err(tr(&lang, "图片过大，无法预览", "Image too large to preview"));
+        }
+        let mime = match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            _ => "image/png",
+        };
+        format!(
+            "data:{};base64,{}",
+            mime,
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    };
+    Ok(PreviewImage {
+        data_url,
+        width: ow,
+        height: oh,
+    })
+}
+
+/// 拖入路径是否为目录（桌面端拖文件夹＝直接把它作为处理目录，原地处理）。
+#[tauri::command]
+fn is_directory(path: String) -> bool {
+    PathBuf::from(path).is_dir()
 }
 
 /// 结果列表缩略图：解码后等比缩到最长边 `max` 像素再编码 PNG，
@@ -829,6 +890,7 @@ pub fn run_tauri_app() {
             share_results,
             read_image_base64,
             read_thumbnail_base64,
+            is_directory,
             reveal_path,
             write_text_file
         ])

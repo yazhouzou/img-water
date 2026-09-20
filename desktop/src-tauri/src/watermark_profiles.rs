@@ -1824,6 +1824,55 @@ pub fn scaled_layers(profile: &Profile, scale: f64) -> (Vec<f32>, Vec<f32>, usiz
     (alpha, color, tw, th)
 }
 
+/// 结果图"暗字形（过冲）"指标：stamp 笔画区与间隙区的**低频亮度差**（负值=笔画偏暗）。
+/// 与 ghost 指标不同，只看结果自身——mask 盖不住水印的暗描边/淡边缘时，生成式结果会
+/// 保留暗边，字形区比周围暗（肉眼可见"暗色水印印记"）。对齐 Python
+/// `_result_overshoot_score`（σ 与边界处理为近似，仅用于阈值判定，不改像素）。
+pub fn result_overshoot_score(out: &RgbImage, px: usize, py: usize) -> Option<f64> {
+    const CALIB_SIGMA: f64 = 6.0;
+    let stamp = doubao_stamp().ok()?;
+    let (w, h) = (out.width() as usize, out.height() as usize);
+    let scale = (w.min(h) as f64) / stamp.ref_short_side;
+    let (alpha, _color, tw, th) = scaled_layers(&stamp, scale);
+    if px + tw > w || py + th > h {
+        return None;
+    }
+    let mut has_core = false;
+    let mut has_gap = false;
+    for &a in &alpha {
+        if a > 0.5 {
+            has_core = true;
+        } else if a < 0.02 {
+            has_gap = true;
+        }
+    }
+    if !has_core || !has_gap {
+        return None;
+    }
+    let mut gray = vec![0f32; tw * th];
+    for y in 0..th {
+        for x in 0..tw {
+            let p = out.get_pixel((px + x) as u32, (py + y) as u32).0;
+            gray[y * tw + x] = p[0].max(p[1]).max(p[2]) as f32;
+        }
+    }
+    let blur = gauss_blur(&gray, tw, th, 1, CALIB_SIGMA);
+    let (mut cs, mut cn, mut gs, mut gn) = (0f64, 0usize, 0f64, 0usize);
+    for i in 0..tw * th {
+        if alpha[i] > 0.5 {
+            cs += blur[i] as f64;
+            cn += 1;
+        } else if alpha[i] < 0.02 {
+            gs += blur[i] as f64;
+            gn += 1;
+        }
+    }
+    if cn == 0 || gn == 0 {
+        return None;
+    }
+    Some(cs / cn as f64 - gs / gn as f64)
+}
+
 pub fn place_by_anchor(profile: &Profile, width: usize, height: usize) -> Option<(usize, usize, f64)> {
     let place = profile.extra.get("place")?.as_object()?;
     let short = width.min(height) as f64;

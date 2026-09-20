@@ -5,6 +5,7 @@ pub mod dbnet;
 pub mod fetch;
 pub mod i18n;
 pub mod lama;
+pub mod photo_meta;
 pub mod pipeline;
 pub mod watermark_profiles;
 

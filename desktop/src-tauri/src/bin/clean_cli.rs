@@ -38,7 +38,7 @@ fn main() {
     let mut any_position = false;
     let mut use_profile = true;
     let mut force = false;
-    let mut no_inverse = false;
+    let mut inverse = false;
     let mut no_retry = false;
     let mut refine = false;
     let mut profile: Option<String> = None;
@@ -80,7 +80,9 @@ fn main() {
             "--any-position" => any_position = true,
             "--no-profile" | "--no-profiles" => use_profile = false,
             "--force" => force = true,
-            "--no-inverse" => no_inverse = true,
+            // 逆解默认关（与 Python 对齐）；--no-inverse 保留为向后兼容的空操作
+            "--inverse" => inverse = true,
+            "--no-inverse" => inverse = false,
             "--no-retry" => no_retry = true,
             "--refine" => refine = true,
             "--profile" => profile = take(&mut args),
@@ -133,7 +135,7 @@ fn main() {
         overwrite_original: overwrite,
         use_profile,
         force,
-        inverse: !no_inverse,
+        inverse,
         retry: !no_retry,
         refine,
         forced_profile: profile,
@@ -157,14 +159,18 @@ fn main() {
             let names = pipeline::target_names(&options.root, &options.files).unwrap_or_else(|e| exit_with(&e));
             pipeline::prepare(&options, &names, &log)
         }
-        "inpaint" => pipeline::inpaint(&model_path, !no_inverse, &log, &no_progress, &not_cancelled),
+        "inpaint" => pipeline::inpaint(&model_path, inverse, &log, &no_progress, &not_cancelled),
         "review-lama" => {
             let names = pipeline::target_names(&options.root, &options.files).unwrap_or_else(|e| exit_with(&e));
             pipeline::review_lama(&names, &root_path).map(|_| ())
         }
         "overwrite-review" => {
             let names = pipeline::target_names(&options.root, &options.files).unwrap_or_else(|e| exit_with(&e));
-            pipeline::finalize_outputs(&options, &names, &log).map(|_| ())
+            pipeline::finalize_outputs(&options, &names, &log).map(|o| {
+                for s in &o.skipped {
+                    eprintln!("skipped {}: {}", s.name, s.reasons.join("; "));
+                }
+            })
         }
         "cleanup" => {
             let names = pipeline::target_names(&options.root, &options.files).unwrap_or_else(|e| exit_with(&e));
@@ -482,12 +488,12 @@ fn run_profile_command(
 }
 
 fn print_help() {
-    println!("usage: clean-cli [--root <dir>] [--mask-box x1,y1,x2,y2] [--any-position] [--refine] [--profile <id>] [--no-profile] [--no-inverse] [--no-retry] [--force] [--keep-work] [--overwrite] [--output-dir <dir>] [--model <onnx>] <command> [files...]");
+    println!("usage: clean-cli [--root <dir>] [--mask-box x1,y1,x2,y2] [--any-position] [--refine] [--profile <id>] [--no-profile] [--inverse] [--no-retry] [--force] [--keep-work] [--overwrite] [--output-dir <dir>] [--model <onnx>] <command> [files...]");
     println!("  run|prepare|inpaint|review-lama|overwrite-review|cleanup");
     println!("默认结果另存到 <root>/watermark-cleaned/；--overwrite 直接覆盖原图（自动备份 original-watermark-backup/）");
     println!("--any-position: 处理任意位置的文字水印（OCR 检测），默认只处理贴右下角的豆包水印");
     println!("--no-profile: 跳过水印档案库（逐像素逆解），只用模板/检测 + 生成式修复");
-    println!("--no-inverse: 关闭豆包 stamp 逐像素逆解（默认开）");
+    println!("--inverse: 开启豆包 stamp 逐像素逆解（默认关，走生成式 LaMa；复杂纹理背景可选）");
     println!("--no-retry: 关闭残留自动重试（默认开，最多 1 轮）");
     println!("--refine: 实验性：手动框选时框内笔画精分割（只重绘笔画，失败退回整框）");
     println!("--profile <id>: 精确模式：只用指定水印档案定位（见 profiles 子命令）");
