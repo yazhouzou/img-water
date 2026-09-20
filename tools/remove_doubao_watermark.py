@@ -63,6 +63,11 @@ TEMPLATE_MIN_SCORE = 20.0
 # 用于 FAIL 判定，低对比残影达不到 20 会被放过（本 bug 的根因）。
 TEMPLATE_RESIDUAL_RATIO = 0.2
 TEMPLATE_RESIDUAL_FLOOR = 8.0
+# 残留判据用"源图水印锚点处的分"而非"角窗最大分"：真实残留必然在锚点处最强；而沙地/
+# 花墙等强纹理背景会在角窗别处凑出高分（实测 1.png 锚点 11.0 而窗最大 27.3、6.png
+# 锚点 24.6 而窗最大 34.6 → 旧口径把已去干净的两张误判 FAIL、整批拒绝）。要求锚点分
+# ≥ 0.85×窗最大（"水印处即主导峰"）才判残留/FAIL，避免背景巧合误报。
+TEMPLATE_RESIDUAL_DOMINANCE = 0.85
 # 连续 α mask：水印真正污染的像素是 α>0（含抗锯齿带），二值模板（α>0.5）只覆盖
 # 笔画核心，只能靠大膨胀补抗锯齿，代价是多盖 ~30% 干净画面被模型重绘（"影响周边
 # 元素"的根因）。改用从黑底 2.png 提取的连续 α 图（tools/doubao-wm-alpha.png，
@@ -167,6 +172,41 @@ def load_template():
     return tpl, alpha, meta
 
 
+def _template_response(gray, width, height):
+    """模板 gap-score 响应图 + 模板尺寸 (th, tw)；模板缺失/大于图时返回 None。
+    两种预处理逐像素取更强者（峰值都落在水印处，命中位置不变）：
+      - 顶帽（局部背景扣除）抑制纹理/光照梯度，救"亮背景压平笔画"（3.png raw 15 → 顶帽 33）；
+      - 原始 max(RGB) 保留绝对亮度差，救"背景亮块尺度 > 顶帽核"（2.png 顶帽 19.9、raw 22.3）。
+    分离度实测：正样本（原图）max ≥22.3，负样本（已去水印）≤9.3，阈值 20 干净。
+    抽出来供"定位"（template_stroke_mask 取角窗峰）与"定点打分"（verify_paths 在源图
+    锚点处量结果，见 TEMPLATE_RESIDUAL_DOMINANCE）共用，保证两处口径完全一致。"""
+    import cv2
+    import numpy as np
+    tpl, _alpha, meta = load_template()
+    if tpl is None:
+        return None
+    scale = min(height, width) / meta['ref_short_side']
+    t = cv2.resize(tpl.astype(np.float32), (0, 0), fx=scale, fy=scale,
+                   interpolation=cv2.INTER_NEAREST)
+    th_t, tw_t = t.shape
+    if th_t >= height or tw_t >= width:
+        return None
+    k = min(31, max(3, (min(height, width) - 1) | 1))
+    tophat = gray - cv2.morphologyEx(
+        gray, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    t01 = (t > 0.5).astype(np.float32)
+    ones = np.ones(t.shape, np.float32)
+    n_in = float(t01.sum())
+    n_out = float(t01.size) - n_in
+
+    def _gap_score(src):
+        s_in = cv2.matchTemplate(src, t01, cv2.TM_CCORR)
+        s_all = cv2.matchTemplate(src, ones, cv2.TM_CCORR)
+        return s_in / n_in - (s_all - s_in) / n_out
+
+    return np.maximum(_gap_score(gray), _gap_score(tophat)), th_t, tw_t
+
+
 def template_stroke_mask(gray, width, height, model='mat'):
     """在右下角窗口内用模板做 gap-score 匹配（0/1 模板核取 S_in、全 1 核取窗口和，
     gap = S_in/N_in − S_out/N_out），返回 (mask_uint8, score, info)。
@@ -181,33 +221,10 @@ def template_stroke_mask(gray, width, height, model='mat'):
     tpl, alpha, meta = load_template()
     if tpl is None:
         return None, 0.0, 'template asset missing'
-    # 两种预处理各有所长，逐像素取更强者（实测两者峰值都落在水印处，故命中位置不变）：
-    #  - 顶帽（局部背景扣除）抑制纹理/光照梯度，救"亮背景压平笔画"的图：
-    #    3.png raw 15 → 顶帽 33；
-    #  - 原始 max(RGB) 保留绝对亮度差，救"背景亮块尺度 > 顶帽核"的图：
-    #    岩石/树皮类背景（2.png）顶帽 19.9 掉到阈值下、raw 22.3 仍可判。
-    # 分离度实测：正样本（原图）max ≥22.3，负样本（已去水印）max ≤9.3，阈值 20 仍干净。
-    k = max(3, (min(height, width) - 1) | 1)
-    k = min(31, k)
-    tophat = gray - cv2.morphologyEx(
-        gray, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-    scale = min(height, width) / meta['ref_short_side']
-    t = cv2.resize(tpl.astype(np.float32), (0, 0), fx=scale, fy=scale,
-                   interpolation=cv2.INTER_NEAREST)
-    th_t, tw_t = t.shape
-    if th_t >= height or tw_t >= width:
+    resp = _template_response(gray, width, height)
+    if resp is None:
         return None, 0.0, 'template larger than image'
-    t01 = (t > 0.5).astype(np.float32)
-    ones = np.ones(t.shape, np.float32)
-    n_in = float(t01.sum())
-    n_out = float(t01.size) - n_in
-
-    def _gap_score(src):
-        s_in = cv2.matchTemplate(src, t01, cv2.TM_CCORR)
-        s_all = cv2.matchTemplate(src, ones, cv2.TM_CCORR)
-        return s_in / n_in - (s_all - s_in) / n_out
-
-    response = np.maximum(_gap_score(gray), _gap_score(tophat))
+    response, th_t, tw_t = resp
     # 水印必贴右下角：只在右下角 40px 余量窗口内取峰
     y0 = max(0, response.shape[0] - 41)
     x0 = max(0, response.shape[1] - 41)
@@ -231,6 +248,7 @@ def template_stroke_mask(gray, width, height, model='mat'):
         core = (a * 255.0 > TEMPLATE_ALPHA_THRESHOLD).astype(np.uint8)
         how = 'alpha'
     else:
+        t = cv2.resize(tpl.astype(np.float32), (tw_t, th_t), interpolation=cv2.INTER_NEAREST)
         core = (t > 0.5).astype(np.uint8)
         how = 'binary fallback'
     mask = cv2.dilate(core,
@@ -1239,17 +1257,38 @@ def verify_paths(orig_path, res_path, mask_path, outside_tol=2, warn_ratio=0.08,
         'outside_max': int(diff[~active].max()) if (~active).any() else 0,
         'reasons': [],
     }
-    # 模板残留：原图命中模板 → 修复后不应再命中（豆包水印专用判据，非豆包图自动跳过）
-    orig_score = res_score = 0.0
+    # 模板残留：原图命中模板 → 修复后不应再命中（豆包水印专用判据，非豆包图自动跳过）。
+    # 结果分取**源图水印锚点处**的分（而非角窗最大分）——真实残留必然在锚点处最强，而
+    # 强纹理背景（沙地/花墙）会在角窗别处凑高分，用最大分会误报 FAIL（见
+    # TEMPLATE_RESIDUAL_DOMINANCE 注释）。res_win 仅用于"锚点是否主导峰"的判定。
+    orig_score = res_score = res_win = 0.0
     try:
+        import cv2
         gray_o = np.array(Image.open(orig_path).convert('RGB')).max(axis=2).astype(np.float32)
-        _, orig_score, _ = template_stroke_mask(gray_o, gray_o.shape[1], gray_o.shape[0])
         gray_r = np.array(Image.open(res_path).convert('RGB')).max(axis=2).astype(np.float32)
-        _, res_score, _ = template_stroke_mask(gray_r, gray_r.shape[1], gray_r.shape[0])
+        resp_o = _template_response(gray_o, gray_o.shape[1], gray_o.shape[0])
+        resp_r = _template_response(gray_r, gray_r.shape[1], gray_r.shape[0])
+        if resp_o is not None:
+            ro, _th, _tw = resp_o
+            y0 = max(0, ro.shape[0] - 41)
+            x0 = max(0, ro.shape[1] - 41)
+            _, _, _, loc = cv2.minMaxLoc(ro[y0:, x0:])
+            ox, oy = loc[0] + x0, loc[1] + y0
+            orig_score = float(ro[oy, ox])
+            if resp_r is not None:
+                rr, _th, _tw = resp_r
+                if oy < rr.shape[0] and ox < rr.shape[1]:
+                    res_score = float(rr[oy, ox])
+                yr = max(0, rr.shape[0] - 41)
+                xr = max(0, rr.shape[1] - 41)
+                res_win = float(rr[yr:, xr:].max())
     except Exception:
         pass
     report['orig_template_score'] = round(float(orig_score), 1)
     report['res_template_score'] = round(float(res_score), 1)
+    report['res_template_window_max'] = round(float(res_win), 1)
+    # 锚点分须≥0.85×角窗最大分（"水印处即主导峰"）：背景巧合高分达不到 → 不算残留。
+    residual_dominant = res_score >= TEMPLATE_RESIDUAL_DOMINANCE * res_win if res_win > 0 else False
     # 是否做模板残留检查：优先用调用方给的 template_applied；未给则要求
     # scale≈1.0（合成/缩放图上的非豆包水印可能碰巧高分，会误报）
     if template_applied is None:
@@ -1259,7 +1298,7 @@ def verify_paths(orig_path, res_path, mask_path, outside_tol=2, warn_ratio=0.08,
     # 结构化残留标记：供自动重试逻辑判定"是否因水印残留而不完美"
     # （区别于 mask 外改动——那是工程 bug，重试无法修复）
     report['residual'] = bool(
-        template_applied and orig_score >= TEMPLATE_MIN_SCORE
+        template_applied and orig_score >= TEMPLATE_MIN_SCORE and residual_dominant
         and (res_score >= TEMPLATE_MIN_SCORE
              or (res_score >= TEMPLATE_RESIDUAL_FLOOR
                  and res_score >= orig_score * TEMPLATE_RESIDUAL_RATIO)))
@@ -1268,11 +1307,13 @@ def verify_paths(orig_path, res_path, mask_path, outside_tol=2, warn_ratio=0.08,
         verdict = 'FAIL'
         report['reasons'].append(
             f"mask 外有 {report['outside_changed']} px 被改动 (max {report['outside_max']})")
-    if template_applied and orig_score >= TEMPLATE_MIN_SCORE and res_score >= TEMPLATE_MIN_SCORE:
+    if (template_applied and orig_score >= TEMPLATE_MIN_SCORE
+            and res_score >= TEMPLATE_MIN_SCORE and residual_dominant):
         verdict = 'FAIL'
         report['reasons'].append(
             f'修复后仍匹配豆包模板 (score {res_score:.1f} >= {TEMPLATE_MIN_SCORE:.0f})，疑有残留')
-    elif template_applied and orig_score >= TEMPLATE_MIN_SCORE and res_score >= TEMPLATE_MIN_SCORE * 0.6:
+    elif (template_applied and orig_score >= TEMPLATE_MIN_SCORE
+          and res_score >= TEMPLATE_MIN_SCORE * 0.6 and residual_dominant):
         if verdict != 'FAIL':
             verdict = 'WARN'
         report['reasons'].append(
@@ -1689,25 +1730,34 @@ def overwrite_review(names, root, emit=True, verify=True, force=False):
                 f'the same folder used by prepare, and that the file was not modified '
                 f'in between.')
         pending.append((src, dst))
-    # 验证闭环：落盘前客观自检，FAIL 拒绝覆盖（--force 强制），WARN 提示
+    # 验证闭环：落盘前逐张客观自检。**逐张判定**——FAIL 的图不落盘（覆盖模式下保持原图、
+    # 另存模式下该图不产出），其余图照常写入；`--force` 跳过自检、全部照写。旧行为是
+    # "任何一张 FAIL 就整批拒绝、一张都不写"：单张复杂背景的模板残留**误报**会让整批看似
+    # "跑了没用、水印还在"（与 Rust `finalize_outputs` 的逐张判定对齐，见 desktop/AGENTS.md）。
+    skipped = []
     if verify:
-        failures = []
-        for name in names:
+        writable = []
+        for src, dst in pending:
+            name = dst.name
             report = verify_repaired(name, root)
             report_verify(name, report)
-            if report and report['verdict'] == 'FAIL':
-                failures.append(name)
-        if failures and not force:
-            raise SystemExit(
-                'overwrite-review: verification FAILED for ' + ', '.join(failures)
-                + ' — refusing to overwrite (use --force to override, or review manually)')
+            if report and report['verdict'] == 'FAIL' and not force:
+                print(f'skip {name}: failed self-check, kept original '
+                      f'(review the candidate image, or use --force)')
+                skipped.append(name)
+                continue
+            writable.append((src, dst))
+        pending = writable
     for src, dst in pending:
         copyfile(src, dst)
     output = REVIEW / 'overwritten-corner-review.png'
-    review(root, output.name, names)
+    if pending:
+        review(root, output.name, [dst.name for _, dst in pending])
     if emit:
         print(output)
-    return output
+    if skipped:
+        print(f'skipped (kept original, failed self-check): {", ".join(skipped)}')
+    return output, skipped
 
 
 def cleanup(names, root):
@@ -1778,8 +1828,13 @@ def run_all(names, custom_box, keep_work, root, model='mat', refine=False, any_p
             any_position=any_position, use_profile=use_profile)
     inpaint(model, inverse=inverse, retry=retry, use_profile=use_profile)
     candidate_review = review_lama(names, emit=False, root=root)
-    final_review = overwrite_review(names, root, emit=False, force=force)
-    print(f'processed {len(names)} file(s): {", ".join(names)}')
+    final_review, skipped = overwrite_review(names, root, emit=False, force=force)
+    skipped_set = set(skipped)
+    written = [n for n in names if n not in skipped_set]
+    print(f'processed {len(written)} file(s): {", ".join(written)}')
+    if skipped:
+        print(f'NOT processed (kept original, failed self-check): {", ".join(skipped)}'
+              f' — review the candidate images, or re-run with --force to accept them')
     print(f'candidate review: {candidate_review}')
     print(f'final review: {final_review}')
     if keep_work:

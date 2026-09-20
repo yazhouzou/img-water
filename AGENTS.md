@@ -53,7 +53,7 @@ $P $S --root /path run            # 项目外目录
 （判据成因与反例见 `docs/lessons.md` §1–§2、§10。）
 
 ## 验证、备份与质量标准
-- **验证（`verify_paths`）**：`overwrite-review`/`review-lama` 打印 `[PASS]/[WARN]/[FAIL]`，**FAIL 拒绝覆盖**（`--force` 强制）。判据：① mask 外零改动（mask 外差异 >2 即 FAIL，必是 bug）；② 模板残留（`.tpl` 原图命中而修复后仍命中 → FAIL/WARN）；③ mask 面积 >8% 告警。
+- **验证（`verify_paths`）**：`overwrite-review`/`review-lama` 打印 `[PASS]/[WARN]/[FAIL]`。落盘**逐张判定**（与 Rust `finalize_outputs` 对齐）：FAIL 的图**保留原图不落盘**、其余照写，`--force` 跳过自检全部照写——**不再"任何一张 FAIL 就整批拒绝"**（旧行为下单张复杂背景的模板残留误报会让整批看似"跑了没用、水印还在"）。判据：① mask 外零改动（mask 外差异 >2 即 FAIL，必是 bug）；② 模板残留（`.tpl` 原图命中而修复后仍命中 → FAIL/WARN）——**结果分取源图水印锚点处的分**（非角窗最大分），且须 `≥ TEMPLATE_RESIDUAL_DOMINANCE`(0.85)×角窗最大分（"水印处即主导峰"）；强纹理背景（沙地/花墙）在角窗别处凑的高分不再误判已去干净图为 FAIL（实测 1.png 锚点 11.0/窗 27.3、6.png 锚点 24.6/窗 34.6）；③ mask 面积 >8% 告警。
 - **逆解默认关（`--inverse` 开）**：逆解按 stamp α/C 逐像素反解，能保真实纹理，但前提是"该图水印与资产 α/C 完全一致"——实拍图上并不总成立，会留**伪影**（4.png 白线、2.png 彩点、1.png 暗字形）。实测 7 张实拍图中 MAT 版模板残留**在 6 张上更低或相等**，故默认纯 MAT；需要保纹理的复杂背景（花丛类）可显式 `--inverse`。
 - **暗字形（过冲）自动重试（默认开、1 轮）**：MAT 在 mask 盖不住水印**淡边缘/暗描边**时会把残留暗边当内容保留 → 结果字形区比周围暗（`_result_overshoot_score` 负值，1.png 地毯实测 −23）。检测到即把 mask 膨胀 `OVERSHOOT_DILATE=15x15` 重跑该图（实测 −23 → −3~−6），先于残留重试执行。这是"换一张图就失效"的兜底：判据只关乎结果本身、与图无关。
 - **残留重试（默认开、1 轮、`--no-retry` 关）**：残留判定 = 绝对分 ≥ `TEMPLATE_MIN_SCORE`(20) 或 相对分 ≥ 原分 `TEMPLATE_RESIDUAL_RATIO`(0.2) 且 ≥ `TEMPLATE_RESIDUAL_FLOOR`(8)——低对比残影达不到 20，靠相对判据兜底。命中即 mask 膨胀一级（`RETRY_DILATE=5x5`）隔离重跑；仍残留交 `overwrite-review` 拒绝。**逆解已生效的图跳过重试**——逆解是精确物理恢复，生成式 MAT 重试会把它重新糊掉（`.tpl`/`.wprof` 侧车标记者不入重试候选）。

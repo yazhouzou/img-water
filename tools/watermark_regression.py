@@ -665,6 +665,103 @@ def run_e2e(rdw, swt, cases, model):
 
 # ---------------------------------------------------------------------------
 
+def run_anchor_checks(rdw, only):
+    """残留判据"锚定 + 主导峰"（无模型）：结果分取**源图水印锚点处**的分，且须
+    ≥ TEMPLATE_RESIDUAL_DOMINANCE×角窗最大分。防"强纹理背景在角窗别处凑高分 → 已去
+    干净的图被误判 FAIL 整批拒绝"回归（实测 1.png/6.png）；同时保证真残留（锚点处仍
+    最强）依旧 FAIL。打桩 `_template_response` 精确构造"锚点低/别处高"与"锚点最高"。"""
+    import numpy as np
+    from shutil import rmtree
+    rows = []
+    if only and 'anchor' not in only:
+        return rows
+    tmp = Path(tempfile.mkdtemp(prefix='wm-anchor-'))
+    saved = rdw._template_response
+    try:
+        w = h = 200
+        img = np.full((h, w, 3), 128, np.uint8)
+        op, rp, mp = tmp / 'o.png', tmp / 'r.png', tmp / 'm.png'
+        Image.fromarray(img).save(op)
+        Image.fromarray(img).save(rp)
+        small = np.zeros((h, w), np.uint8)
+        small[100:120, 100:120] = 255          # 小 mask，避开 mask 占比 WARN 干扰
+        Image.fromarray(small).save(mp)
+
+        def mk(anchor, other=None):
+            r = np.zeros((60, 60), np.float32)
+            r[30, 30] = anchor          # 落在角窗内（窗=最后 41 行/列，索引 19..59）
+            if other is not None:
+                r[22, 22] = other       # 角窗别处（背景巧合），仍在窗内
+            return (r, 40, 40)
+
+        def run(seq):
+            it = list(seq)
+            rdw._template_response = lambda *a, **k: it.pop(0)
+            return rdw.verify_paths(op, rp, mp, template_applied=True)
+
+        # ① 结果锚点分低(10)、角窗别处高(40) → 不得 FAIL（旧口径会误判 FAIL）
+        rep = run([mk(60.0), mk(10.0, 40.0)])
+        rows.append(({'group': 'anchor', 'name': 'off-anchor background peak not FAIL', 'expect': 'ok'},
+                     bool(rep and rep['verdict'] == 'PASS' and not rep['residual']),
+                     f"verdict={rep and rep['verdict']} residual={rep and rep['residual']} "
+                     f"anchor={rep and rep['res_template_score']} win={rep and rep.get('res_template_window_max')}"))
+        # ② 结果锚点处仍最强(30) → 真残留必须 FAIL
+        rep2 = run([mk(60.0), mk(30.0)])
+        rows.append(({'group': 'anchor', 'name': 'anchored residual still FAIL', 'expect': 'ok'},
+                     bool(rep2 and rep2['verdict'] == 'FAIL' and rep2['residual']),
+                     f"verdict={rep2 and rep2['verdict']} residual={rep2 and rep2['residual']} "
+                     f"anchor={rep2 and rep2['res_template_score']} win={rep2 and rep2.get('res_template_window_max')}"))
+    finally:
+        rdw._template_response = saved
+        rmtree(tmp, ignore_errors=True)
+    return rows
+
+
+def run_skip_checks(rdw, only):
+    """落盘逐张判定（无模型）：overwrite-review 对 FAIL 的图**保留原图**、其余照写——
+    旧行为是"任何一张 FAIL 就整批拒绝、一张都不写"，单张复杂背景的模板残留误报会让整批
+    看似"跑了没用、水印还在"。这里用打桩的 verify_repaired 直接验证编排（good 落盘、
+    bad 保留 + 计入 skipped）。"""
+    import json as _json
+    import numpy as np
+    from shutil import rmtree
+    rows = []
+    if only and 'skip' not in only:
+        return rows
+    tmp = Path(tempfile.mkdtemp(prefix='wm-skip-'))
+    saved = (rdw.MANIFEST, rdw.LAMA, rdw.REVIEW, rdw.verify_repaired, rdw.report_verify, rdw.review)
+    try:
+        root = tmp / 'root'; lama = tmp / 'lama'; review = tmp / 'review'
+        for d in (root, lama, review):
+            d.mkdir(parents=True, exist_ok=True)
+        rng = np.random.default_rng(4)
+        orig = np.zeros((120, 160, 3), np.uint8)
+        cleaned = rng.integers(0, 255, (120, 160, 3), dtype=np.uint8)
+        manifest = {}
+        for name, content in (('good.png', orig), ('bad.png', orig)):
+            Image.fromarray(content).save(root / name)
+            Image.fromarray(cleaned if name == 'good.png' else rng.integers(1, 9, (120, 160, 3), np.uint8)).save(lama / name)
+            manifest[name] = md5(root / name)
+        (tmp / 'manifest.json').write_text(_json.dumps(manifest))
+        rdw.MANIFEST = tmp / 'manifest.json'
+        rdw.LAMA = lama
+        rdw.REVIEW = review
+        rdw.verify_repaired = lambda name, _root: {'verdict': 'FAIL' if name == 'bad.png' else 'PASS', 'reasons': []}
+        rdw.report_verify = lambda *a, **k: None
+        rdw.review = lambda *a, **k: review
+        _, skipped = rdw.overwrite_review(['good.png', 'bad.png'], root)
+        good_written = np.array(Image.open(root / 'good.png').convert('RGB')).mean() > 20
+        bad_kept = bool((np.array(Image.open(root / 'bad.png').convert('RGB')) == orig).all())
+        rows.append(({'group': 'skip', 'name': 'overwrite skips only FAIL images', 'expect': 'ok'},
+                     good_written and bad_kept and skipped == ['bad.png'],
+                     f'good_written={good_written} bad_kept={bad_kept} skipped={skipped}'))
+    finally:
+        (rdw.MANIFEST, rdw.LAMA, rdw.REVIEW, rdw.verify_repaired,
+         rdw.report_verify, rdw.review) = saved
+        rmtree(tmp, ignore_errors=True)
+    return rows
+
+
 def run_crop_checks(rdw, only):
     """自裁小块推理（提速）的防回归（无模型）：
     ① `_crop_box` 必须把完整水印框进去且边长 ≤ CROP_SIDE_MAX（只有 ≤512 时 MAT 补齐后才是
@@ -745,6 +842,8 @@ def main():
     rows += run_inverse_quality_checks(rdw, args.only)
     rows += run_auto_profile_checks(rdw, swt, args.only)
     rows += run_crop_checks(rdw, args.only)
+    rows += run_skip_checks(rdw, args.only)
+    rows += run_anchor_checks(rdw, args.only)
 
     print(f'{"layer":5s} {"case":40s} {"expect":6s} {"mark":5s} detail')
     fails = 0
