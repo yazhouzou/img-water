@@ -81,7 +81,7 @@ STAMP_MASK_OPEN = (3, 3)
 # refine（--refine 实验性框内笔画精分割）仍用较大核连接笔画碎片
 REFINE_DILATE_MAT = (7, 7)
 REFINE_DILATE_LAMA = (19, 11)
-# 逆解 stamp（默认开，--no-inverse 关）：完整水印模型 obs = α·C + (1−α)·bg，α 为覆盖度、
+# 逆解 stamp（**默认关**，--inverse 开；历史教训见下）：完整水印模型 obs = α·C + (1−α)·bg，α 为覆盖度、
 # C 为逐像素颜色（含暗色描边——纯白字模型反解不掉它）。从 4 张同款水印、不同背景
 # 的图（黑底/纸面/沙滩/花墙）联立标定。逆解恢复的是**真实背景**（非生成），对复杂
 # 纹理背景（花丛类）明显优于 MAT 的平滑重绘；但对低纹理背景（暗底/沙面/纸面）会
@@ -112,6 +112,17 @@ INVERSE_MAX_DC = 48.0
 # 且其暗底噪声团肉眼可见）判负，负值=真实纹理（3.png −0.199、1.png −0.798）无害。
 INVERSE_RESIDUAL_SLACK = 2.0
 INVERSE_GHOST_MAX = 0.25
+# 逆解色度去噪：只替换"**色度离群但亮度正常**"的孤立彩点（色度差 > 阈值，0..255）。
+# 逆解 (obs−αC)/(1−α) 把噪声放大 ~2 倍，mask 内会冒出橙/蓝彩点；但**全域**色度中值会
+# 一并抹掉真实色度细节（回归实测 core err 0.96→11.26）。故只对离群点动刀，并用亮度
+# 判据把"色度离群但亮度也离群的正常噪声点"排除在外。
+INVERSE_CHROMA_OUTLIER = 25
+INVERSE_CHROMA_LUMA_TOL = 12
+# 逆解**过冲**（负字形残影）闸门：结果图在 stamp 笔画区的低频亮度相对间隙区不得低于
+# −INVERSE_OVERSHOOT_MAX。逆解按 stamp α 减去水印贡献，若实际水印弱于资产/背景更亮就会
+# 减过头 → 笔画处变暗，肉眼即"暗色字形印记"（1.png 地毯案例：字形区比间隙暗 22，而
+# ghost 判据只看正值、过冲为负故漏网）。
+INVERSE_OVERSHOOT_MAX = 10.0
 # 结果择优（逆解 vs MAT）：逆解是精确恢复、保留真实纹理，但只在模型适用的图（scale≈1.0
 # 且 stamp 匹配好）上可靠；对 scale≠1.0（4/5.png 1728 竖图，scale=1.08）会因 stamp
 # 缩放插值失配产生字形残留（实测模板分 29/34），对平滑背景会放大噪声。故不再只靠预
@@ -170,13 +181,15 @@ def template_stroke_mask(gray, width, height, model='mat'):
     tpl, alpha, meta = load_template()
     if tpl is None:
         return None, 0.0, 'template asset missing'
-    # 顶帽（局部背景扣除）后再匹配：亮背景（纸面/花墙/雪）会压低"笔画-间隙"绝对差，
-    # 使 3.png 这类低对比水印漏判（raw max(RGB) gap 仅 15，甚至低于已去水印图的负样本）。
-    # 顶帽只保留局部高于背景的亮结构，水印笔画凸显、纹理与光照梯度被抑制，且与背景
-    # 亮度无关：实测正样本 ≥33（3.png 33）、负样本 ≤8.4，分离更干净。
+    # 两种预处理各有所长，逐像素取更强者（实测两者峰值都落在水印处，故命中位置不变）：
+    #  - 顶帽（局部背景扣除）抑制纹理/光照梯度，救"亮背景压平笔画"的图：
+    #    3.png raw 15 → 顶帽 33；
+    #  - 原始 max(RGB) 保留绝对亮度差，救"背景亮块尺度 > 顶帽核"的图：
+    #    岩石/树皮类背景（2.png）顶帽 19.9 掉到阈值下、raw 22.3 仍可判。
+    # 分离度实测：正样本（原图）max ≥22.3，负样本（已去水印）max ≤9.3，阈值 20 仍干净。
     k = max(3, (min(height, width) - 1) | 1)
     k = min(31, k)
-    gray = gray - cv2.morphologyEx(
+    tophat = gray - cv2.morphologyEx(
         gray, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
     scale = min(height, width) / meta['ref_short_side']
     t = cv2.resize(tpl.astype(np.float32), (0, 0), fx=scale, fy=scale,
@@ -188,9 +201,13 @@ def template_stroke_mask(gray, width, height, model='mat'):
     ones = np.ones(t.shape, np.float32)
     n_in = float(t01.sum())
     n_out = float(t01.size) - n_in
-    s_in = cv2.matchTemplate(gray, t01, cv2.TM_CCORR)
-    s_all = cv2.matchTemplate(gray, ones, cv2.TM_CCORR)
-    response = s_in / n_in - (s_all - s_in) / n_out
+
+    def _gap_score(src):
+        s_in = cv2.matchTemplate(src, t01, cv2.TM_CCORR)
+        s_all = cv2.matchTemplate(src, ones, cv2.TM_CCORR)
+        return s_in / n_in - (s_all - s_in) / n_out
+
+    response = np.maximum(_gap_score(gray), _gap_score(tophat))
     # 水印必贴右下角：只在右下角 40px 余量窗口内取峰
     y0 = max(0, response.shape[0] - 41)
     x0 = max(0, response.shape[1] - 41)
@@ -266,6 +283,32 @@ def _result_ghost_score(out, mat_path, px, py):
     glyph = glyph - glyph.mean()
     denom = float(np.linalg.norm(r) * np.linalg.norm(glyph))
     return float((r * glyph).sum() / denom) if denom > 1e-6 else 0.0
+
+
+def _result_overshoot_score(out, px, py):
+    """逆解**过冲**指标：结果图在 stamp 笔画区与间隙区的**低频亮度差**（负值=过冲）。
+    与 `_result_ghost_score`（看 逆解−MAT，负值可能只是真实纹理）不同，这里只看结果自身：
+    笔画处若明显比背景暗，说明水印被减过头，会留下肉眼可见的暗字形（见 INVERSE_OVERSHOOT_MAX）。"""
+    import cv2
+    import numpy as np
+
+    alpha0, _ = _load_stamp()
+    if alpha0 is None:
+        return None
+    h, w = out.shape[:2]
+    scale = min(h, w) / STAMP_REF_SHORT
+    tw = int(round(alpha0.shape[1] * scale))
+    th = int(round(alpha0.shape[0] * scale))
+    if py + th > h or px + tw > w:
+        return None
+    a0 = cv2.resize(alpha0, (tw, th), interpolation=cv2.INTER_LINEAR)
+    core = a0 > 0.5
+    gap = a0 < 0.02
+    if not core.any() or not gap.any():
+        return None
+    gray = out[py:py + th, px:px + tw].astype(np.float32).max(axis=2)
+    blur = cv2.GaussianBlur(gray, (0, 0), INVERSE_CALIB_SIGMA)
+    return float(blur[core].mean() - blur[gap].mean())
 
 
 def inverse_apply(obs_path, mat_path, model='mat'):
@@ -352,6 +395,21 @@ def inverse_apply(obs_path, mat_path, model='mat'):
     out = obs.copy()
     sub = out[py:py + th, px:px + tw]
     sub[m] = hybrid[m]
+    # 色度去噪（仅 mask 内）：逆解 (obs−αC)/(1−α) 把噪声放大约 1/(1−α)≈2 倍，mask 内会
+    # 留下孤立**彩色**噪点（2.png 肉眼可见的橙/蓝点）。只替换"色度离群、亮度却正常"的
+    # 像素：亮度通道与 mask 外一概不动，真实色度细节与正常噪声点都保留。写回只覆盖 mask
+    # 内像素，保证"mask 外零改动"（cvtColor 往返的 ±1 舍入不会外泄）。
+    m_full = np.zeros(out.shape[:2], bool)
+    m_full[py:py + th, px:px + tw] = m
+    ycc = cv2.cvtColor(out.astype(np.uint8), cv2.COLOR_RGB2YCrCb)
+    luma_delta = np.abs(ycc[:, :, 0].astype(np.int16) - cv2.medianBlur(ycc[:, :, 0], 3).astype(np.int16))
+    for ch in (1, 2):
+        med = cv2.medianBlur(ycc[:, :, ch], 3)
+        chroma_delta = np.abs(ycc[:, :, ch].astype(np.int16) - med.astype(np.int16))
+        replace = m_full & (chroma_delta > INVERSE_CHROMA_OUTLIER) & (luma_delta < INVERSE_CHROMA_LUMA_TOL)
+        ycc[:, :, ch] = np.where(replace, med, ycc[:, :, ch])
+    den = cv2.cvtColor(ycc, cv2.COLOR_YCrCb2RGB).astype(np.float32)
+    sub[m] = den[py:py + th, px:px + tw][m]
     out[py:py + th, px:px + tw] = sub
     return out.astype(np.uint8), (px, py, hf, gain, resid)
 
@@ -631,25 +689,42 @@ def _detect_full_dark(image):
     return _boxes_from_mask(dark, h, w)
 
 
+# 字符高度（相对短边）判据：水印随短边等比缩放，字形高度稳定落在带内——
+#   · 豆包 stamp：字符高 ≈ 3.5% 短边（1600 → 56~59px）
+#   · 合成通用文字（回归样本）：≈ 3.4% 短边
+# 而"已去水印图"右下角的背景亮斑/纹理，字符高普遍只有 1.3%~2.0% 短边
+# （地毯/木纹/花丛的碎块），旧下限 1.2%*H 太低 → 兜底检测把背景当水印硬修。
+# 收紧到 2.6%~5.0% 短边后，真实水印（3.4~3.7%）仍稳过，背景碎块被挡在门外。
+CORNER_CHAR_H_MIN_REL = 0.026
+CORNER_CHAR_H_MAX_REL = 0.050
+CORNER_ROW_H_MIN_REL = 0.026
+CORNER_ROW_H_MAX_REL = 0.046
+# 行块模式：合并后的整行宽高比上限。水印行块实测 4.0~4.6（豆包）/ 4.6~9（通用
+# 文字），而背景亮斑成行后 6.8~10.8（已去水印图 6.png 花丛 859x79）→ 上限 8。
+CORNER_ROW_ASPECT_MAX = 8.0
+
+
 def _corner_row_boxes(white, H, W, x0, y0, pad):
     """行块模式：9x3 膨胀两次直接合并字符成行（水印字符与背景亮斑粘连、
     字符级分离失败时——如雪景雪点——仍能定位整行）。防御：
-    1) 行框高度上限 6% 图高（排除大面积粘连块，如 1.png 沙滩亮斑 12%）；
+    1) 行框高度须落在水印字形高度带（相对短边 2.6%~4.6%）内，宽高比 ≤8
+       （排除大面积粘连块，如 1.png 沙滩亮斑 12%、已去水印图背景碎块）；
     2) 组件必须整体位于 corner 检测区内（排除从区外伸进来的画面内容）；
     3) 文字性验证 + 贴边约束同字符行模式。"""
     import cv2
+    short = min(H, W)
     merged = cv2.dilate(white, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 3)), iterations=2)
     count, _, stats, _ = cv2.connectedComponentsWithStats(merged, 8)
     boxes = []
     for i in range(1, count):
         x, y, cw, ch, area = (int(v) for v in stats[i])
         gx1, gy1, gx2, gy2 = x0 + x, y0 + y, x0 + x + cw, y0 + y + ch
-        if area < 400 or cw < ch or cw / ch > 20:
+        if area < 400 or cw < ch or cw / ch > CORNER_ROW_ASPECT_MAX:
             continue
         fill = area / float(cw * ch)
         if not (0.15 <= fill <= 0.95):
             continue
-        if ch > H * 0.06:
+        if ch < short * CORNER_ROW_H_MIN_REL or ch > short * CORNER_ROW_H_MAX_REL:
             continue
         if gx1 < x0 - 20:
             continue
@@ -701,14 +776,17 @@ def _text_rows_from_components(chars, H, W, x0, y0, pad):
 
 def _corner_char_boxes(white, H, W, x0, y0, pad):
     """字符行模式：5x5 轻度膨胀合并字符内笔画，字符组件高度一致成行
-    （水印是单行文字；沙滩亮斑高度杂乱不成行，自然排除）。"""
+    （水印是单行文字；沙滩亮斑高度杂乱不成行，自然排除）。字符高须落在
+    水印字形高度带（相对短边 2.6%~5.0%）——否则已去水印图的背景碎块
+    （1.3%~2.0%）会被当字符聚成行（地毯 2.png / 花丛 6.png 均实测）。"""
     import cv2
+    short = min(H, W)
     white = cv2.dilate(white, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
     count, _, stats, _ = cv2.connectedComponentsWithStats(white, 8)
     chars = []
     for i in range(1, count):
         x, y, cw, ch, area = (int(v) for v in stats[i])
-        if ch < H * 0.012 or ch > H * 0.045:
+        if ch < short * CORNER_CHAR_H_MIN_REL or ch > short * CORNER_CHAR_H_MAX_REL:
             continue
         if cw < ch * 0.25 or cw > ch * 7 or area < 120:
             continue
@@ -997,7 +1075,20 @@ def prepare(names, custom_box, root, emit=True, model='mat', refine=False,
     for name in names:
         current = Path(root) / name
         backup = backup_root / name
-        if not backup.exists():
+        if backup.exists() and _md5(backup) != _md5(current):
+            # 备份与当前文件内容不一致：用户换了一批图 / 改了同名文件。备份的语义是
+            # "本轮处理前的原图"（可撤销、可重跑）。若沿用旧备份当 origin，prepare 会
+            # 一直在**错的图**上跑（白耗整批），最后 overwrite-review 的 md5 校验再把
+            # 全部结果拒绝——用户看到"跑完但一张都没去水印"。故把旧备份挪到 .previous/
+            # 留档，用当前文件刷新备份（幂等：旧备份留存不覆盖）。
+            stale = backup_root / '.previous' / name
+            stale.parent.mkdir(parents=True, exist_ok=True)
+            if not stale.exists():
+                copyfile(backup, stale)
+            copyfile(current, backup)
+            print(f'{name}: backup differs from the current file — refreshed '
+                  f'(previous copy kept at {stale})')
+        elif not backup.exists():
             copyfile(current, backup)
         copyfile(backup, SOURCE / name)
         # 记录本轮处理源文件的 md5：overwrite-review 覆盖前校验目标文件
@@ -1266,6 +1357,91 @@ def review(input_dir, output_name, names):
 # 后重跑 MAT。这是"不完美就重新处理"的落点——残留来自 mask 盖不住（对齐/抗锯齿
 # 误差），小一级膨胀即可；只在明确的残留 FAIL 上触发，mask 外改动属工程 bug 不重试。
 RETRY_DILATE = (5, 5)
+# 暗字形（过冲）自动重试：当 mask 盖不住水印的淡边缘/暗描边时，MAT 会把残留的暗边
+# 当内容保留 → 结果字形区比周围暗（1.png 地毯流苏实测 foot-gap −23，肉眼即"暗色水印
+# 印记"）。检测到即把 mask 膨胀到 OVERSHOOT_DILATE 重跑该图（实测 −23 → −1.3）。
+OVERSHOOT_DILATE = (15, 15)
+
+# 自裁小块推理：iopaint 的 MAT 会把输入补齐成 512 的方形（min_size=512 / pad_mod=512 /
+# pad_to_square），整图或大裁块会被补到 1024²，而 MAT 耗时随尺寸非线性暴涨——实测同一张
+# 2848×1600：整图 63s、802×626 裁块 53s、480×480 裁块仅 10s。故按水印位置自裁 ≤512 的
+# 方块（补齐后仍是 512²），只把 **mask 区域** 贴回原图 → mask 外逐字节不变。
+CROP_SIDE_MAX = 512
+CROP_MARGIN = 128
+
+
+def _crop_box(mask, w, h):
+    """按 mask 包围盒居中取 ≤CROP_SIDE_MAX 的方块（保证把水印连同上下文都框进去，
+    且补齐后仍是 512²）。返回 (x1, y1, x2, y2)，无 mask 像素时返回 None。
+    设 `WM_INPAINT_NO_CROP=1` 可禁用自裁（整图进 iopaint，仅供排查/对照）。"""
+    import numpy as np
+    if os.environ.get('WM_INPAINT_NO_CROP'):
+        return None
+    ys, xs = np.nonzero(np.asarray(mask) > 0)
+    if len(xs) == 0:
+        return None
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    core = max(x2 - x1, y2 - y1)
+    side = core + 2 * CROP_MARGIN
+    if core <= CROP_SIDE_MAX:
+        side = min(CROP_SIDE_MAX, side)
+    side = min(side, w, h)
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    X1 = min(max(cx - side // 2, 0), w - side)
+    Y1 = min(max(cy - side // 2, 0), h - side)
+    return X1, Y1, X1 + side, Y1 + side
+
+
+def _iopaint_batch(names, model, src_dir, mask_dir, out_dir):
+    """自裁小块跑一次 iopaint，再把每个裁块结果的 **mask 像素** 贴回原图（mask 外保持
+    逐字节不变）。无有效 mask 的图退化为整图交给 iopaint（安全兜底）。"""
+    import numpy as np
+    crop_root = WORK / 'crop'
+    sub_src = crop_root / 'source'
+    sub_msk = crop_root / 'masks'
+    sub_out = crop_root / 'lama'
+    if crop_root.exists():
+        rmtree(crop_root)
+    for path in (sub_src, sub_msk, sub_out):
+        path.mkdir(parents=True, exist_ok=True)
+    boxes = {}
+    for name in names:
+        with Image.open(src_dir / name) as im:
+            rgb = im.convert('RGB')
+            w, h = rgb.size
+        with Image.open(mask_dir / name) as mk:
+            mask = np.array(mk.convert('L'))
+        box = _crop_box(mask, w, h)
+        if box is None:
+            rgb.save(sub_src / name)
+            Image.fromarray(mask).save(sub_msk / name)
+        else:
+            rgb.crop(box).save(sub_src / name)
+            Image.fromarray(mask[box[1]:box[3], box[0]:box[2]]).save(sub_msk / name)
+        boxes[name] = box
+    subprocess.run(
+        [
+            str(IOPAINT), 'run', '--model', model, '--device', DEVICE,
+            '--image', str(sub_src), '--mask', str(sub_msk), '--output', str(sub_out),
+        ],
+        check=True,
+    )
+    for name in names:
+        box = boxes[name]
+        if box is None:
+            copyfile(sub_out / name, out_dir / name)
+            continue
+        X1, Y1, X2, Y2 = box
+        out = np.array(Image.open(src_dir / name).convert('RGB'))
+        res = np.array(Image.open(sub_out / name).convert('RGB'))
+        with Image.open(mask_dir / name) as mk:
+            sel = np.array(mk.convert('L'))[Y1:Y2, X1:X2] > 0
+        region = out[Y1:Y2, X1:X2]
+        region[sel] = res[sel]
+        out[Y1:Y2, X1:X2] = region
+        Image.fromarray(out).save(out_dir / name)
+    rmtree(crop_root, ignore_errors=True)
 
 
 def _expand_mask(mask_path, kernel=RETRY_DILATE):
@@ -1290,38 +1466,8 @@ def _residual_state(name):
 
 
 def _retry_inpaint(names, model):
-    """把待重试的图单独放进隔离子目录重跑一次 iopaint（避免整批重复推理），
-    结果写回 LAMA。"""
-    retry_root = WORK / 'retry'
-    sub_src = retry_root / 'source'
-    sub_msk = retry_root / 'masks'
-    sub_out = retry_root / 'lama'
-    if retry_root.exists():
-        rmtree(retry_root)
-    for path in (sub_src, sub_msk, sub_out):
-        path.mkdir(parents=True, exist_ok=True)
-    for name in names:
-        copyfile(SOURCE / name, sub_src / name)
-        copyfile(MASKS / name, sub_msk / name)
-    subprocess.run(
-        [
-            str(IOPAINT),
-            'run',
-            '--model',
-            model,
-            '--device',
-            DEVICE,
-            '--image',
-            str(sub_src),
-            '--mask',
-            str(sub_msk),
-            '--output',
-            str(sub_out),
-        ],
-        check=True,
-    )
-    for name in names:
-        copyfile(sub_out / name, LAMA / name)
+    """把待重试的图单独重跑一次 iopaint（自裁小块，避免整批重复推理），结果写回 LAMA。"""
+    _iopaint_batch(names, model, SOURCE, MASKS, LAMA)
 
 
 def _residual_retry(names, model, skip=()):
@@ -1346,7 +1492,54 @@ def _residual_retry(names, model, skip=()):
                   f'unless --force is used')
 
 
-def inpaint(model='mat', inverse=True, retry=True, use_profile=True):
+def _overshoot_footgap(name):
+    """结果图的**暗字形（过冲）**指标：用原图（SOURCE）定位水印位置（结果图已无水印，
+    模板定位会失败），再量 LAMA 结果在 stamp 笔画区相对间隙区的低频亮度差
+    （负值=笔画偏暗=暗字形）。仅对模板命中的图有意义。"""
+    import cv2
+    import numpy as np
+
+    with Image.open(SOURCE / name) as im:
+        rgb = im.convert('RGB')
+        w, h = rgb.size
+        gray = np.array(rgb).max(axis=2).astype(np.float32)
+    _mask, _score, info = template_stroke_mask(gray, w, h)
+    mm = re.search(r'at \((\d+),(\d+)\)', info)
+    if not mm:
+        return None
+    px, py = int(mm.group(1)), int(mm.group(2))
+    with Image.open(LAMA / name) as im:
+        out = np.array(im.convert('RGB')).astype(np.float32)
+    return _result_overshoot_score(out, px, py)
+
+
+def _overshoot_retry(names, model, skip=()):
+    """暗字形（过冲）自动重试（最多 1 轮）：mask 盖不住水印淡边缘/暗描边时，MAT 会把
+    残留暗边当内容保留 → 字形区比周围暗。检测到即扩 mask 重跑——这是"换一张图就失效"
+    的兜底：判据与图无关，只要结果出现暗字形就重画。"""
+    skip = set(skip)
+    candidates = []
+    for name in names:
+        if name in skip or not (MASKS / f'{name}.tpl').exists():
+            continue
+        ov = _overshoot_footgap(name)
+        if ov is not None and ov < -INVERSE_OVERSHOOT_MAX:
+            candidates.append(name)
+            print(f'{name}: dark glyph detected (foot-gap {ov:.1f}) — expanding mask and retrying')
+    if not candidates:
+        return
+    for name in candidates:
+        added = _expand_mask(MASKS / name, OVERSHOOT_DILATE)
+        print(f'{name}: overshoot retry mask +{added}px '
+              f'(dilate {OVERSHOOT_DILATE[0]}x{OVERSHOOT_DILATE[1]})')
+    _retry_inpaint(candidates, model)
+    for name in candidates:
+        ov = _overshoot_footgap(name)
+        if ov is not None:
+            print(f'{name}: after overshoot retry foot-gap {ov:.1f}')
+
+
+def inpaint(model='mat', inverse=False, retry=True, use_profile=True):
     if not IOPAINT.exists():
         raise SystemExit('missing project env; run tools/ensure-inpaint-env.sh (or .ps1 on Windows) first')
     try:
@@ -1373,23 +1566,8 @@ def inpaint(model='mat', inverse=True, retry=True, use_profile=True):
     # MAT（mask-aware transformer）对结构边界的重建显著优于 LaMa：
     # 光斑/阴影/花瓣形态保留更完整（6.png 花墙阴影、光斑锐度对比验证），
     # 代价是推理约慢 12 倍（单图 ~2 分钟 vs ~10 秒）。lama 可用 --model lama 回退。
-    subprocess.run(
-        [
-            str(IOPAINT),
-            'run',
-            '--model',
-            model,
-            '--device',
-            DEVICE,
-            '--image',
-            str(SOURCE),
-            '--mask',
-            str(MASKS),
-            '--output',
-            str(LAMA),
-        ],
-        check=True,
-    )
+    # 自裁小块推理（见 _iopaint_batch）：MAT 补齐成 512²，避开整图补到 1024² 的非线性耗时。
+    _iopaint_batch(active_names, model, SOURCE, MASKS, LAMA)
     inverse_done = set()
     if inverse:
         # inverse（默认开，逐图自动择优）：模板命中且纹理复杂的 scale≈1.0 图用
@@ -1406,28 +1584,33 @@ def inpaint(model='mat', inverse=True, retry=True, use_profile=True):
                 print(f'{name}: inverse skipped (gating), keep MAT')
                 continue
             out, (px, py, hf, gain, calib) = res
-            # 结果择优：逆解 vs MAT。三条件同时满足才采用逆解（保住真实纹理）：
+            # 结果择优：逆解 vs MAT。四条件同时满足才采用逆解（保住真实纹理）：
             # ① 绝对分 < TEMPLATE_MIN_SCORE（无强字形残留）；
             # ② 不显著差于 MAT（×TOL 之上再放 SLACK，抵消"真实纹理抬高 gap-score"的偏差）；
-            # ③ 无**正字形残影**（≤ GHOST_MAX，区分"真纹理"与"水印残留"，见 _result_ghost_score）。
-            # 任一不过 → 保留 MAT（避免暗底噪声团/失配字形覆盖更干净的 MAT，如 2/4/5.png）。
+            # ③ 无**正字形残影**（≤ GHOST_MAX，区分"真纹理"与"水印残留"，见 _result_ghost_score）；
+            # ④ 无**过冲**（笔画区低频不低于间隙区 −INVERSE_OVERSHOOT_MAX；③ 只查正值，
+            #    减过头留下的**暗字形**会漏网，见 _result_overshoot_score）。
+            # 任一不过 → 保留 MAT（避免暗底噪声团/失配字形/暗字形覆盖更干净的 MAT）。
             inv_score = _result_template_score(out)
             mat_score = _result_template_score(mat_path)
             ghost = _result_ghost_score(out, mat_path, px, py)
+            overshoot = _result_overshoot_score(out, px, py)
             if (inv_score < TEMPLATE_MIN_SCORE
                     and inv_score <= mat_score * INVERSE_RESIDUAL_TOLERANCE + INVERSE_RESIDUAL_SLACK
-                    and (ghost is None or ghost <= INVERSE_GHOST_MAX)):
+                    and (ghost is None or ghost <= INVERSE_GHOST_MAX)
+                    and (overshoot is None or overshoot >= -INVERSE_OVERSHOOT_MAX)):
                 Image.fromarray(out).save(mat_path)
                 inverse_done.add(name)
                 # .inv 标记：verify 对逆解结果放宽模板残留判据（gap-score 对逆解恢复的
                 # 真实纹理会误报，见 verify_repaired）
                 (MASKS / f'{name}.inv').write_text('')
                 applied.append(f'{name} (pos {px},{py} hf {hf:.1f} gain {gain:.2f} '
-                               f'calib {calib:.2f} ghost {ghost:.2f}; '
+                               f'calib {calib:.2f} ghost {ghost:.2f} overshoot {overshoot:.1f}; '
                                f'resid inv {inv_score:.1f} vs mat {mat_score:.1f})')
             else:
                 print(f'{name}: inverse rejected by result comparison '
-                      f'(resid inv {inv_score:.1f} vs mat {mat_score:.1f} ghost {ghost:.2f}), keep MAT')
+                      f'(resid inv {inv_score:.1f} vs mat {mat_score:.1f} ghost {ghost:.2f} '
+                      f'overshoot {overshoot:.1f}), keep MAT')
         if applied:
             print('inverse stamp applied: ' + '; '.join(applied))
     if inverse and use_profile and wprof is not None:
@@ -1463,6 +1646,9 @@ def inpaint(model='mat', inverse=True, retry=True, use_profile=True):
             applied.append(f'{name} ({detail})')
         if applied:
             print('profile inverse applied: ' + '; '.join(applied))
+    if retry:
+        # 暗字形（过冲）优先重试：mask 不足导致 MAT 保留水的暗边，先扩 mask 重画。
+        _overshoot_retry(active_names, model, skip=inverse_done)
     if retry:
         # 自校验不完美 → 重新处理（最多 1 轮）：见 _residual_retry。
         # 逆解成功的图不重试：逆解是精确物理恢复（已覆盖 MAT），retry 会用生成式
@@ -1587,7 +1773,7 @@ def learn_auto(names, root, label, custom_box=None, any_position=False, ref_shor
     print(f'saved profile {profile.id} -> {base}')
 
 
-def run_all(names, custom_box, keep_work, root, model='mat', refine=False, any_position=False, inverse=True, force=False, retry=True, use_profile=True):
+def run_all(names, custom_box, keep_work, root, model='mat', refine=False, any_position=False, inverse=False, force=False, retry=True, use_profile=True):
     prepare(names, custom_box, root, emit=False, model=model, refine=refine,
             any_position=any_position, use_profile=use_profile)
     inpaint(model, inverse=inverse, retry=retry, use_profile=use_profile)
@@ -1647,20 +1833,9 @@ def main():
         '--inverse',
         dest='inverse',
         action='store_true',
-        default=True,
-        help='DEFAULT ON: per-image auto selection. For template-matched scale~1.0 '
-             'images with complex texture (e.g. flowers), recover the real background '
-             'under the watermark via the calibrated full stamp model '
-             '(obs = a*C + (1-a)*bg) instead of MAT generation; other images '
-             '(smooth backgrounds, scaled images, saturated pixels) automatically '
-             'keep MAT. Restores real texture but can amplify noise on smooth '
-             'backgrounds, hence gated. Use --no-inverse to force MAT everywhere.',
-    )
-    parser.add_argument(
-        '--no-inverse',
-        dest='inverse',
-        action='store_false',
-        help='disable auto inverse and force MAT for every image',
+        default=False,
+        help='enable stamp inverse where it beats MAT (off by default: on real photos it '
+             'can leave dark-glyph/streak artifacts that plain MAT does not)',
     )
     parser.add_argument(
         '--no-retry',

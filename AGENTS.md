@@ -15,7 +15,7 @@
 2. 备份到 `original-watermark-backup/`（已存在不覆盖）。
 3. 出右下角裁剪复查图，确认水印位置/尺寸/范围（不用于筛选）。
 4. 遮罩：自动检测（默认，检不到跳过）→ 检不到或其它水印用 `--mask-box` 手动。只覆盖水印文字。
-5. 模型默认 **mat**（复杂结构优于 LaMa，~2min/图 vs ~10s）；`--model lama` 回退；MAT 权重缺失用 **ghfast.top 镜像**下到 `~/.cache/torch/hub/checkpoints/`。
+5. 模型默认 **mat**（复杂结构优于 LaMa）；MAT 权重缺失用 **ghfast.top 镜像**下到 `~/.cache/torch/hub/checkpoints/`。**自裁小块推理**（`_iopaint_batch`）：iopaint 的 MAT 会把输入补齐成 512 的方形（`min_size=512`/`mod=512`/`pad_to_square`），整图会被补到 1024²、耗时非线性暴涨（实测同图整图 ~90s、512² 裁块 ~8s，**约 10x**）——故按水印位置自裁 ≤512（`CROP_SIDE_MAX`）方块，只把 **mask 像素**贴回原图（mask 外逐字节不变）。`--model lama` 回退。
 6. 覆盖前出候选复查图，确认无残留/糊块；`overwrite-review` FAIL 拒绝覆盖。
 7. 覆盖后出落盘复查图确认；通过后清理备份与 `/tmp` 复查产物。
 
@@ -25,8 +25,8 @@
 # 分步（默认）：prepare→inpaint→review-lama→overwrite-review→cleanup
 P=.img-inpaint-venv/bin/python; S=tools/remove_doubao_watermark.py
 $P $S prepare [文件]
-$P $S inpaint [文件]              # 逐图统一尝试 stamp 逆解（逐图标定 gain+墨色 C：以 MAT 低频为参考最小二乘，消颜色鬼影并保真实纹理）+ 结果择优（残留 ≤ MAT×1.75+2 且 <20 且 无正字形残影 才采用，否则落回 MAT）；残留自动重试 1 轮（逆解图跳过）
-$P $S --no-inverse inpaint [文件] # 强制全 MAT
+$P $S inpaint [文件]              # 默认**纯 MAT**；随后两轮自动兜底：① 暗字形（过冲）→ mask 膨胀 15x15 重跑（1 轮）；② 水印残留 → mask 膨胀 5x5 重跑（1 轮）
+$P $S --inverse inpaint [文件]     # 额外启用 stamp 逆解（逐图标定 gain+墨色 C + 结果择优，可保真实纹理，但在实拍图上会留暗字形/白线/彩点等伪影，故默认关）
 $P $S --no-retry inpaint [文件]   # 关残留重试
 $P $S review-lama [文件]          # 候选复查图 + PASS/WARN/FAIL
 $P $S overwrite-review [文件]     # FAIL 拒绝覆盖
@@ -42,7 +42,7 @@ $P $S --root /path run            # 项目外目录
 
 ## 遮罩规则
 按当前图尺寸生成，不可假设尺寸相同。
-1. **自动检测（默认）**：全图白字 + 右下兜底，框过**字符行判据**，膨胀只可 5x5 一次（阈值/判据参数见 `docs/lessons.md` §10）。
+1. **自动检测（默认）**：全图白字 + 右下兜底，框过**字符行判据**，膨胀只可 5x5 一次（阈值/判据参数见 `docs/lessons.md` §10）。右下兜底另有**字符高带**：字符/行块高须落在短边 `2.6%~5.0%`（豆包字形 ≈3.5%），否则已去水印图右下角的背景碎块（地毯/纸面/花丛，1.3%~2.0%）会被聚成"字符行"误修；行块宽高比 ≤8。
 2. **只留贴右下角的框**（豆包必贴右下），分散水印用 `--mask-box`。
 3. **检不到 → 跳过**（空 mask 不进模型）；`--mask-box` 指定则强制。
 4. **模板 footprint mask**：豆包字形固定，资产 `tools/doubao-wm-template.png`/`.json`；按短边缩放后在右下角 40px 窗口用**顶帽 gap-score** 匹配；命中写 mask 并写 `.tpl`。mask 来源优先级：**stamp 完整 footprint**（`tools/doubao-wm-stamp-alpha.png`，含暗色描边/抗锯齿，α>0.03）> 模板亮字 α（`tools/doubao-wm-alpha.png`，**仅亮字核心、漏描边**）> 二值模板。**必须用含描边的完整 footprint**——只盖亮字会在低对比背景（木纹/纸面）MAT 重绘后留暗字形残影，且 gap-score 判据检测不到暗描边（会误判 PASS）。不足回退整框，再不到则空 mask 跳过。
@@ -54,6 +54,8 @@ $P $S --root /path run            # 项目外目录
 
 ## 验证、备份与质量标准
 - **验证（`verify_paths`）**：`overwrite-review`/`review-lama` 打印 `[PASS]/[WARN]/[FAIL]`，**FAIL 拒绝覆盖**（`--force` 强制）。判据：① mask 外零改动（mask 外差异 >2 即 FAIL，必是 bug）；② 模板残留（`.tpl` 原图命中而修复后仍命中 → FAIL/WARN）；③ mask 面积 >8% 告警。
+- **逆解默认关（`--inverse` 开）**：逆解按 stamp α/C 逐像素反解，能保真实纹理，但前提是"该图水印与资产 α/C 完全一致"——实拍图上并不总成立，会留**伪影**（4.png 白线、2.png 彩点、1.png 暗字形）。实测 7 张实拍图中 MAT 版模板残留**在 6 张上更低或相等**，故默认纯 MAT；需要保纹理的复杂背景（花丛类）可显式 `--inverse`。
+- **暗字形（过冲）自动重试（默认开、1 轮）**：MAT 在 mask 盖不住水印**淡边缘/暗描边**时会把残留暗边当内容保留 → 结果字形区比周围暗（`_result_overshoot_score` 负值，1.png 地毯实测 −23）。检测到即把 mask 膨胀 `OVERSHOOT_DILATE=15x15` 重跑该图（实测 −23 → −3~−6），先于残留重试执行。这是"换一张图就失效"的兜底：判据只关乎结果本身、与图无关。
 - **残留重试（默认开、1 轮、`--no-retry` 关）**：残留判定 = 绝对分 ≥ `TEMPLATE_MIN_SCORE`(20) 或 相对分 ≥ 原分 `TEMPLATE_RESIDUAL_RATIO`(0.2) 且 ≥ `TEMPLATE_RESIDUAL_FLOOR`(8)——低对比残影达不到 20，靠相对判据兜底。命中即 mask 膨胀一级（`RETRY_DILATE=5x5`）隔离重跑；仍残留交 `overwrite-review` 拒绝。**逆解已生效的图跳过重试**——逆解是精确物理恢复，生成式 MAT 重试会把它重新糊掉（`.tpl`/`.wprof` 侧车标记者不入重试候选）。
 - **备份**：`original-watermark-backup/` 不存在才复制、不覆盖；通过后删备份与 `/tmp` 复查产物。
 - **覆盖安全（md5）**：prepare 记源 md5 到 `WORK/manifest.json`，`overwrite-review` 覆盖前校验，不一致/无 manifest 拒绝。**`--root` 不得指向 `dist/`**。

@@ -72,6 +72,28 @@ def eval_doubao(rdw, path):
     return score >= rdw.TEMPLATE_MIN_SCORE, score
 
 
+def looks_processed(rdw, path):
+    """根目录图是否可当作"已去水印图"：与 dist 原图不同 **且** 豆包模板不再命中。
+
+    仅凭 md5 不同不够——dist 若与根目录同步为带水印原图、或用户直接往根目录放入带水印
+    新图，md5 虽不同但图其实仍带水印，此时把它当"干净背景/已处理图"会令"不应误检"负例
+    假 FAIL（实测：dist 与原图同步后 clean:3/no-watermark、residual: processed 两个负例
+    被真实水印触发）。这里用贴合字形的模板命中做判据——它走的是模板路径，与被测的兜底
+    检测不同，不构成循环依赖。"""
+    import numpy as np
+    ref = DIST / path.name
+    if not (ref.exists() and md5(path) != md5(ref)):
+        return False
+    try:
+        with Image.open(path) as im:
+            rgb = im.convert('RGB')
+            gray = np.array(rgb).max(axis=2).astype(np.float32)
+            _, score, _ = rdw.template_stroke_mask(gray, rgb.size[0], rgb.size[1])
+    except Exception:
+        return False
+    return score < rdw.TEMPLATE_MIN_SCORE
+
+
 def eval_synth(rdw, swt, img, real, any_position):
     """合成文字水印：检测框与已知 bbox 的最大 IoU（含管线位置过滤）。
     real=None（负样本）时，任何检出都算误检。"""
@@ -109,7 +131,8 @@ def build_cases(rdw, swt):
             return im.crop((0, 0, w, h)) if im.width >= w and im.height >= h else im.resize((w, h))
         return swt.make_background(kind, w, h)
 
-    photo_bgs = [f'clean:{p.stem}' for p in clean[:3]]
+    # 只把"确实已去水印"的根目录图当干净背景（dist 同步为原图时 clean 会含带水印图）。
+    photo_bgs = [f'clean:{p.stem}' for p in clean if looks_processed(rdw, p)][:3]
     # C. 支持能力：亮色文字水印（右下角，默认管线）应命中
     for bgk in ['black', 'gradient', 'whitebg', *photo_bgs]:
         for color in ['white', 'translucent']:
@@ -124,8 +147,8 @@ def build_cases(rdw, swt):
             cases.append({'group': 'synth-any', 'name': f'gradient/{color}/{pos}',
                           'img': img, 'real': real, 'any_position': True,
                           'layer': 1, 'expect': 'hit'})
-    # E. 支持能力：无水印纯背景/干净照片不应误检
-    for bgk in ['black', 'whitebg', 'gradient', 'clean:2', 'clean:3']:
+    # E. 支持能力：无水印纯背景/干净照片不应误检（干净照片仅取确实已去水印者）
+    for bgk in ['black', 'whitebg', 'gradient', *photo_bgs]:
         try:
             img = bg(bgk)
         except FileNotFoundError:
@@ -133,8 +156,39 @@ def build_cases(rdw, swt):
         cases.append({'group': 'synth-neg', 'name': f'{bgk}/no-watermark',
                       'img': img, 'real': None,
                       'any_position': False, 'layer': 1, 'expect': 'miss'})
+    # E2. 已去水印图（整图，默认模式只留右下角框）不得误检——防"兜底检测把右下角
+    #     背景碎块当字形硬修"回归。旧判据字符高下限 1.2%*H 太低，地毯 1/2.png、纸面
+    #     3.png、花丛 6.png 的背景碎块被聚成"字符行"硬修；收紧到 2.6%~5.0% 短边后
+    #     应回归"跳过"。用整图（而非裁角）复现：检测窗按图幅比例，裁角会改变场景。
+    for path in clean:
+        if not looks_processed(rdw, path):
+            continue
+        try:
+            im = Image.open(path).convert('RGB')
+        except OSError:
+            continue
+        cases.append({'group': 'synth-neg', 'name': f'{path.name} (processed)',
+                      'img': im, 'real': None,
+                      'any_position': False, 'layer': 1, 'expect': 'miss'})
+    # E3. 合成"已去水印图"右下角背景碎块不得误检：不依赖 dist/根目录，CI 恒可跑。
+    #     碎块字形高 26px（1.63% 短边）低于字符高下限 2.6%（41.6px），收紧前旧判据
+    #     下限 1.2%*H 会把它聚成"字符行"误检硬修；与 Rust 同名单测同几何。
+    try:
+        import numpy as np
+        W, H = 2848, 1600
+        arr = np.tile(np.array([236, 233, 228], np.uint8), (H, W, 1))
+        arr[::53, :] = np.array([226, 222, 216], np.uint8)
+        y1 = H - 45
+        for i in range(6):
+            x1 = W - 40 - 30 * i - 22
+            arr[y1:y1 + 26, x1:x1 + 22] = np.array([250, 248, 244], np.uint8)
+        cases.append({'group': 'synth-neg', 'name': 'specks/bottomright (processed-like)',
+                      'img': Image.fromarray(arr), 'real': None,
+                      'any_position': False, 'layer': 1, 'expect': 'miss'})
+    except ImportError:
+        pass
     # F. 已知边界（物理低对比 / busy photo 误检；不算回归失败，只锁定现状）
-    for bgk, color in [('gradient', 'pale'), ('whitebg', 'pale'), ('clean:3', 'pale')]:
+    for bgk, color in [('gradient', 'pale'), ('whitebg', 'pale')]:
         try:
             img, real = swt.stamp_text(bg(bgk), color, 'bottomright', 1.0)
         except FileNotFoundError:
@@ -142,6 +196,16 @@ def build_cases(rdw, swt):
         cases.append({'group': 'boundary', 'name': f'{bgk}/{color} (low-contrast)',
                       'img': img, 'real': real, 'any_position': False,
                       'layer': 1, 'expect': 'miss', 'boundary': True})
+    # clean:3 上的淡字（220）原先被同图背景碎块干扰、融合框偏大而 miss；字符高带
+    # 收紧后碎块被排除，检出框回到淡字本体（IoU 0.43）→ 转正为应命中。
+    if looks_processed(rdw, ROOT / '3.png'):
+        try:
+            img, real = swt.stamp_text(bg('clean:3'), 'pale', 'bottomright', 1.0)
+            cases.append({'group': 'synth-corner', 'name': 'clean:3/pale (low-contrast)',
+                          'img': img, 'real': real, 'any_position': False,
+                          'layer': 1, 'expect': 'hit'})
+        except FileNotFoundError:
+            pass
     return cases
 
 
@@ -158,6 +222,75 @@ def run_layer1(rdw, swt, cases, only):
             hit = iou > 0.3
             detail = f'max IoU {iou:.2f}'
         rows.append((c, hit == (c['expect'] == 'hit'), detail))
+    return rows
+
+
+def run_lowcontrast_check(rdw, only):
+    """低对比盲区：背景亮块尺度≈顶帽核时，模板 gap-score 必须**同时**用 raw 与顶帽
+    两种口径取强者（`template_stroke_mask` 的 max 规则）。
+
+    只算顶帽口径时，岩石/树皮这类背景（亮块尺度大于顶帽核、顶帽跟不上）会把水印
+    gap 压到阈值下：真实图 2.png 顶帽 19.9 < 20（水印漏检、完全没去除），raw 22.3
+    仍可判。这里用随机大亮块背景 + 豆包 stamp 合成复现同一机制（不依赖 dist）：
+    修复前顶帽口径 19.4 < 20 → FAIL，修复后 max 22.0 → PASS。"""
+    import numpy as np
+    import cv2
+    if only and 'lowcontrast' not in only:
+        return []
+    tpl, _alpha, meta = rdw.load_template()
+    stamp, _ = rdw._load_stamp()
+    if tpl is None or stamp is None:
+        return []
+    h, w = 900, 1600
+    scale = min(h, w) / meta['ref_short_side']
+    sh = max(1, int(round(stamp.shape[0] * scale)))
+    sw = max(1, int(round(stamp.shape[1] * scale)))
+    sa = cv2.resize(stamp, (sw, sh), interpolation=cv2.INTER_LINEAR)
+    rng = np.random.default_rng(3)
+    blk = 30  # 亮块尺度≈顶帽核(31)：顶帽无法把背景压平
+    small = rng.random((h // blk + 1, w // blk + 1)).astype(np.float32)
+    big = cv2.resize(small, (w, h), interpolation=cv2.INTER_CUBIC)
+    big = (big - big.min()) / (big.max() - big.min() + 1e-6)
+    lo, hi = 188, 245
+    img = (lo + big * (hi - lo))[..., None] * np.array([1.0, 0.92, 0.80], np.float32)
+    x1, y1 = w - sw - 8, h - sh - 8
+    region = img[y1:y1 + sh, x1:x1 + sw]
+    a = sa[..., None]
+    img[y1:y1 + sh, x1:x1 + sw] = region * (1 - a) + 255.0 * a
+    gray = np.clip(img, 0, 255).astype(np.uint8).max(axis=2).astype(np.float32)
+    _mask, score, _info = rdw.template_stroke_mask(gray, w, h)
+    case = {'group': 'doubao-lowcontrast', 'name': 'big-blocks/white', 'expect': 'hit'}
+    return [(case, score >= rdw.TEMPLATE_MIN_SCORE, f'tmpl score {score:.1f}')]
+
+
+def run_inverse_quality_checks(rdw, only):
+    """逆解质量闸门（gap-score 测不到的盲区）：
+
+    ① **过冲**（减过头留暗字形）：1.png 地毯案例字形区比间隙暗 22，模板 gap-score 只查
+       "字形偏亮"（残留）故漏网；`_result_overshoot_score` 必须能把它判出来（< −阈值）。
+    ② 正常图（字形区与间隙区同分布）不得误判过冲。"""
+    import numpy as np
+    if only and 'inverse-quality' not in only:
+        return []
+    stamp, _ = rdw._load_stamp()
+    if stamp is None:
+        return []
+    px, py = 2541, 1490
+    h, w = 1600, 2848
+    sh, sw = stamp.shape
+    rng = np.random.default_rng(11)
+    base = (rng.random((h, w, 3)) * 30 + 150).astype(np.float32)
+    clean = rdw._result_overshoot_score(base, px, py)
+    rows = [({'group': 'inverse-quality', 'name': 'overshoot: clean image', 'expect': 'ok'},
+             clean is not None and clean > -rdw.INVERSE_OVERSHOOT_MAX,
+             f'overshoot {clean:.1f}' if clean is not None else 'n/a')]
+    bad = base.copy()
+    reg = bad[py:py + sh, px:px + sw]
+    reg[stamp > 0.5] -= 40.0  # 模拟"减过头"：字形核心被压暗
+    over = rdw._result_overshoot_score(bad, px, py)
+    rows.append(({'group': 'inverse-quality', 'name': 'overshoot: darkened glyph', 'expect': 'reject'},
+                 over is not None and over < -rdw.INVERSE_OVERSHOOT_MAX,
+                 f'overshoot {over:.1f}' if over is not None else 'n/a'))
     return rows
 
 
@@ -409,11 +542,13 @@ def run_verify_checks(rdw, only):
     rows.append(({**base, 'name': 'residual: unchanged(2.png)'},
                  bool(rep and rep.get('residual') and rep['verdict'] == 'FAIL'),
                  f"residual={rep and rep.get('residual')} verdict={rep and rep['verdict']}"))
-    # 残留负例：结果是已去水印图 → residual=False（不误触发重试）
-    rep = rdw.verify_paths(dist2, clean2, mask_path, template_applied=True)
-    rows.append(({**base, 'name': 'residual: processed(2.png)'},
-                 bool(rep and not rep.get('residual')),
-                 f"residual={rep and rep.get('residual')} verdict={rep and rep['verdict']}"))
+    # 残留负例：结果是已去水印图 → residual=False（不误触发重试）。仅当根目录 2.png
+    # 确实已去水印（dist 若与根目录同步为原图则不成立）才纳入，否则负例本身无效。
+    if looks_processed(rdw, clean2):
+        rep = rdw.verify_paths(dist2, clean2, mask_path, template_applied=True)
+        rows.append(({**base, 'name': 'residual: processed(2.png)'},
+                     bool(rep and not rep.get('residual')),
+                     f"residual={rep and rep.get('residual')} verdict={rep and rep['verdict']}"))
     # mask 膨胀：新增像素数应等于面积增量（自动重试用它扩 mask）
     before = int((np.array(Image.open(mask_path).convert('L')) > 0).sum())
     added = rdw._expand_mask(mask_path)
@@ -530,6 +665,68 @@ def run_e2e(rdw, swt, cases, model):
 
 # ---------------------------------------------------------------------------
 
+def run_crop_checks(rdw, only):
+    """自裁小块推理（提速）的防回归（无模型）：
+    ① `_crop_box` 必须把完整水印框进去且边长 ≤ CROP_SIDE_MAX（只有 ≤512 时 MAT 补齐后才是
+       512²；一旦超过就会被补到 1024²，耗时非线性暴涨——实测同图 8s vs 90s）；
+    ② 用 stub iopaint 验证 `_iopaint_batch` **只贴回 mask 像素**：mask 外逐字节不变
+       （AGENTS 硬约束），mask 内取裁块结果。"""
+    import numpy as np
+    from shutil import rmtree
+    rows = []
+    if only and 'crop' not in only:
+        return rows
+    for (w, h, bw, bh) in [(2848, 1600, 287, 99), (1728, 2304, 316, 92), (1248, 1664, 303, 64)]:
+        m = np.zeros((h, w), np.uint8)
+        x1, y1 = w - bw - 15, h - bh - 20
+        m[y1:y1 + bh, x1:x1 + bw] = 255
+        box = rdw._crop_box(m, w, h)
+        ok = (box is not None and box[0] <= x1 and box[1] <= y1
+              and box[2] >= x1 + bw and box[3] >= y1 + bh
+              and max(box[2] - box[0], box[3] - box[1]) <= rdw.CROP_SIDE_MAX)
+        rows.append(({'group': 'crop', 'name': f'crop box {w}x{h} covers+<=512', 'expect': 'ok'},
+                     ok, f'box={box}'))
+    tmp = Path(tempfile.mkdtemp(prefix='wm-crop-'))
+    old_work, old_sub = rdw.WORK, rdw.subprocess
+    try:
+        src, msk, out = tmp / 'source', tmp / 'masks', tmp / 'out'
+        for d in (src, msk, out):
+            d.mkdir(parents=True, exist_ok=True)
+        rdw.WORK = tmp / 'work'
+        rng = np.random.default_rng(0)
+        base = rng.integers(0, 255, (900, 1400, 3), dtype=np.uint8)  # 大图 → 必走裁块
+        mask = np.zeros((900, 1400), np.uint8)
+        mask[700:760, 1000:1180] = 255
+        Image.fromarray(base).save(src / 'x.png')
+        Image.fromarray(mask).save(msk / 'x.png')
+        calls = {}
+        class _Fake:  # 只保留 run，供 _iopaint_batch 调
+            @staticmethod
+            def run(argv, **kw):
+                img_dir = Path(argv[argv.index('--image') + 1])
+                msk_dir = Path(argv[argv.index('--mask') + 1])
+                out_dir = Path(argv[argv.index('--output') + 1])
+                calls['crop_size'] = Image.open(img_dir / 'x.png').size
+                arr = np.array(Image.open(img_dir / 'x.png').convert('RGB'))
+                mk = np.array(Image.open(msk_dir / 'x.png').convert('L'))
+                arr[mk > 0] = (0, 255, 0)  # stub：mask 内填纯绿
+                Image.fromarray(arr).save(out_dir / 'x.png')
+        rdw.subprocess = _Fake
+        rdw._iopaint_batch(['x.png'], 'mat', src, msk, out)
+        res = np.array(Image.open(out / 'x.png').convert('RGB'))
+        inside = mask > 0
+        outside_same = bool((res[~inside] == base[~inside]).all())
+        inside_filled = bool((res[inside] == np.array([0, 255, 0])).all())
+        cropped = calls.get('crop_size') is not None and max(calls['crop_size']) <= rdw.CROP_SIDE_MAX
+        rows.append(({'group': 'crop', 'name': 'batch pastes mask only, crops <=512', 'expect': 'ok'},
+                     outside_same and inside_filled and cropped,
+                     f'outside_unchanged={outside_same} inside_filled={inside_filled} crop={calls.get("crop_size")}'))
+    finally:
+        rdw.WORK, rdw.subprocess = old_work, old_sub
+        rmtree(tmp, ignore_errors=True)
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser(description='watermark processing regression corpus')
     ap.add_argument('--e2e', action='store_true', help='also run full pipeline + result verification (slow)')
@@ -544,7 +741,10 @@ def main():
     rows = run_layer1(rdw, swt, cases, args.only)
     rows += run_stamp_checks(rdw, args.only)
     rows += run_verify_checks(rdw, args.only)
+    rows += run_lowcontrast_check(rdw, args.only)
+    rows += run_inverse_quality_checks(rdw, args.only)
     rows += run_auto_profile_checks(rdw, swt, args.only)
+    rows += run_crop_checks(rdw, args.only)
 
     print(f'{"layer":5s} {"case":40s} {"expect":6s} {"mark":5s} detail')
     fails = 0
