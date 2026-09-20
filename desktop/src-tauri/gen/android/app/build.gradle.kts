@@ -13,6 +13,23 @@ val tauriProperties = Properties().apply {
     }
 }
 
+// 版本号单一来源 = src-tauri/tauri.conf.json 的 version。tauri.properties 由 CLI 生成且被
+// .gitignore 掉：CI 全新检出时该文件不存在（gen/android 已入库 → 不会重跑 android init），
+// gradle 会静默退回 versionName=1.0/versionCode=1，导致线上 APK 版本号是假的。
+// 这里直接读配置；versionCode 沿用 Tauri 默认公式 major*1000000 + minor*1000 + patch
+// （0.3.4 → 3004，与历史一致；0.5.5 → 5005，单调递增，满足 Play 商店要求）。
+val appVersion: String? = run {
+    val conf = file("../../../tauri.conf.json")
+    if (!conf.exists()) null
+    else Regex("\"version\"\\s*:\\s*\"([^\"]+)\"").find(conf.readText())?.groupValues?.get(1)
+}
+
+fun semverToVersionCode(v: String): Int {
+    val parts = v.trim().removePrefix("v").split(".")
+    fun at(i: Int) = parts.getOrNull(i)?.takeWhile { it.isDigit() }?.toIntOrNull() ?: 0
+    return at(0) * 1000000 + at(1) * 1000 + at(2)
+}
+
 android {
     compileSdk = 36
     namespace = "com.yazhouzou.doubaoWatermarkRemover"
@@ -21,8 +38,9 @@ android {
         applicationId = "com.yazhouzou.doubaoWatermarkRemover"
         minSdk = 24
         targetSdk = 36
-        versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
-        versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
+        versionCode = appVersion?.let { semverToVersionCode(it) }
+            ?: tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
+        versionName = appVersion ?: tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }
     signingConfigs {
         create("ciRelease") {

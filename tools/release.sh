@@ -19,9 +19,13 @@ if [ "${SKIP_CHECK:-0}" != "1" ]; then
 fi
 
 echo "[2/4] 更新版本号 → $VER"
+# 版本号单一来源 = tauri.conf.json（macOS/Android 产物版本都取自它），
+# Cargo.toml / package.json 必须同步（有单测 version_manifests_are_in_sync 把关）。
 perl -pi -e "s/\"version\": \"[0-9.]+\"/\"version\": \"$VER\"/" desktop/src-tauri/tauri.conf.json
+perl -pi -e "s/^version = \"[0-9.]+\"/version = \"$VER\"/" desktop/src-tauri/Cargo.toml
+perl -pi -e "s/\"version\": \"[0-9.]+\"/\"version\": \"$VER\"/" desktop/package.json
 
-git add desktop/src-tauri/tauri.conf.json
+git add desktop/src-tauri/tauri.conf.json desktop/src-tauri/Cargo.toml desktop/package.json
 if ! git diff --cached --quiet; then
   git commit -m "Release $TAG"
 fi
