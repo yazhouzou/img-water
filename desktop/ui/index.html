@@ -110,7 +110,6 @@
         <div class="run-buttons">
           <button id="btn-run" class="btn primary" disabled>开始处理</button>
           <button id="btn-cancel" class="btn danger" hidden data-i18n="cancel"></button>
-          <button id="btn-cleanup" class="btn danger ghost" disabled data-i18n="cleanup"></button>
         </div>
         <div id="run-progress" class="run-progress" hidden>
           <div class="run-progress-track">
@@ -196,7 +195,17 @@
   </div>
 
   <div id="lightbox" class="lightbox" role="dialog" aria-modal="true" aria-label="预览大图">
-    <img src="" alt="预览大图" />
+    <div id="lightbox-stage" class="lightbox-stage">
+      <img id="lightbox-img" src="" alt="预览大图" draggable="false" hidden />
+      <div id="lightbox-loading" class="lightbox-loading" hidden><span class="spinner"></span><span data-i18n="previewLoading"></span></div>
+    </div>
+    <div class="lightbox-toolbar" role="toolbar">
+      <button id="lightbox-zoom-out" class="lightbox-btn" type="button" data-i18n-title="zoomOut" data-i18n-aria="zoomOut"><span aria-hidden="true">−</span></button>
+      <span id="lightbox-zoom-label" class="lightbox-zoom">100%</span>
+      <button id="lightbox-zoom-in" class="lightbox-btn" type="button" data-i18n-title="zoomIn" data-i18n-aria="zoomIn"><span aria-hidden="true">＋</span></button>
+      <button id="lightbox-reset" class="lightbox-btn" type="button" data-i18n="resetZoom"></button>
+      <button id="lightbox-close" class="lightbox-btn" type="button" data-i18n="closePreview"></button>
+    </div>
   </div>
 
   <div id="drop-overlay" class="drop-overlay" hidden>

@@ -4,6 +4,12 @@
 (function () {
   if (window.__TAURI__) return;
 
+  // 联调便利：?nodisclaimer=1 跳过使用须知弹窗，方便截图/自动化
+  const bootParams = new URLSearchParams(location.search);
+  if (bootParams.get('nodisclaimer') === '1') {
+    try { localStorage.setItem('wm-disclaimer-ok', '1'); } catch (_) {}
+  }
+
   const handlers = {};
   const FAKE_PNGS = ['1.png', '2.png', '3.png', '4.png', '5.png'];
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

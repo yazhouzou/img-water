@@ -8,7 +8,7 @@ cd "$(dirname "$0")/../desktop/ui"
 
 echo "UI 联调地址："
 echo "  移动端视图  http://localhost:$PORT/index.html?mobile=1"
-echo "  桌面视图    http://localhost:$PORT/index.html?desktop=1"
+echo "  桌面视图    http://localhost:$PORT/index.html?mobile=0"
 echo "  模拟未下载模型 http://localhost:$PORT/index.html?mobile=1&nomodel=1"
 echo "提示：F12 打开 DevTools，设备工具栏可模拟手机屏宽；若端口被占用，先 Ctrl+C 旧服务或换端口"
 echo "Ctrl+C 退出"

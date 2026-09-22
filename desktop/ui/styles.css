@@ -223,6 +223,39 @@ body {
 .file-item:has(input:checked) { background: var(--primary-soft); }
 .placeholder { color: var(--muted); font-size: 13px; padding: 14px; text-align: center; }
 
+/* 桌面端左栏：整体可滚动（窗口偏矮时"开始处理"不再被裁掉），
+   文件列表给固定高度区间；长文件名省略，绝不产生横向滚动条。 */
+body:not(.mobile) .files-panel { overflow-y: auto; overflow-x: hidden; }
+/* 除文件列表外的子项都不参与收缩：空间不足时让面板整体滚动，
+   而不是把 folder-path 等（overflow:hidden → min-height:0）压扁裁切 */
+body:not(.mobile) .files-panel > *:not(.file-list) { flex-shrink: 0; }
+/* 文件列表是唯一可伸缩的子项：吃掉剩余空间，并设上下限 */
+body:not(.mobile) .file-list {
+  flex: 1 1 auto;
+  min-height: 120px;
+  max-height: 340px;
+  overflow-x: hidden;
+}
+body:not(.mobile) .file-item span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 细滚动条：桌面端更克制，不喧宾夺主 */
+body:not(.mobile) .files-panel::-webkit-scrollbar { width: 8px; }
+body:not(.mobile) .files-panel::-webkit-scrollbar-track { background: transparent; }
+body:not(.mobile) .files-panel::-webkit-scrollbar-thumb {
+  background: rgba(120, 128, 142, 0.32);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+body:not(.mobile) .files-panel::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(120, 128, 142, 0.52);
+}
+
 /* 空状态引导 */
 .empty-state {
   display: flex;
@@ -594,15 +627,6 @@ body.mobile #btn-run {
   border-radius: 14px;
 }
 body.mobile #btn-run:disabled { box-shadow: none; }
-body.mobile #btn-cleanup {
-  min-height: 36px;
-  border: none;
-  background: transparent;
-  color: var(--muted);
-  font-size: 13px;
-  padding: 4px;
-}
-body.mobile:not(.state-done) #btn-cleanup { display: none; }
 body.mobile .checkbox { font-size: 13px; padding: 4px 0; }
 
 /* 结果卡片 */
@@ -620,13 +644,6 @@ body.mobile .log {
   border-radius: 10px;
 }
 
-@media (max-width: 720px) {
-  .topbar { flex-wrap: wrap; gap: 8px; }
-  .layout { grid-template-columns: 1fr; padding: 10px 12px 16px; }
-  .brand h1 { font-size: 15px; }
-  .subtitle { font-size: 11px; }
-  .review-grid { grid-template-columns: 1fr; }
-}
 body.mobile .topbar {
   padding: 14px 16px 10px;
   gap: 8px;
@@ -743,14 +760,6 @@ body.mobile #btn-run {
   border-radius: 14px;
   box-shadow: 0 4px 14px rgba(79, 70, 229, 0.3);
 }
-body.mobile #btn-cleanup {
-  min-height: 36px;
-  border: none;
-  background: transparent;
-  color: var(--muted);
-  font-size: 13px;
-  padding: 4px;
-}
 body.mobile .checkbox { font-size: 13px; padding: 4px 0; }
 
 /* 结果卡片 */
@@ -774,29 +783,98 @@ body.mobile .log {
   .brand h1 { font-size: 15px; }
   .subtitle { font-size: 11px; }
   .review-grid { grid-template-columns: 1fr; }
+  /* 窄窗口：左右栏改为上下堆叠后，让页面整体滚动，避免两栏被硬塞进
+     固定高度、各自被压缩而裁掉内容（桌面端 body 默认 overflow:hidden） */
+  body:not(.mobile) { height: auto; min-height: 100vh; overflow: auto; }
+  body:not(.mobile) .layout { flex: 0 0 auto; }
+  body:not(.mobile) .right-panel { overflow-y: visible; }
 }
 
-/* 预览图点击放大 */
+/* 预览灯箱：点击缩略图/复查图打开高清大图，支持滚轮缩放、拖拽平移 */
 .review-img.has-image { cursor: zoom-in; }
 .review-img.has-image img:hover { outline: 2px solid var(--primary, #5b5bd6); }
+
 .lightbox {
   display: none;
   position: fixed;
   inset: 0;
   z-index: 1000;
-  background: rgba(15, 15, 20, 0.82);
-  align-items: center;
-  justify-content: center;
-  cursor: zoom-out;
-  padding: 24px;
+  background: rgba(12, 12, 16, 0.92);
 }
-.lightbox.open { display: flex; }
-.lightbox img {
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
-  border-radius: 8px;
-  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+.lightbox.open { display: block; }
+
+.lightbox-stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.lightbox-stage.grabbing { cursor: grabbing; }
+.lightbox-stage img {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  max-width: none;
+  max-height: none;
+  transform-origin: center center;
+  transform: translate(-50%, -50%);
+  border-radius: 6px;
+  box-shadow: 0 10px 50px rgba(0, 0, 0, 0.55);
+  will-change: transform;
+  -webkit-user-drag: none;
+}
+.lightbox-loading {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #d6d9e0;
+  font-size: 13px;
+}
+.lightbox-loading[hidden] { display: none; }
+
+.lightbox-toolbar {
+  position: absolute;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(32, 34, 42, 0.86);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.lightbox-btn {
+  border: none;
+  background: transparent;
+  color: #eef0f5;
+  border-radius: 999px;
+  min-width: 34px;
+  height: 30px;
+  padding: 0 10px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.lightbox-btn:hover { background: rgba(255, 255, 255, 0.14); }
+.lightbox-btn:disabled { opacity: 0.4; cursor: default; }
+.lightbox-zoom {
+  min-width: 48px;
+  text-align: center;
+  font-size: 12px;
+  color: #c8ccd6;
+  font-variant-numeric: tabular-nums;
 }
 
 /* 手动框选水印 */
@@ -832,15 +910,14 @@ body.mobile .log {
   gap: 8px;
   font-size: 12px;
   margin-top: 6px;
+  flex-wrap: wrap;
 }
 .output-dir-row[hidden] { display: none; }
 body.mobile .output-dir-row { display: none; }
 #output-dir-path {
-  flex: 1;
+  flex: 1 1 160px;
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 .output-hint code {
   background: var(--chip, rgba(127, 127, 127, 0.14));
@@ -918,6 +995,14 @@ body.mobile .output-dir-row { display: none; }
 }
 
 .run-buttons { display: flex; align-items: center; gap: 10px; }
+/* 主操作按钮常驻左栏底部：窗口偏矮时也不会被滚出视野 */
+body:not(.mobile) .run-buttons {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  padding: 10px 0 2px;
+  background: var(--panel);
+}
 .run-progress {
   display: flex;
   align-items: center;

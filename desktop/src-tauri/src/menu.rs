@@ -15,12 +15,11 @@ pub const EVENT_MENU_ACTION: &str = "menu-action";
 pub const ID_PICK: &str = "menu-pick";
 pub const ID_START: &str = "menu-start";
 pub const ID_EXPORT_LOG: &str = "menu-export-log";
-pub const ID_CLEANUP: &str = "menu-cleanup";
 pub const ID_HELP_GUIDE: &str = "menu-help-guide";
 pub const ID_HELP_ISSUE: &str = "menu-help-issue";
 
 /// 需要转发给前端的动作（其余为系统预定义项，由系统原生处理）。
-const FORWARDED: &[&str] = &[ID_PICK, ID_START, ID_EXPORT_LOG, ID_CLEANUP];
+const FORWARDED: &[&str] = &[ID_PICK, ID_START, ID_EXPORT_LOG];
 
 const GUIDE_URL: &str = "https://github.com/yazhouzou/img-water#readme";
 const ISSUE_URL: &str = "https://github.com/yazhouzou/img-water/issues/new";
@@ -74,11 +73,6 @@ pub fn build<R: Runtime>(app: &AppHandle<R>, lang: &str) -> tauri::Result<Menu<R
         .separator()
         .item(
             &MenuItemBuilder::with_id(ID_EXPORT_LOG, t(lang, "导出日志…", "Export Log…"))
-                .build(app)?,
-        )
-        .separator()
-        .item(
-            &MenuItemBuilder::with_id(ID_CLEANUP, t(lang, "清理临时文件", "Clean Temporary Files"))
                 .build(app)?,
         )
         .separator()
@@ -163,7 +157,6 @@ mod tests {
         assert!(FORWARDED.contains(&ID_PICK));
         assert!(FORWARDED.contains(&ID_START));
         assert!(FORWARDED.contains(&ID_EXPORT_LOG));
-        assert!(FORWARDED.contains(&ID_CLEANUP));
         // 帮助项在 Rust 侧直接打开链接，不进转发列表
         assert!(!FORWARDED.contains(&ID_HELP_GUIDE));
         assert!(!FORWARDED.contains(&ID_HELP_ISSUE));

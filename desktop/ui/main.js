@@ -11,7 +11,6 @@ const els = {
   btnSelectAll: document.getElementById('btn-select-all'),
   btnSelectNone: document.getElementById('btn-select-none'),
   btnRun: document.getElementById('btn-run'),
-  btnCleanup: document.getElementById('btn-cleanup'),
   btnClearLog: document.getElementById('btn-clear-log'),
   btnExportLog: document.getElementById('btn-export-log'),
   folderPath: document.getElementById('folder-path'),
@@ -69,6 +68,15 @@ const els = {
   compareSource: document.getElementById('compare-source'),
   compareFinal: document.getElementById('compare-final'),
   compareHandle: document.getElementById('compare-handle'),
+  lightbox: document.getElementById('lightbox'),
+  lightboxStage: document.getElementById('lightbox-stage'),
+  lightboxImg: document.getElementById('lightbox-img'),
+  lightboxLoading: document.getElementById('lightbox-loading'),
+  lightboxZoomLabel: document.getElementById('lightbox-zoom-label'),
+  lightboxZoomIn: document.getElementById('lightbox-zoom-in'),
+  lightboxZoomOut: document.getElementById('lightbox-zoom-out'),
+  lightboxReset: document.getElementById('lightbox-reset'),
+  lightboxClose: document.getElementById('lightbox-close'),
 };
 
 let targetRoot = null;
@@ -97,7 +105,6 @@ function setRunning(value) {
   els.btnRun.hidden = value;
   els.btnCancel.hidden = !value;
   els.btnPick.disabled = value;
-  els.btnCleanup.disabled = value || !targetRoot;
   els.btnSetup.disabled = value;
   els.btnMask.disabled = value || !targetRoot;
   els.btnLearn.disabled = value;
@@ -187,7 +194,6 @@ async function restoreLastFolder() {
     const names = await invoke('list_pngs', { root: lastRoot, lang: window.i18n.lang });
     targetRoot = lastRoot;
     els.btnRefresh.disabled = false;
-    els.btnCleanup.disabled = running;
     clearMaskSelection();
     renderFolderPath();
     renderFiles(names);
@@ -229,17 +235,152 @@ function showReview(container, path) {
     });
 }
 
+// —— 大图预览灯箱：高清加载 + 滚轮/按钮缩放 + 拖拽平移 ——
+// 关键：结果缩略图只有 200px，点开必须按**原图路径**重新读高清图，否则放大后是糊的。
+const LB_MAX_SCALE = 8;
+const LB_MIN_FACTOR = 0.2; // 相对"适应窗口"的最小缩放
+let lbScale = 1, lbTx = 0, lbTy = 0, lbFit = 1;
+let lbNatural = { w: 0, h: 0 };
+
+function setLightboxTransform() {
+  els.lightboxImg.style.transform =
+    `translate(-50%, -50%) translate(${lbTx}px, ${lbTy}px) scale(${lbScale})`;
+  els.lightboxZoomLabel.textContent = Math.round(lbScale * 100) + '%';
+  els.lightboxZoomIn.disabled = lbScale >= LB_MAX_SCALE - 0.001;
+  els.lightboxZoomOut.disabled = lbScale <= Math.max(lbFit * LB_MIN_FACTOR, 0.05) + 0.001;
+}
+
+function lightboxFitScale() {
+  const stage = els.lightboxStage.getBoundingClientRect();
+  if (!lbNatural.w || !lbNatural.h || !stage.width || !stage.height) return 1;
+  return Math.min(stage.width / lbNatural.w, stage.height / lbNatural.h);
+}
+
+function resetLightboxView() {
+  lbFit = lightboxFitScale();
+  lbScale = lbFit;
+  lbTx = 0;
+  lbTy = 0;
+  setLightboxTransform();
+}
+
 function openLightbox(dataUrl) {
-  const lightbox = document.getElementById('lightbox');
-  const img = lightbox.querySelector('img');
-  img.src = dataUrl;
-  lightbox.classList.add('open');
+  els.lightboxLoading.hidden = true;
+  els.lightboxImg.hidden = false;
+  els.lightboxImg.src = dataUrl;
+  els.lightbox.classList.add('open');
+  const onLoad = () => {
+    lbNatural = { w: els.lightboxImg.naturalWidth, h: els.lightboxImg.naturalHeight };
+    resetLightboxView();
+  };
+  if (els.lightboxImg.complete && els.lightboxImg.naturalWidth) onLoad();
+  else els.lightboxImg.addEventListener('load', onLoad, { once: true });
+}
+
+async function openLightboxPath(path) {
+  els.lightboxImg.hidden = true;
+  els.lightboxImg.src = '';
+  els.lightboxLoading.hidden = false;
+  els.lightbox.classList.add('open');
+  try {
+    const preview = await invoke('read_image_base64', { path, max: 4096, lang: window.i18n.lang });
+    if (!els.lightbox.classList.contains('open')) return; // 加载期间用户已关闭
+    openLightbox(preview.data_url);
+  } catch (err) {
+    closeLightbox();
+    logLine(t('previewFailed')(String(err)));
+  }
 }
 
 function closeLightbox() {
-  const lightbox = document.getElementById('lightbox');
-  lightbox.classList.remove('open');
-  lightbox.querySelector('img').src = '';
+  els.lightbox.classList.remove('open');
+  els.lightboxImg.hidden = true;
+  els.lightboxImg.src = '';
+  els.lightboxLoading.hidden = true;
+  els.lightboxStage.classList.remove('grabbing');
+  lbNatural = { w: 0, h: 0 };
+}
+
+// 以屏幕坐标点为锚缩放：该点下的图像像素保持不动（缩放体验自然）
+function zoomLightboxAt(clientX, clientY, factor) {
+  const stage = els.lightboxStage.getBoundingClientRect();
+  const cx = clientX - stage.left - stage.width / 2;
+  const cy = clientY - stage.top - stage.height / 2;
+  const minScale = Math.max(lbFit * LB_MIN_FACTOR, 0.05);
+  const next = Math.max(minScale, Math.min(LB_MAX_SCALE, lbScale * factor));
+  if (Math.abs(next - lbScale) < 1e-4) return;
+  const px = (cx - lbTx) / lbScale;
+  const py = (cy - lbTy) / lbScale;
+  lbScale = next;
+  lbTx = cx - px * next;
+  lbTy = cy - py * next;
+  setLightboxTransform();
+}
+
+function bindLightbox() {
+  const stage = els.lightboxStage;
+  let dragging = false;
+  let downOnImg = false;
+  let moved = false;
+  let startX = 0, startY = 0, startTx = 0, startTy = 0;
+
+  stage.addEventListener('pointerdown', (ev) => {
+    if (els.lightboxImg.hidden) return;
+    dragging = true;
+    moved = false;
+    downOnImg = ev.target === els.lightboxImg;
+    startX = ev.clientX;
+    startY = ev.clientY;
+    startTx = lbTx;
+    startTy = lbTy;
+    stage.classList.add('grabbing');
+    try { stage.setPointerCapture(ev.pointerId); } catch (_) {}
+  });
+  stage.addEventListener('pointermove', (ev) => {
+    if (!dragging) return;
+    const dx = ev.clientX - startX;
+    const dy = ev.clientY - startY;
+    if (Math.abs(dx) > 4 || Math.abs(dy) > 4) moved = true;
+    lbTx = startTx + dx;
+    lbTy = startTy + dy;
+    setLightboxTransform();
+  });
+  const endDrag = (ev) => {
+    if (!dragging) return;
+    dragging = false;
+    stage.classList.remove('grabbing');
+    try {
+      if (stage.hasPointerCapture && stage.hasPointerCapture(ev.pointerId)) {
+        stage.releasePointerCapture(ev.pointerId);
+      }
+    } catch (_) {}
+    // 单击图片外的空白 → 关闭；拖动或点图片本身不关闭
+    if (!moved && !downOnImg) closeLightbox();
+  };
+  stage.addEventListener('pointerup', endDrag);
+  stage.addEventListener('pointercancel', endDrag);
+  stage.addEventListener('dblclick', (ev) => {
+    if (els.lightboxImg.hidden) return;
+    if (Math.abs(lbScale - lbFit) < 0.01) zoomLightboxAt(ev.clientX, ev.clientY, (lbFit * 2) / lbScale);
+    else resetLightboxView();
+  });
+  stage.addEventListener('wheel', (ev) => {
+    if (els.lightboxImg.hidden) return;
+    ev.preventDefault();
+    zoomLightboxAt(ev.clientX, ev.clientY, ev.deltaY < 0 ? 1.15 : 1 / 1.15);
+  }, { passive: false });
+
+  const centerZoom = (factor) => {
+    const r = stage.getBoundingClientRect();
+    zoomLightboxAt(r.left + r.width / 2, r.top + r.height / 2, factor);
+  };
+  els.lightboxZoomIn.addEventListener('click', () => centerZoom(1.25));
+  els.lightboxZoomOut.addEventListener('click', () => centerZoom(1 / 1.25));
+  els.lightboxReset.addEventListener('click', resetLightboxView);
+  els.lightboxClose.addEventListener('click', closeLightbox);
+  window.addEventListener('resize', () => {
+    if (els.lightbox.classList.contains('open') && !els.lightboxImg.hidden) resetLightboxView();
+  });
 }
 
 // Android 返回键（MainActivity 经 evaluateJavascript 调用）：
@@ -673,9 +814,7 @@ function renderResultList(paths) {
     img.className = 'result-thumb pending';
     img.alt = basename(path);
     img.title = t('viewLarge');
-    img.addEventListener('click', () => {
-      if (img.dataset.ready) openLightbox(img.src);
-    });
+    img.addEventListener('click', () => openLightboxPath(path));
     item.appendChild(img);
     thumbQueue.push({ path, img });
     pumpThumbQueue();
@@ -795,9 +934,10 @@ function renderExitBanner(payload) {
     // 覆盖模式：备份保留在 original-watermark-backup/，给一个"后悔药"
     if (payload.overwritten && targetRoot) {
       const restore = document.createElement('button');
-      restore.className = 'btn small';
+      restore.className = 'btn small danger ghost';
       restore.type = 'button';
       restore.textContent = t('restoreOriginal');
+      restore.title = t('restoreHint');
       restore.addEventListener('click', async () => {
         const ok = await confirm(t('restoreConfirm'), { title: t('restoreOriginal'), kind: 'warning' });
         if (!ok) return;
@@ -968,8 +1108,6 @@ async function init() {
       if (!els.btnRun.hidden && !els.btnRun.disabled) els.btnRun.click();
     } else if (id === 'menu-export-log') {
       if (!els.btnExportLog.disabled) els.btnExportLog.click();
-    } else if (id === 'menu-cleanup') {
-      if (!els.btnCleanup.disabled) els.btnCleanup.click();
     }
   });
 
@@ -986,7 +1124,7 @@ async function init() {
     if (btn) els.btnPick.click();
   });
 
-  document.getElementById('lightbox').addEventListener('click', closeLightbox);
+  bindLightbox();
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       closeLightbox();
@@ -1080,7 +1218,6 @@ async function init() {
       const imported = await invoke('import_files', { paths, lang: window.i18n.lang });
       targetRoot = imported.dir;
       els.btnRefresh.disabled = false;
-      els.btnCleanup.disabled = running;
       clearReviews();
       clearMaskSelection();
       logLine(`[${t('importedLog')}] ${paths.length}`);
@@ -1109,7 +1246,6 @@ async function init() {
     targetRoot = picked;
     rememberRoot(picked);
     els.btnRefresh.disabled = false;
-    els.btnCleanup.disabled = running;
     clearReviews();
     clearMaskSelection();
     await refreshFiles();
@@ -1150,7 +1286,6 @@ async function init() {
             targetRoot = dir;
             rememberRoot(dir);
             els.btnRefresh.disabled = false;
-            els.btnCleanup.disabled = running;
             clearReviews();
             clearMaskSelection();
             await refreshFiles();
@@ -1278,21 +1413,6 @@ async function init() {
       logLine(t('logCancelFailed')(String(err)));
     } finally {
       els.btnCancel.disabled = false;
-    }
-  });
-
-  els.btnCleanup.addEventListener('click', async () => {
-    // 覆盖模式下这个动作会删掉 original-watermark-backup/（也就失去"恢复原图"），先确认
-    const ok = await confirm(t('cleanupConfirm'), { title: t('cleanup'), kind: 'warning' });
-    if (!ok) return;
-    els.btnCleanup.disabled = true;
-    try {
-      await invoke('cleanup_pipeline', { lang: window.i18n.lang });
-      logLine(t('logCleanupDone'));
-    } catch (err) {
-      logLine(t('logCleanupFailed')(String(err)));
-    } finally {
-      els.btnCleanup.disabled = running;
     }
   });
 
