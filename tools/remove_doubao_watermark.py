@@ -410,7 +410,12 @@ def inverse_apply(obs_path, mat_path, model='mat'):
             continue
         dc = np.array([float((kf[m] * err[..., c][m]).sum()) / denom for c in range(3)])
         dc = np.clip(dc, -INVERSE_MAX_DC, INVERSE_MAX_DC)
-        corr = inv - kf[..., None] * dc
+        # 墨色校正项 kf·ΔC 在高 α 处可达上百级，`inv − kf·ΔC` 会**越过 0**（甚至 255）。
+        # 必须 clip 回 [0,255]：`inv`(未校正) 在第 400 行已 clip，但校正后的 `corr` 曾漏
+        # clip → 负值在 `out.astype(np.uint8)` 上**回绕**（−2 → 254），生成刺眼的
+        # 蓝/品红"彩点"（6.png 实测 [164,157,152]→[20,10,254]）。这正是逆解长期被诟病的
+        # "彩色伪影"根因（2.png 彩点/4.png 白线同源）。clip 后消失。
+        corr = np.clip(inv - kf[..., None] * dc, 0, 255)
         resid = float(np.abs(cv2.GaussianBlur(corr, (0, 0), INVERSE_CALIB_SIGMA) - mat_low)[m].mean())
         if best is None or resid < best[0]:
             best = (resid, corr, a, float(k))
@@ -744,6 +749,10 @@ CORNER_ROW_ASPECT_MAX = 8.0
 # 7.png 80x60 比 1.33）会被行块模式当"粘连成行的水印"检出（`_text_likeness` 段数判据在
 # 纹理上也会过）。加下限 2.5 把这类"矮胖单块"挡在门外，真水印行（≥4.0）稳过。
 CORNER_ROW_ASPECT_MIN = 2.5
+# 行块模式 x 投影段数**下限**（2026-09，防"已去水印图再误检"）：真水印整行 ≥5 字符，
+# 合并后仍 ≥4 段；而亮沙地/栏杆这类**宽亮带**背景在 248 高阈值下只切出 3 段
+# （6.png 逆解后 386x71 seg=3 被当水印行 → 再检出重跑把成品修坏）。取 4。
+CORNER_ROW_SEG_MIN = 4
 
 
 def _corner_row_boxes(white, H, W, x0, y0, pad):
@@ -773,7 +782,10 @@ def _corner_row_boxes(white, H, W, x0, y0, pad):
         if gx2 < W - 40 or gy2 < H - 40:
             continue
         fill_raw, segments = _text_likeness(white, x, y, x + cw, y + ch)
-        if fill_raw > 0.6 or segments < 3:
+        # 段数下限 4（非 3）：水印整行 ≥5 字符 → 合并后仍 ≥4 段；而**亮沙地/栏杆**
+        # 这类"宽亮带"背景在 248 高阈值下只会切出 3 段（6.png 逆解后 386x71 seg=3
+        # 被当水印行、再检出重跑把成品修坏）。放宽到 3 段会放进背景宽亮带。
+        if fill_raw > 0.6 or segments < CORNER_ROW_SEG_MIN:
             continue
         boxes.append((
             max(0, gx1 - pad), max(0, gy1 - pad), min(W - 6, gx2 + pad), min(H - 6, gy2 + pad)

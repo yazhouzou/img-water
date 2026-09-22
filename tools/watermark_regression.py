@@ -291,6 +291,38 @@ def run_inverse_quality_checks(rdw, only):
     rows.append(({'group': 'inverse-quality', 'name': 'overshoot: darkened glyph', 'expect': 'reject'},
                  over is not None and over < -rdw.INVERSE_OVERSHOOT_MAX,
                  f'overshoot {over:.1f}' if over is not None else 'n/a'))
+
+    # ③ 墨色校正后必须 clip 回 [0,255]：`corr = inv − kf·ΔC`（kf=α/(1−α)）在高 α 处会越过
+    #    0；漏 clip 时负值在 `out.astype(np.uint8)` 上**回绕**（−1→255），生成刺眼彩点
+    #    （6.png 实测 [164,157,152]→[20,10,254]）。构造"深色纹理背景 + 白字水印 + 偏暗 MAT"
+    #    把 ΔC 拉大、局部 corr 转负，锁死"字形核区不得出现比真实背景亮 >100 级"。
+    import cv2
+    scale = min(h, w) / rdw.STAMP_REF_SHORT
+    th = int(round(stamp.shape[0] * scale))
+    tw = int(round(stamp.shape[1] * scale))
+    aa = cv2.resize(stamp, (tw, th), interpolation=cv2.INTER_LINEAR)[..., None]
+    true_bg = (np.random.default_rng(5).random((th, tw, 3)) * 35 + 8).astype(np.float32)
+    obs = np.full((h, w, 3), 30, np.float32)
+    obs[py:py + th, px:px + tw] = true_bg * (1 - aa) + 255.0 * aa
+    mat = np.full((h, w, 3), 20, np.float32)
+    tmp = Path(tempfile.mkdtemp(prefix='wm-invclip-'))
+    try:
+        op, mp = tmp / 'o.png', tmp / 'm.png'
+        Image.fromarray(obs.astype(np.uint8)).save(op)
+        Image.fromarray(mat.astype(np.uint8)).save(mp)
+        res = rdw.inverse_apply(str(op), str(mp))
+        core = stamp > 0.5
+        wrapped = None
+        if res is not None:
+            v = np.array(res[0])[py:py + th, px:px + tw][core].astype(np.float32)
+            wrapped = int((v - true_bg[core] > 180).sum())
+        rows.append(({'group': 'inverse-quality', 'name': 'ink-calib clip: no wrapped bright specks',
+                      'expect': 'ok'},
+                     wrapped == 0,
+                     f'pixels >true_bg+180: {wrapped} (un-clipped wraps {989}; calib residual <=110)'
+                     if wrapped is not None else 'n/a'))
+    finally:
+        rmtree(tmp, ignore_errors=True)
     return rows
 
 
@@ -962,6 +994,20 @@ def run_detect_floor_checks(rdw, only):
     wide_boxes = rdw._corner_row_boxes(wide, H, W, x0, y0, pad)
     rows.append(({'group': 'detect-floor', 'name': 'wide genuine row still detected', 'expect': 'ok'},
                  bool(wide_boxes), f'boxes={len(wide_boxes)}'))
+
+    # ③ 行块 x 投影段数下限（4）：3 段的"宽亮带"（亮沙地/栏杆，6.png 逆解后 386x71 seg=3）
+    #    不得当水印行；真水印行（上例 seg=18）仍检。
+    seg3 = skyline([56, 40, 30], 13, 42)   # cw168 ch60 比2.8 fill0.77 fr0.53 seg3（其余合格）
+    saved_seg = rdw.CORNER_ROW_SEG_MIN
+    try:
+        rdw.CORNER_ROW_SEG_MIN = 3
+        seg_pre = rdw._corner_row_boxes(seg3, H, W, x0, y0, pad)
+    finally:
+        rdw.CORNER_ROW_SEG_MIN = saved_seg
+    seg_post = rdw._corner_row_boxes(seg3, H, W, x0, y0, pad)
+    rows.append(({'group': 'detect-floor', 'name': 'row segment floor rejects 3-seg wide band', 'expect': 'ok'},
+                 bool(seg_pre) and not seg_post,
+                 f'pre_floor_boxes={len(seg_pre)} post_floor_boxes={len(seg_post)}'))
     return rows
 
 
