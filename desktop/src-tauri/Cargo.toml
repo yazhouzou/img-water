@@ -1,6 +1,6 @@
 [package]
 name = "doubao-watermark-remover"
-version = "0.5.5"
+version = "0.5.6"
 description = "Remove Doubao AI watermark from PNG images"
 edition = "2021"
 default-run = "doubao-watermark-remover"
