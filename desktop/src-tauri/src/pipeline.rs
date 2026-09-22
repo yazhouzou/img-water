@@ -27,6 +27,8 @@ const TEMPLATE_ALPHA_THRESHOLD: u8 = 8;
 // mask 膨胀 ±1px，仅补偿缩放/对齐误差（对齐 Python TEMPLATE_STROKE_DILATE）。
 const TEMPLATE_DILATE_W: usize = 3;
 const TEMPLATE_DILATE_H: usize = 3;
+// stamp footprint 二值阈值 8/255 ≈ α>0.03（对齐 Python STAMP_MASK_THRESHOLD）。
+const STAMP_MASK_THRESHOLD: u8 = 8;
 // 顶帽开运算核半径（31x31 椭圆，对齐 Python k=min(31, ...)）。
 const TOPHAT_RADIUS: usize = 15;
 
@@ -128,11 +130,40 @@ pub struct TemplateHit {
     pub py: usize,
 }
 
-/// 模板笔画 mask 匹配：按图片短边比例缩放模板（水印尺寸随短边等比），在右下角
-/// 40px 余量窗口内做**顶帽 gap-score** 匹配（顶帽扣局部背景后笔画区均亮 - 间隙区
-/// 均亮），命中返回 TemplateHit。mask 取连续 α 图 α>0.03 的污染像素 + ±1px（最小
-/// 侵入）；分数不足返回 None 交给整框检测回退。
+/// mask 来源：Alpha=亮字 α（默认，保水印周围真实纹理）；Footprint=含暗描边的完整
+/// stamp footprint（低对比背景防暗字形残影，会圈进高频纹理，仅作结果残留时的升级项）。
+#[derive(Clone, Copy, PartialEq)]
+enum MaskSource {
+    Alpha,
+    Footprint,
+}
+
+/// 模板笔画 mask 匹配（默认亮字 α）：按图片短边比例缩放模板（水印尺寸随短边等比），在
+/// 右下角 40px 余量窗口内做**顶帽 gap-score** 匹配（顶帽扣局部背景后笔画区均亮 - 间隙
+/// 区均亮），命中返回 TemplateHit。mask 取连续 α 图 α>0.03 的污染像素 + ±1px（最小侵入）；
+/// 分数不足返回 None 交给整框检测回退。
 fn template_stroke_mask(image: &DynamicImage) -> Result<Option<TemplateHit>, String> {
+    template_mask(image, MaskSource::Alpha)
+}
+
+/// 含暗描边的完整 stamp footprint mask（对齐 Python `source='footprint'`）。低对比背景
+/// （纸面/木纹）用它防"亮字 mask 盖不住暗描边 → 模型留暗字形残影"；但会圈进水印周围的
+/// 高频纹理（花枝/花瓣）被重绘抹平，故**只在结果确实残留时**由 `footprint_retry` 升级。
+fn template_footprint_mask(image: &DynamicImage) -> Result<Option<TemplateHit>, String> {
+    template_mask(image, MaskSource::Footprint)
+}
+
+/// 载入 stamp 完整 footprint 的连续 α 图（含暗描边/抗锯齿）。
+fn load_stamp_alpha() -> Result<GrayImage, String> {
+    image::load_from_memory_with_format(
+        crate::watermark_profiles::STAMP_ALPHA_PNG,
+        image::ImageFormat::Png,
+    )
+    .map(|d| d.to_luma8())
+    .map_err(|e| e.to_string())
+}
+
+fn template_mask(image: &DynamicImage, source: MaskSource) -> Result<Option<TemplateHit>, String> {
     let (tpl, alpha, meta) = load_template()?;
     let rgb = image.to_rgb8();
     let (iw, ih) = (rgb.width() as usize, rgb.height() as usize);
@@ -219,17 +250,46 @@ fn template_stroke_mask(image: &DynamicImage) -> Result<Option<TemplateHit>, Str
     if score < TEMPLATE_MIN_SCORE {
         return Ok(None);
     }
-    // 连续 α mask（α>0.03 的真实污染像素，含抗锯齿带）+ ±1px 膨胀：只覆盖真正被
-    // 水印污染的像素，不再靠大膨胀补抗锯齿（后者会多盖干净画面被模型重绘）。
-    let a = image::imageops::resize(&alpha, tw, th, FilterType::Triangle);
-    let mut bin = vec![false; (tw as usize) * (th as usize)];
-    for y in 0..th as usize {
-        for x in 0..tw as usize {
-            if a.get_pixel(x as u32, y as u32).0[0] > TEMPLATE_ALPHA_THRESHOLD {
-                bin[y * tw as usize + x] = true;
+    // mask 来源（对齐 Python template_stroke_mask）：
+    //   Alpha —— 亮字 α（α>0.03 的真实污染像素，含抗锯齿带）。只覆盖真正被水印污染的
+    //     像素，不再靠大膨胀补抗锯齿（后者会多盖干净画面被模型重绘）。
+    //   Footprint —— 含暗描边的完整 stamp footprint（α>0.03 + OPEN 清标定噪点）。
+    let (bin, how) = match source {
+        MaskSource::Alpha => {
+            let a = image::imageops::resize(&alpha, tw, th, FilterType::Triangle);
+            let mut bin = vec![false; (tw as usize) * (th as usize)];
+            for y in 0..th as usize {
+                for x in 0..tw as usize {
+                    if a.get_pixel(x as u32, y as u32).0[0] > TEMPLATE_ALPHA_THRESHOLD {
+                        bin[y * tw as usize + x] = true;
+                    }
+                }
             }
+            (bin, "alpha")
         }
-    }
+        MaskSource::Footprint => {
+            let sa = load_stamp_alpha()?;
+            let sa = image::imageops::resize(&sa, tw, th, FilterType::Triangle);
+            let n = (tw as usize) * (th as usize);
+            let mut f = vec![0f64; n];
+            for y in 0..th as usize {
+                for x in 0..tw as usize {
+                    if sa.get_pixel(x as u32, y as u32).0[0] > STAMP_MASK_THRESHOLD {
+                        f[y * tw as usize + x] = 1.0;
+                    }
+                }
+            }
+            // OPEN（椭圆 3x3）清标定噪点，对齐 Python cv2.MORPH_OPEN(MORPH_ELLIPSE,(3,3))
+            let opened = ellipse_morph(
+                &ellipse_morph(&f, tw as usize, th as usize, 1, false),
+                tw as usize,
+                th as usize,
+                1,
+                true,
+            );
+            (opened.iter().map(|&v| v > 0.5).collect(), "stamp footprint")
+        }
+    };
     let dilate_1d = |src: &[bool], w: usize, h: usize, horizontal: bool| -> Vec<bool> {
         let (rx, ry) = if horizontal {
             (TEMPLATE_DILATE_W / 2, 0)
@@ -275,7 +335,7 @@ fn template_stroke_mask(image: &DynamicImage) -> Result<Option<TemplateHit>, Str
             }
         }
     }
-    let info = format!("template alpha mask at ({px},{py}) score {score:.1}");
+    let info = format!("template {how} mask at ({px},{py}) score {score:.1}");
     Ok(Some(TemplateHit { mask, info, score, px, py }))
 }
 
@@ -1872,6 +1932,69 @@ const RETRY_DILATE: (usize, usize) = (5, 5);
 /// 暗字形（过冲）判据与重试膨胀核，对齐 Python `INVERSE_OVERSHOOT_MAX` / `OVERSHOOT_DILATE`。
 const INVERSE_OVERSHOOT_MAX: f64 = 10.0;
 const OVERSHOOT_DILATE: (usize, usize) = (15, 15);
+/// 结果驱动的 footprint 升级阈值（对齐 Python `FOOTPRINT_RETRY_MIN`）：结果模板残留高于
+/// 此值才把亮字 mask 升级为含暗描边的 stamp footprint。
+const FOOTPRINT_RETRY_MIN: f64 = 5.0;
+
+/// 结果驱动的 mask 升级（最多 1 轮，对齐 Python `_footprint_retry`）：默认亮字 mask 保
+/// 水印周围真实纹理（花丛/枝叶不被抹平）；结果仍有明显模板残留（低对比背景的暗描边亮字
+/// mask 盖不住）时，改用含描边的 stamp footprint mask 重跑该图。逆解图跳过。
+pub fn footprint_retry(
+    options: &PipelineOptions,
+    names: &[String],
+    model_path: &Path,
+    log: Logger,
+) -> Result<(), String> {
+    let (source, masks, _, _) = work_dirs();
+    let mut candidates: Vec<(String, f64)> = Vec::new();
+    for name in names {
+        if masks.join(format!("{}.inv", name)).exists()
+            || !masks.join(format!("{}.tpl", name)).exists()
+        {
+            continue;
+        }
+        let score = verify_repaired(name, &options.root)
+            .map(|r| r.res_score)
+            .unwrap_or(0.0);
+        if score > FOOTPRINT_RETRY_MIN {
+            candidates.push((name.clone(), score));
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let mut upgraded: Vec<String> = Vec::new();
+    for (name, score) in &candidates {
+        let src = open_any(&source.join(name))?;
+        match template_footprint_mask(&src)? {
+            Some(hit) => {
+                save_png(DynamicImage::ImageLuma8(hit.mask), &masks.join(name))?;
+                log(&format!(
+                    "{}: residual {:.1} > {:.0} — upgrade to stamp footprint mask and retry",
+                    name, score, FOOTPRINT_RETRY_MIN
+                ));
+                upgraded.push(name.clone());
+            }
+            None => log(&format!(
+                "{}: residual {:.1} but stamp footprint unavailable, keep alpha mask",
+                name, score
+            )),
+        }
+    }
+    if upgraded.is_empty() {
+        return Ok(());
+    }
+    inpaint_subset(model_path, &upgraded, options.inverse, log)?;
+    for name in &upgraded {
+        if let Some(report) = verify_repaired(name, &options.root) {
+            log(&format!(
+                "{}: after footprint retry tmpl {:.1}",
+                name, report.res_score
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// 结果图的暗字形（过冲）指标：用 SOURCE（本轮未改动原图）定位水印——结果图已无水印，
 /// 模板定位会失败——再量当前修复结果在 stamp 笔画区相对间隙区的低频亮度差（负值=笔画
@@ -2503,6 +2626,8 @@ pub fn run(
     let source_review = review_dir.join("source-corner-review.png");
     inpaint(model_path, options.inverse, log, progress, is_cancelled)?;
     if options.retry && !is_cancelled() {
+        // 结果驱动升级：亮字 mask 残留明显时先升级到含描边的 footprint（对齐 Python）。
+        footprint_retry(options, &names, model_path, log)?;
         // 暗字形（过冲）优先重试：mask 不足导致生成式结果保留水印暗边，先扩 mask 重画。
         overshoot_retry(options, &names, model_path, log)?;
         residual_retry(options, &names, model_path, log)?;
@@ -2695,6 +2820,60 @@ mod tests {
     fn template_stroke_mask_misses_clean_image() {
         let img = RgbImage::from_pixel(1600, 900, Rgb([240, 240, 233]));
         assert!(template_stroke_mask(&DynamicImage::ImageRgb8(img)).unwrap().is_none());
+    }
+
+    #[test]
+    fn template_footprint_mask_covers_dark_outline() {
+        // 结果驱动升级路径：默认亮字 α mask 只盖笔画核心，含暗描边的 stamp footprint 应
+        // 额外覆盖描边区（低对比背景靠它防暗字形残影）。
+        let (tpl, alpha, _meta) = load_template().unwrap();
+        let (w, h) = (1728u32, 2304u32);
+        let scale = 1728.0 / 1600.0;
+        let tw = (tpl.width() as f64 * scale) as u32;
+        let th = (tpl.height() as f64 * scale) as u32;
+        let t = image::imageops::resize(&tpl, tw, th, FilterType::Nearest);
+        let mut img = RgbImage::from_pixel(w, h, Rgb([100, 105, 110]));
+        let px = (w - t.width()) as i32;
+        let py = (h - t.height()) as i32;
+        for ty in 0..t.height() {
+            for tx in 0..t.width() {
+                if t.get_pixel(tx, ty).0[0] > 127 {
+                    let p = img.get_pixel((px + tx as i32) as u32, (py + ty as i32) as u32);
+                    let blend = |c: u8| -> u8 { (c as f64 * 0.4 + 255.0 * 0.6) as u8 };
+                    img.put_pixel(
+                        (px + tx as i32) as u32,
+                        (py + ty as i32) as u32,
+                        Rgb([blend(p.0[0]), blend(p.0[1]), blend(p.0[2])]),
+                    );
+                }
+            }
+        }
+        let dimg = DynamicImage::ImageRgb8(img);
+        let a = template_stroke_mask(&dimg).unwrap().expect("alpha hit");
+        let f = template_footprint_mask(&dimg).unwrap().expect("footprint hit");
+        let a_n = a.mask.pixels().filter(|p| p.0[0] > 0).count();
+        let f_n = f.mask.pixels().filter(|p| p.0[0] > 0).count();
+        assert!(f_n > a_n, "footprint must cover more than alpha ({f_n} vs {a_n})");
+        assert!(f.info.contains("footprint"), "info: {}", f.info);
+        // 描边区 = stamp α 有、亮字 α 没有的像素；footprint 应覆盖其大部分。
+        let stamp_r = image::imageops::resize(&load_stamp_alpha().unwrap(), tw, th, FilterType::Triangle);
+        let alpha_r = image::imageops::resize(&alpha, tw, th, FilterType::Triangle);
+        let (mut outline, mut covered) = (0usize, 0usize);
+        for y in 0..th {
+            for x in 0..tw {
+                let s = stamp_r.get_pixel(x, y).0[0];
+                let av = alpha_r.get_pixel(x, y).0[0];
+                if s > STAMP_MASK_THRESHOLD && av <= TEMPLATE_ALPHA_THRESHOLD {
+                    outline += 1;
+                    if f.mask.get_pixel((px + x as i32) as u32, (py + y as i32) as u32).0[0] > 0 {
+                        covered += 1;
+                    }
+                }
+            }
+        }
+        assert!(outline > 500, "outline region too small: {outline}");
+        let cov = covered as f64 / outline as f64;
+        assert!(cov >= 0.75, "footprint should cover outline ({:.1}% of {outline}px)", cov * 100.0);
     }
 
     #[test]
@@ -2948,6 +3127,64 @@ mod tests {
             }
         }
         assert!(fails.is_empty(), "refine parity failures: {fails:?}");
+    }
+
+    /// 与 Python `template_stroke_mask(source='footprint')` 的逐像素一致性。先用
+    /// `python tools/footprint_parity_dump.py` 生成 /tmp/footprint-parity
+    /// （`FOOTPRINT_PARITY_DIR` 可覆盖），产物缺失时自动跳过。
+    #[test]
+    #[ignore]
+    fn template_footprint_mask_matches_python() {
+        let dir = match std::env::var("FOOTPRINT_PARITY_DIR") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => PathBuf::from("/tmp/footprint-parity"),
+        };
+        let manifest = match fs::read_to_string(dir.join("manifest.json")) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let cases: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+        let mut fails: Vec<String> = Vec::new();
+        for case in cases.as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let image = load_image(&PathBuf::from("../../dist").join(name)).unwrap();
+            let got = template_footprint_mask(&image).unwrap();
+            if let Some(hit) = &got {
+                let _ = hit.mask.save(dir.join(format!("rust-{name}.png")));
+            }
+            let expected_path = case.get("mask").and_then(|v| v.as_str());
+            match (got, expected_path) {
+                (None, None) => {}
+                (None, Some(p)) => fails.push(format!("{name}: rust None, python {p}")),
+                (Some(_), None) => fails.push(format!("{name}: rust Some, python None")),
+                (Some(hit), Some(p)) => {
+                    let exp = image::open(p).unwrap().to_luma8();
+                    assert_eq!(hit.mask.dimensions(), exp.dimensions(), "{name}: size mismatch");
+                    let (mut inter, mut union) = (0f64, 0f64);
+                    for (a, b) in hit.mask.pixels().zip(exp.pixels()) {
+                        let (a, b) = (a.0[0] > 0, b.0[0] > 0);
+                        if a || b {
+                            union += 1.0;
+                        }
+                        if a && b {
+                            inter += 1.0;
+                        }
+                    }
+                    let iou = if union == 0.0 { 1.0 } else { inter / union };
+                    // 非缩放图（模板按短边 1:1）要求逐像素一致；缩放图因 `image` crate 的
+                    // Triangle 与 cv2 INTER_LINEAR 重采样差异（边界带 ~2%，亮字 alpha 通路
+                    // 同样存在）放宽到 0.93——仍能挡住"来源/OPEN/膨胀"这类真回归。
+                    let ref_short = load_template().unwrap().2.ref_short_side;
+                    let short = image.width().min(image.height()) as f64;
+                    let min_iou = if (short / ref_short - 1.0).abs() > 1e-6 { 0.93 } else { 0.995 };
+                    println!("{name}: IOU {iou:.4} (min {min_iou})");
+                    if iou < min_iou {
+                        fails.push(format!("{name}: IOU {iou:.4} < {min_iou}"));
+                    }
+                }
+            }
+        }
+        assert!(fails.is_empty(), "footprint parity failures: {fails:?}");
     }
 
     #[test]

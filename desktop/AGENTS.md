@@ -67,11 +67,12 @@ Python（终端）与 Rust 口径**除修复模型外已对齐**：
 
 | 能力 | Python | Rust/App |
 |---|---|---|
-| 模板笔画 mask（连续 α>0.03 + 1px 膨胀） | ✓ | ✓ |
+| 模板笔画 mask（**默认亮字 α** 连续 α>0.03 + 1px 膨胀） | ✓ | ✓ |
 | 顶帽 gap-score + 阈值 20 | ✓ | ✓ |
 | 结果级验证（mask 外零改动，FAIL 拒绝落盘） | ✓ | ✓（`--force` 强制） |
 | 豆包 stamp 逆解（**默认关**，`--inverse` 开；App「逆解还原真实纹理」勾选） | ✓ | ✓ |
 | 水印档案库逆解（**随 `--inverse`**，默认关；档案仍作精确 mask） | ✓ | ✓ |
+| 结果驱动 footprint 升级（残留 >5 时，1 轮，默认开） | ✓ | ✓ |
 | 过冲（暗字形）自动重试（1 轮，默认开） | ✓ | ✓ |
 | 残留自动重试（1 轮，默认开，逆解图跳过） | ✓ | ✓（`--no-retry` 关） |
 | 框选/检测框内笔画精分割（`--refine`，实验性） | ✓ | ✓（`--refine`；App 默认勾选；残留自动退化整框，见下） |
@@ -92,6 +93,8 @@ Python（终端）与 Rust 口径**除修复模型外已对齐**：
 - **与 Python 的有意分歧**：Python 的精分割也写 `.tpl`（会在非豆包图误报残留）；Rust 已改为只写 `.refinebox`。故"双端同步"此格仅指能力对齐，不是逐字节行为一致。精分割本身逐像素一致：`python tools/refine_parity_dump.py` + `cargo test --lib -- --ignored refine_box_mask_matches_python`（IoU=1.0000）。
 
 **"App 影响周边元素"根因（v0.5.5 已修）**：旧 Rust 模板 mask 用「二值核(α>0.5) + 19x11 膨胀」（19/11 本是 Python `REFINE_DILATE_LAMA` 给退化框精分割用的），靠大膨胀补抗锯齿 → 比 Python 的「连续 α>0.03 + 1px」多盖约 38% 干净画面被模型重绘；且无顶帽 + 阈值 40 使亮背景（纸面/花墙/雪/沙滩）分数跌破阈值 → 回退整框 mask（面积再涨 3~5 倍）。修复后 Rust mask 与 Python **逐像素一致**（实测 IoU=1.0000，dist/1、3、6）。
+
+**模板 mask 默认亮字 α + 结果驱动 footprint 升级（v0.5.6）**：`6e0823a` 曾把两端默认一刀切换成"含暗描边的完整 footprint"（防低对比背景暗字形残影），但 footprint 会圈进水印周围高频纹理 → 6.png 花枝被重绘抹平（Python 10172→14685px）。现改为**默认亮字 α**（只盖笔画、保纹理，两端一致），仅当结果模板残留 >`FOOTPRINT_RETRY_MIN`(5) 时升级 footprint 重跑（Python `_footprint_retry`、Rust `footprint_retry`，先于过冲/残留重试，逆解图跳过）。footprint mask 逐像素一致：`python tools/footprint_parity_dump.py` + `cargo test --lib -- --ignored template_footprint_mask_matches_python`（非缩放图 IoU=1.0000；缩放图 ~0.95，源于 `image` crate Triangle 与 cv2 INTER_LINEAR 重采样差异，亮字 α 通路同样存在）。Python footprint 用 `doubao-wm-stamp-alpha.png`（8-bit，与 Rust 同源）而非 npz float32——后者逐像素差 ~0.002，在 α≈0.031 阈值处翻边界像素使两端 mask 对不齐（IoU 0.978）。
 
 **验证基线（v0.5.5）**：dist/1、3、6 双端 `mask 10172px`、`outside changed 0`；6.png 双端 stamp 逆解同取 `gain 1.05`（水印区 MAD 0.46、P95=2，此前 1.85/P95=16）；1、3.png 双端均按门控跳过逆解。`cargo test --lib` 19+4 passed；`compare_pipelines.py` 5/5 PASS。
 

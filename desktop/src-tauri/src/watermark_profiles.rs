@@ -95,7 +95,7 @@ const EMBEDDED: &[(&str, &[u8], &[u8], &str)] = &[(
 /// `tools/doubao-wm-stamp.npz` 导出（4 张同款水印不同背景联立标定）。
 /// **只用于模板命中后的逐像素解析逆解**，不进入 `EMBEDDED`/`match_image`：
 /// 豆包的定位仍走 gap-score 模板（`pipeline::template_stroke_mask`）。
-const STAMP_ALPHA_PNG: &[u8] = include_bytes!("../../../tools/doubao-wm-stamp-alpha.png");
+pub(crate) const STAMP_ALPHA_PNG: &[u8] = include_bytes!("../../../tools/doubao-wm-stamp-alpha.png");
 const STAMP_COLOR_PNG: &[u8] = include_bytes!("../../../tools/doubao-wm-stamp-color.png");
 const STAMP_META_JSON: &str = r#"{"id":"doubao-stamp","label":"doubao","ref_short_side":1600.0,"source":"tools/doubao-wm-stamp.npz","extra":{}}"#;
 

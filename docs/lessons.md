@@ -113,3 +113,12 @@
 - **实现**：`_sd_inpaint`（自裁 ≤512 方块 → diffusers `StableDiffusionInpaintPipeline` + **LCM-LoRA 6 步**（`latent-consistency/lcm-lora-sdv1-5`，4–8 步≈25 步质量）→ 只贴 mask 像素）。路由用 `_ring_hf`（**水印周边环带**高频能量，必须**排除字形框本身**——否则字形边缘也是高频、所有图都误判"有纹理"）。SD 图写 `.sd` 侧车、跳过逆解与两轮重试。
 - **速度/环境坑**：① iopaint 在 MPS 上强制 **fp32**（`get_torch_dtype`：fp16+attention_slicing 会黑图），比 fp16 慢一倍——故 SD 走**自建 diffusers 管线**用 fp16（实测不黑）；② 8GB M1 上 LCM 6 步单图 2–6min 且受**内存压力**影响抖动大；③ 直连 `huggingface.co` 常被墙（TCP 握手被透明代理放行、**TLS 才失败**）→ `_hf_reachable` 必须发 **HTTPS 请求**判定，且 `HF_ENDPOINT` 要在 **import `huggingface_hub` 之前**设置（其 `ENDPOINT` 常量 import 时读取），否则 `load_lora_weights` 的 `model_info` 仍打 huggingface.co 超时。
 - **回归**：`run_sd_checks`（打桩 `_sd_pipe`/`_sd_generator`，CI 无 torch 也能跑）：① `_ring_hf` 排除字形框；② 只路由高纹理、只贴 mask、平滑图跳过。
+
+## 16. 模板 mask 来源：默认亮字 α，结果残留才升级 footprint（v0.5.6）
+- **背景**：`6e0823a` 为治低对比背景（木纹/纸面）的**暗字形残影**，把两端模板 mask 默认从"亮字 α"一刀切换成"含暗描边的完整 footprint"（Python 10172→14685px）。**代价**：footprint 把水印周围的高频纹理（花枝/花瓣）圈进 mask，生成式重绘把它们**抹平**——6.png 花枝被抹掉（Python/Rust 一致复现）。根因：水印压在花枝上时，暗描边与花枝在空间上重叠，扩大 mask 必然多盖真实纹理。
+- **两难**：亮字 α mask 保纹理，但低对比背景盖不住暗描边 → 留残影；footprint 去描边，但抹平高频纹理。**没有单一 mask 两全**。
+- **解法＝结果驱动**：默认亮字 α（保纹理、与 App 一致）；`_footprint_retry`/`footprint_retry` 量结果模板残留，> `FOOTPRINT_RETRY_MIN`(5) 才升级 footprint 重跑该图。花丛（6.png 残留 2.3）不升级→保枝；纸面（4.png MAT 残留 6.8）升级→去描边。
+- **footprint mask 必须两端同源**：Python 原用 `doubao-wm-stamp.npz` 的 float32 α，Rust 用导出的 8-bit `doubao-wm-stamp-alpha.png`。两者逐像素差 ~0.002，在 α≈0.031 阈值处翻边界像素 → mask 对不齐（实测 IoU 0.978、1.png bbox 底边差 5px）。改 Python footprint 分支用 PNG（`_load_stamp_alpha_png`）后非缩放图 IoU=**1.0000**。逆解/残影评分仍用 npz（float 更精）。
+- **缩放图仍非逐像素**（4.png 1728×2304 IoU 0.948）：`image` crate 的 Triangle 与 cv2 `INTER_LINEAR` 重采样在边界带差 ~2%（**亮字 α 通路同样存在**，实测 0.9607），是**既有**限制、非本次引入。别为它改 resize（牵连全链路）。
+- **残留分与模型绑定**：Rust/LaMa 对 4.png 亮字 α 结果残留 **0.0**（LaMa 平滑掉字形结构），Python/MAT 是 **6.8**（MAT 保留结构）→ 同一阈值两端触发时机不同，属正常（模型本质不同）。footprint 升级是兜底，触发即生效（强制测试：Rust 4.png mask 12327→16977px）。
+- **回归**：Python `default mask is alpha (keeps texture)` + `footprint mask covers dark outline` + `result-driven upgrade wired`；Rust `template_footprint_mask_covers_dark_outline` + `template_footprint_mask_matches_python`（`tools/footprint_parity_dump.py`，非缩放 0.995/缩放 0.93）。

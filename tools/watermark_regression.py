@@ -518,12 +518,13 @@ def run_stamp_checks(rdw, only):
                                          + (1 - a0[..., None]) * mid[py:py + th, px:px + tw])
         synth_path = tmp / 'synth.png'
         Image.fromarray(np.clip(synth, 0, 255).astype(np.uint8)).save(synth_path)
-        # 1) mask 必须覆盖完整 footprint（含暗描边），不能只盖亮字核心：只盖亮字的 mask
-        # 会在低对比背景 MAT 重绘后留暗字形残影，而 gap-score 判据测不到暗描边会误判
-        # PASS。这条锁死"mask 来源必须是含描边的 stamp footprint"（用合成图，免 dist）。
+        # 1) mask 来源（结果驱动，2026-09）：默认用**亮字 α**（只盖笔画、保水印周围真实
+        # 纹理、对齐 App）；只有结果确实残留（低对比背景暗描边）时才由 _footprint_retry
+        # 升级到含描边的 stamp footprint。分别锁死两条，防止再次"一刀切大 mask"抹平花枝：
+        #   a) 默认 mask 不覆盖描边（≈0）——保证花丛/枝叶类不会被大 mask 重绘抹平；
+        #   b) footprint mask 覆盖描边 ≥0.75——升级路径的能力仍在（纸面/木纹可救）。
         gray = np.array(Image.open(synth_path)).max(2).astype(np.float32)
-        mask_arr, _score, _info = rdw.template_stroke_mask(gray, w, h)
-        if mask_arr is not None and alpha is not None:
+        if alpha is not None:
             scale = min(h, w) / meta['ref_short_side']
             thm = int(round(stamp_a.shape[0] * scale))
             twm = int(round(stamp_a.shape[1] * scale))
@@ -532,14 +533,27 @@ def run_stamp_checks(rdw, only):
             # 描边区 = stamp footprint 有、模板亮字 α 没有的像素
             outline = ((sa * 255.0 > rdw.STAMP_MASK_THRESHOLD)
                        & (ta * 255.0 <= rdw.TEMPLATE_ALPHA_THRESHOLD))
-            sub = mask_arr[py:py + thm, px:px + twm] > 0
-            cov = float(sub[outline].mean()) if outline.any() else 1.0
-            # 阈值 0.75：mask 与测试用的 stamp 缩放路径一致，但 OPEN 会削掉描边最外缘，
-            # 实测 88~93%；退回"仅亮字"时覆盖骤降到 ~41%，0.75 有足够判别裕度。
-            rows.append(({'group': 'footprint', 'name': 'mask covers dark outline',
+            mask_a, _sa_, info_a = rdw.template_stroke_mask(gray, w, h)
+            sub_a = mask_a[py:py + thm, px:px + twm] > 0 if mask_a is not None else None
+            cov_a = float(sub_a[outline].mean()) if (sub_a is not None and outline.any()) else 0.0
+            # 亮字 α mask 经 (3,3) 膨胀只探入描边外缘，实测覆盖 ~40%；footprint ~89%。
+            # 阈值 0.6：既确认"默认不是大 mask"（与 footprint 明显分离），又容忍膨胀外溢。
+            rows.append(({'group': 'footprint', 'name': 'default mask is alpha (keeps texture)',
                           'expect': 'ok'},
-                         bool(outline.any()) and cov >= 0.75,
-                         f'outline {int(outline.sum())}px covered {cov * 100:.1f}%'))
+                         mask_a is not None and 'alpha' in info_a and cov_a <= 0.6,
+                         f'outline {int(outline.sum())}px covered {cov_a * 100:.1f}% ({info_a})'))
+            mask_f, _sf_, info_f = rdw.template_stroke_mask(gray, w, h, source='footprint')
+            sub_f = mask_f[py:py + thm, px:px + twm] > 0 if mask_f is not None else None
+            cov_f = float(sub_f[outline].mean()) if (sub_f is not None and outline.any()) else 1.0
+            rows.append(({'group': 'footprint', 'name': 'footprint mask covers dark outline',
+                          'expect': 'ok'},
+                         mask_f is not None and 'footprint' in info_f and cov_f >= 0.75,
+                         f'outline {int(outline.sum())}px covered {cov_f * 100:.1f}% ({info_f})'))
+        rows.append(({'group': 'footprint', 'name': 'result-driven upgrade wired',
+                      'expect': 'ok'},
+                     callable(getattr(rdw, '_footprint_retry', None))
+                     and float(getattr(rdw, 'FOOTPRINT_RETRY_MIN', 0)) > 0,
+                     f'FOOTPRINT_RETRY_MIN={getattr(rdw, "FOOTPRINT_RETRY_MIN", None)}'))
         # 2) 配置守卫：不得退回"纹理门槛"硬预判逆解，择优须可用。
         rows.append(({'group': 'verify', 'name': 'inverse tries all (no hf gate)',
                       'expect': 'ok'},

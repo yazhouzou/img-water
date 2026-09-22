@@ -101,6 +101,10 @@ REFINE_DILATE_LAMA = (19, 11)
 # 而是**统一尝试逆解 + 结果择优**：gating 只保留极端尺度上限与失解（ghost）回退，是否
 # 采用交由结果层指标决定（见 INVERSE_RESIDUAL_TOLERANCE）。
 STAMP_ASSET = Path(__file__).resolve().parent / 'doubao-wm-stamp.npz'
+# stamp 连续 α 的 8-bit 导出（`doubao-wm-stamp.npz` 量化而来）。footprint mask 用它与
+# Rust/App 同源——npz 是 float32，逐像素与 8-bit 导出差 ~0.002，在 α≈0.031 阈值处会翻
+# 边界像素、两端 mask 对不齐（实测 IoU 0.978）。逆解/残影评分仍用 npz 的 α（float 更精）。
+STAMP_ALPHA_PNG = Path(__file__).resolve().parent / 'doubao-wm-stamp-alpha.png'
 STAMP_REF_SHORT = 1600.0
 INVERSE_SCALE_TOL = 0.15
 INVERSE_TEXTURE_MIN = 0.0  # 不再作硬门槛（保留计算供日志）；由结果择优决定采用
@@ -219,11 +223,17 @@ def _template_response(gray, width, height, with_tophat=False):
     return combined, th_t, tw_t
 
 
-def template_stroke_mask(gray, width, height, model='mat'):
+def template_stroke_mask(gray, width, height, model='mat', source='alpha'):
     """在右下角窗口内用模板做 gap-score 匹配（0/1 模板核取 S_in、全 1 核取窗口和，
     gap = S_in/N_in − S_out/N_out），返回 (mask_uint8, score, info)。
-    模板按图片短边比例缩放（豆包水印随短边等比）。mask 优先用连续 α 图
-    （α>0.03 的污染像素 + 1px 缓冲，最小侵入）；α 资产缺失时回退二值模板膨胀。
+    模板按图片短边比例缩放（豆包水印随短边等比）。
+
+    source 决定 mask 来源：
+      'alpha'（默认）——亮字 α（doubao-wm-alpha.png，α>0.03 + 1px 缓冲）。只盖文字
+        笔画、最小侵入，保住水印周围真实纹理（与 Rust/App 一致）。
+      'footprint'——含暗描边的完整 stamp footprint。低对比背景（纸面/木纹）用它防
+        "亮字 mask 盖不住暗描边 → MAT 留暗字形残影"；但它会圈进水印周围的高频纹理
+        （花枝/花瓣），重绘时被抹平，故**只在结果确实残留时**由 _footprint_retry 升级。
     分数低于阈值返回 (None, score, info) 交给整框检测回退。"""
     try:
         import cv2
@@ -253,16 +263,18 @@ def template_stroke_mask(gray, width, height, model='mat'):
         # 一律按"未命中"处理——避免把已去水印的强纹理图再检出、重跑把成品修坏。
         return None, tophat_score, (f'template tophat {tophat_score:.1f} < {TEMPLATE_TOPHAT_MIN}'
                                     f' (raw score {score:.1f}) — texture false positive, skipped')
-    stamp_a, _ = _load_stamp()
-    if stamp_a is not None:
-        # stamp 完整 footprint（含暗色描边）：只盖亮字的 mask 会在低对比背景留暗字形
-        sa = cv2.resize(stamp_a, (tw_t, th_t), interpolation=cv2.INTER_LINEAR)
+    fp_a = _load_stamp_alpha_png() if source == 'footprint' else None
+    if fp_a is not None:
+        # 含暗描边的完整 footprint（8-bit α 与 Rust/App 同源）：低对比背景用它防残影；
+        # 会圈进高频纹理，故仅作升级项
+        sa = cv2.resize(fp_a, (tw_t, th_t), interpolation=cv2.INTER_LINEAR)
         core = (sa * 255.0 > STAMP_MASK_THRESHOLD).astype(np.uint8)
         core = cv2.morphologyEx(
             core, cv2.MORPH_OPEN,
             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, STAMP_MASK_OPEN))
         how = 'stamp footprint'
     elif alpha is not None:
+        # 默认：亮字 α（与 Rust/App 一致）——只盖笔画、保水印周围真实纹理
         a = cv2.resize(alpha, (tw_t, th_t), interpolation=cv2.INTER_LINEAR)
         core = (a * 255.0 > TEMPLATE_ALPHA_THRESHOLD).astype(np.uint8)
         how = 'alpha'
@@ -454,6 +466,16 @@ def inverse_apply(obs_path, mat_path, model='mat'):
     sub[m] = den[py:py + th, px:px + tw][m]
     out[py:py + th, px:px + tw] = sub
     return out.astype(np.uint8), (px, py, hf, gain, resid)
+
+
+def _load_stamp_alpha_png():
+    """stamp 连续 α 的 8-bit 导出（与 Rust/App 同源），供 footprint mask 逐像素对齐。"""
+    import numpy as np
+    from PIL import Image
+
+    if not STAMP_ALPHA_PNG.exists():
+        return None
+    return np.array(Image.open(STAMP_ALPHA_PNG).convert('L')).astype(np.float32) / 255.0
 
 
 def _load_stamp():
@@ -1757,6 +1779,61 @@ def _overshoot_retry(names, model, skip=()):
             print(f'{name}: after overshoot retry foot-gap {ov:.1f}')
 
 
+# 结果驱动 mask 升级阈值：亮字 mask 修复后模板残留分 > 此值，说明低对比背景留下了
+# 暗描边残影，改用含描边的 footprint 重跑。实测 4.png（纸面）7.0 触发、6.png（花丛）2.5
+# 不触发——正好把"该升级的"与"保纹理的"分开。
+FOOTPRINT_RETRY_MIN = 5.0
+
+
+def _write_footprint_mask(name):
+    """用 stamp footprint（含暗描边）重写该图 mask，供低对比残影图升级重跑。
+    返回 True 表示确实写入了 footprint mask（stamp 资产缺失时保持原 mask）。"""
+    import numpy as np
+
+    with Image.open(SOURCE / name) as im:
+        rgb = im.convert('RGB')
+        w, h = rgb.size
+        gray = np.array(rgb).max(axis=2).astype(np.float32)
+    mask, _score, info = template_stroke_mask(gray, w, h, source='footprint')
+    if mask is None or 'footprint' not in info:
+        return False
+    Image.fromarray(mask).save(MASKS / name)
+    return True
+
+
+def _footprint_retry(names, model, skip=()):
+    """**结果驱动**的 mask 升级（最多 1 轮）：默认用亮字 mask（保水印周围纹理、对齐
+    App）；若结果仍有明显模板残留（低对比背景的暗描边），改用含描边的 stamp footprint
+    mask 重跑该图。这样"花丛保纹理"与"纸面去描边"两全，避免一刀切大 mask 把花枝抹平。"""
+    skip = set(skip)
+    candidates = []
+    for name in names:
+        if name in skip or not (MASKS / f'{name}.tpl').exists():
+            continue
+        _res, report = _residual_state(name)
+        score = report.get('res_template_score') if report else None
+        if score is not None and float(score) > FOOTPRINT_RETRY_MIN:
+            candidates.append((name, float(score)))
+    if not candidates:
+        return
+    upgraded = []
+    for name, score in candidates:
+        if _write_footprint_mask(name):
+            upgraded.append(name)
+            print(f'{name}: residual {score:.1f} > {FOOTPRINT_RETRY_MIN} — '
+                  f'upgrade to stamp footprint mask and retry')
+        else:
+            print(f'{name}: residual {score:.1f} but stamp footprint unavailable, keep alpha mask')
+    if not upgraded:
+        return
+    _retry_inpaint(upgraded, model)
+    for name in upgraded:
+        _res, report = _residual_state(name)
+        score = report.get('res_template_score') if report else None
+        if score is not None:
+            print(f'{name}: after footprint retry tmpl {score:.1f}')
+
+
 def inpaint(model='mat', inverse=False, retry=True, use_profile=True, sd=False,
             sd_threshold=SD_TEXTURE_MIN):
     if not IOPAINT.exists():
@@ -1873,6 +1950,10 @@ def inpaint(model='mat', inverse=False, retry=True, use_profile=True, sd=False,
             applied.append(f'{name} ({detail})')
         if applied:
             print('profile inverse applied: ' + '; '.join(applied))
+    if retry:
+        # 结果驱动 mask 升级：亮字 mask 仍残留（低对比背景暗描边）→ 换含描边的
+        # footprint 重跑；保纹理的图（花丛）残留低、不升级，避免抹平花枝。
+        _footprint_retry(active_names, model, skip=inverse_done | sd_done)
     if retry:
         # 暗字形（过冲）优先重试：mask 不足导致 MAT 保留水的暗边，先扩 mask 重画。
         _overshoot_retry(active_names, model, skip=inverse_done | sd_done)
