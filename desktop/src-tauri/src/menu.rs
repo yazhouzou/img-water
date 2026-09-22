@@ -25,6 +25,16 @@ const FORWARDED: &[&str] = &[ID_PICK, ID_START, ID_EXPORT_LOG, ID_CLEANUP];
 const GUIDE_URL: &str = "https://github.com/yazhouzou/img-water#readme";
 const ISSUE_URL: &str = "https://github.com/yazhouzou/img-water/issues/new";
 
+/// 加速键字符串（集中定义 + 单测兜底）。
+///
+/// **坑**：键名必须用 muda 认识的 token（它把 token `to_uppercase()` 后查表，表里是
+/// `ENTER` 而**没有** `Return`）。写错不会报错——tauri 侧是 `s.parse().ok()`，解析失败
+/// 会**静默变成"这个菜单项没有快捷键"**：菜单照常出现、点着能用，但按键毫无反应
+/// （实测 `CmdOrCtrl+Return` 就是这么废掉的）。故用 `ENTER`，并由
+/// `accelerator_strings_use_known_modifiers_and_keys` 拦住同类拼写错误。
+pub const ACCEL_PICK: &str = "CmdOrCtrl+O";
+pub const ACCEL_START: &str = "CmdOrCtrl+ENTER";
+
 fn t(lang: &str, zh: &str, en: &str) -> String {
     crate::i18n::tr(lang, zh, en)
 }
@@ -53,12 +63,12 @@ pub fn build<R: Runtime>(app: &AppHandle<R>, lang: &str) -> tauri::Result<Menu<R
     let file_menu = SubmenuBuilder::new(app, t(lang, "文件", "File"))
         .item(
             &MenuItemBuilder::with_id(ID_PICK, t(lang, "选择文件夹…", "Open Folder…"))
-                .accelerator("CmdOrCtrl+O")
+                .accelerator(ACCEL_PICK)
                 .build(app)?,
         )
         .item(
             &MenuItemBuilder::with_id(ID_START, t(lang, "开始处理", "Start Processing"))
-                .accelerator("CmdOrCtrl+Return")
+                .accelerator(ACCEL_START)
                 .build(app)?,
         )
         .separator()
@@ -163,16 +173,37 @@ mod tests {
         assert_eq!(ids.len(), FORWARDED.len(), "菜单 id 不可重复");
     }
 
-    /// 加速键只用受支持修饰符拼写（拼错会在运行时让菜单创建失败）。
+    /// 加速键必须由 muda 认识的"修饰符 + 键名"token 组成。写错**不会报错**：tauri 侧
+    /// `s.parse().ok()` 会把解析失败静默变成"没有快捷键"（菜单在、按键无反应，实测
+    /// `CmdOrCtrl+Return` 即此坑——muda 表里是 `ENTER`，没有 `Return`）。
     #[test]
-    fn accelerator_strings_use_known_modifiers() {
-        const MODS: &[&str] = &["CmdOrCtrl", "Cmd", "Command", "Ctrl", "Control", "Alt", "Option", "Shift", "Super"];
-        for accel in ["CmdOrCtrl+O", "CmdOrCtrl+Return"] {
+    fn accelerator_strings_use_known_modifiers_and_keys() {
+        // muda `parse_modifier` 接受的修饰符（比较前一律大写）
+        const MODS: &[&str] = &[
+            "CMDORCTRL", "CMDORCONTROL", "COMMANDORCTRL", "COMMANDORCONTROL",
+            "CMD", "COMMAND", "CTRL", "CONTROL", "ALT", "OPTION", "SHIFT", "SUPER",
+        ];
+        // muda `parse_code` 的键名 token（常用子集，比较前一律大写）
+        const KEYS: &[&str] = &[
+            "ENTER", "SPACE", "TAB", "BACKSPACE", "DELETE", "ESCAPE", "CAPSLOCK",
+            "HOME", "END", "PAGEUP", "PAGEDOWN", "INSERT", "PRINTSCREEN",
+            "UP", "DOWN", "LEFT", "RIGHT", "ARROWUP", "ARROWDOWN", "ARROWLEFT", "ARROWRIGHT",
+        ];
+        for accel in [ACCEL_PICK, ACCEL_START] {
             let (mods, key) = accel.rsplit_once('+').expect("加速键需含 '+'");
             assert!(!key.is_empty(), "{} 缺少主键", accel);
             for m in mods.split('+') {
-                assert!(MODS.contains(&m), "未知修饰符 {}（在 {}）", m, accel);
+                assert!(
+                    MODS.contains(&m.to_uppercase().as_str()),
+                    "未知修饰符 {}（在 {}）",
+                    m,
+                    accel
+                );
             }
+            let up = key.to_uppercase();
+            // 单字符键（字母/数字）也是合法的
+            let single = up.len() == 1 && up.chars().all(|c| c.is_ascii_alphanumeric());
+            assert!(KEYS.contains(&up.as_str()) || single, "未知键名 {}（在 {}）", key, accel);
         }
     }
 }
