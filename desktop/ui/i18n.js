@@ -85,6 +85,7 @@
       themeDark: '🌙',
       themeLight: '☀️',
       themeToggle: '切换深浅色',
+      langToggle: '切换界面语言',
       // 动态
       doneBanner: '处理完成',
       doneSubSave: (dir) => `原图未改动 · 结果保存在 ${dir}`,
@@ -152,6 +153,7 @@
       logCancelFailed: (msg) => `[Cancel failed] ${msg}`,
       logCleanupDone: '[Cleanup] Removed backup and temp files',
       logCleanupFailed: (msg) => `[Cleanup] ${msg}`,
+      logMenuLangFailed: (msg) => `[菜单] 语言同步失败：${msg}`,
     },
     en: {
       subtitle: 'Batch-remove AI watermark · 100% local, images never uploaded',
@@ -237,6 +239,7 @@
       themeDark: '🌙',
       themeLight: '☀️',
       themeToggle: 'Toggle theme',
+      langToggle: 'Switch language',
       doneBanner: 'Done',
       doneSubSave: (dir) => `Originals untouched · saved to ${dir}`,
       doneSubOverwrite: 'Originals replaced (backup kept in original-watermark-backup/, restorable)',
@@ -302,6 +305,7 @@
       logCancelFailed: (msg) => `[Cancel failed] ${msg}`,
       logCleanupDone: '[Cleanup] Removed backup and temp files',
       logCleanupFailed: (msg) => `[Cleanup] ${msg}`,
+      logMenuLangFailed: (msg) => `[Menu] Language sync failed: ${msg}`,
     },
   };
 
@@ -328,6 +332,12 @@
       const text = t(el.dataset.i18nTitle);
       if (typeof text === 'string') el.title = text;
     });
+    // 图标型按钮（只有 emoji/缩写）必须靠 aria-label 才能被读屏器念出来
+    document.querySelectorAll('[data-i18n-aria]').forEach((el) => {
+      const text = t(el.dataset.i18nAria);
+      if (typeof text === 'string') el.setAttribute('aria-label', text);
+    });
+    document.documentElement.lang = lang === 'en' ? 'en' : 'zh-CN';
     document.title = lang === 'en' ? 'Watermark Cleaner' : '图片水印清理助手';
   }
 

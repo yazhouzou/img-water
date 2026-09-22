@@ -5,6 +5,9 @@ pub mod dbnet;
 pub mod fetch;
 pub mod i18n;
 pub mod lama;
+// 系统菜单仅桌面端存在（Tauri 的 menu API 在移动端不可用），整模块按平台门控
+#[cfg(desktop)]
+pub mod menu;
 pub mod photo_meta;
 pub mod pipeline;
 pub mod watermark_profiles;

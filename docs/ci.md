@@ -16,7 +16,7 @@
 
 ## CI（GitHub Actions）
 - 仓库 `github.com/yazhouzou/img-water`，remote `github`；origin 仍 Codeup，**双推**。产物自动附 Release（免登录）。
-- 矩阵：`macos-latest`（aarch64）+ `windows-latest`（x86_64）；x86_64 macOS 已从矩阵移除（`ort-sys` 无预编译库）。
+- 矩阵：`macos-latest`（aarch64）+ `windows-latest`（x86_64）；**不做 Intel/universal**（已定：macOS 全线 Apple Silicon；且 `ort-sys` 的 `download-binaries` 没有 `x86_64-apple-darwin` 产物，要 Intel 包就得自建 ORT，代价不成比例）。
 - 构建步骤须 `shell: bash`（Windows runner 默认 pwsh）；Windows 产物路径含 `target/<triple>/`。
 - **CI 默认异步**：推送后标注"CI 后台验证中"即结束，下次用 `api.github.com` 查；仅明确要求才轮询（≥90s）。
 - 本机网络：`github.com:443` 常被阻断，SSH 走 `ssh.github.com:443`（已在 `~/.ssh/config`）；`api.github.com` 可直连查状态/产物。

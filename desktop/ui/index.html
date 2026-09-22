@@ -23,8 +23,8 @@
         <span id="model-progress-text" class="model-progress-text"></span>
       </div>
       <button id="btn-setup" class="btn primary small" hidden data-i18n="setupModel"></button>
-      <button id="btn-theme" class="btn small ghost" data-i18n-title="themeToggle">🌙</button>
-      <button id="btn-lang" class="btn small ghost">EN</button>
+      <button id="btn-theme" class="btn small ghost" data-i18n-title="themeToggle" data-i18n-aria="themeToggle"><span id="btn-theme-icon" aria-hidden="true">🌙</span></button>
+      <button id="btn-lang" class="btn small ghost" data-i18n-aria="langToggle">EN</button>
       <div id="env-badge" class="badge" data-i18n="envChecking"></div>
     </div>
   </header>
@@ -53,7 +53,7 @@
         <button id="btn-select-none" class="btn small ghost" disabled data-i18n="selectNone"></button>
         <span id="file-count" class="muted">0 张</span>
       </div>
-      <div id="file-list" class="file-list">
+      <div id="file-list" class="file-list" role="group" data-i18n-aria="filesTitle">
         <div class="placeholder">先选择图片或文件夹</div>
       </div>
       <div class="run-area">
@@ -156,14 +156,14 @@
           <button id="btn-export-log" class="btn small ghost" type="button" data-i18n="exportLog"></button>
           <button id="btn-clear-log" class="btn small ghost" type="button" data-i18n="clearLog"></button>
         </summary>
-        <pre id="log" class="log"></pre>
+        <pre id="log" class="log" role="log" aria-live="polite" aria-relevant="additions" data-i18n-aria="logTitle"></pre>
       </details>
     </section>
   </main>
 
   <div id="disclaimer-overlay" class="mask-overlay" hidden>
-    <div class="mask-dialog disclaimer-dialog">
-      <h3 data-i18n="disclaimerTitle"></h3>
+    <div class="mask-dialog disclaimer-dialog" role="dialog" aria-modal="true" aria-labelledby="disclaimer-title">
+      <h3 id="disclaimer-title" data-i18n="disclaimerTitle"></h3>
       <div class="disclaimer-body">
         <p data-i18n-html="disclaimerBody1"></p>
         <p data-i18n-html="disclaimerBody2"></p>
@@ -176,9 +176,9 @@
   </div>
 
   <div id="mask-overlay" class="mask-overlay" hidden>
-    <div class="mask-dialog">
+    <div class="mask-dialog" role="dialog" aria-modal="true" aria-labelledby="mask-head-title">
       <div class="mask-head">
-        <span data-i18n="maskHead"></span>
+        <span id="mask-head-title" data-i18n="maskHead"></span>
         <button id="btn-mask-cancel" class="btn small ghost" type="button" data-i18n="maskCancel"></button>
       </div>
       <div id="mask-canvas-wrap" class="mask-canvas-wrap">
@@ -195,7 +195,7 @@
     </div>
   </div>
 
-  <div id="lightbox" class="lightbox">
+  <div id="lightbox" class="lightbox" role="dialog" aria-modal="true" aria-label="预览大图">
     <img src="" alt="预览大图" />
   </div>
 

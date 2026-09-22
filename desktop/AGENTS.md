@@ -16,6 +16,7 @@ Tauri 桌面应用，内置 Rust + ONNX Runtime 修复内核（v0.2 起，无需
 - `pipeline.rs` 是 Python 脚本的 Rust 移植（备份/遮罩/修复/复查/覆盖/清理）；`run` 清理前把两张复查拼图复制到系统临时目录 `doubao-watermark-review/` 再输出路径。
 - CLI `clean-cli`（`cargo build --bin clean-cli`），参数同 Python（`--root`/`--mask-box`/`--keep-work`/`--force`（验证 FAIL 时强制落盘）/`--output-dir <dir>`（另存模式自定义输出目录） + `run|prepare|inpaint|review-lama|overwrite-review|cleanup`）。
 - 模型下载：启动缺失即自动下载（多连接分段+重试+源回退 hf-mirror→huggingface），顶栏进度条；`LAMA_ONNX_URL` 覆盖源，`LAMA_ONNX_PATH` 覆盖位置。
+- **模型下载断点续传（`fetch.rs`）**：失败/退出**不再清理分段**，下次（含重启 App）从断点续传；单连接路径也用 `Range` 接着下。**同一性判定 `PartMeta{url,total,etag}`**（`dest.with_extension("part.json")`）：双方都有 ETag 时以 ETag 为准、否则退化为"总大小一致"，判定不符即丢分段重下——否则换镜像/远端换文件后会拼出**大小对但内容错**的模型（静默损坏）。**期望大小以 HEAD 的 content-length 为准**：截断响应的 content-length 会"自圆其说"（谎报为已发出长度），只看 GET 头会把半截文件当完整文件改名落盘。并行合并先写 `.part.merge`、**改成功后**才删 `.partN`（旧实现边合并边删，崩在中间要全部重下）。临时文件名基于**去扩展名的 stem**（`lama_fp32.onnx` → `lama_fp32.part0`），`prune_temps` 用 `file_stem()` 匹配。
 
 ## 水印档案库（Rust 侧）
 概念/建档案流程/阈值见 `docs/non-doubao-watermarks.md`；这里只记 Rust 侧差异与踩坑。
@@ -52,6 +53,10 @@ Tauri 桌面应用，内置 Rust + ONNX Runtime 修复内核（v0.2 起，无需
 - 结果区「逐张缩略图」：pipeline-exit 带 `outputs`，前端用 `read_thumbnail_base64`（解码后 `thumbnail(200,200)` 再编码 PNG，3 并发）渲染；桌面每张可 `reveal_path`（macOS `open -R`）。拖拽导入有高亮遮罩（enter/over/leave/drop），非图片给提示；快捷键 Cmd/Ctrl+O 选图、Cmd/Ctrl+Enter 开始（输入框内不触发）。日志区「导出日志」走 dialog `save` + `write_text_file`，便于用户反馈问题。
 - 签名/公证：CI 与 `tools/package-app.sh mac` 均做分级校验（未配证书只告警），详见 `docs/ci.md`「macOS 签名与公证」。
 - 图片格式：`image` crate 显式只开 `png`（jpeg/webp 由 `imageproc` 默认特性带入，`Cargo.lock` 有 `zune-jpeg`/`image-webp`）；**HEIC 不支持**（要 libheif/平台解码器，代价大），picker 与拖拽过滤都只认 png/jpg/jpeg/webp。
+- **自定义系统菜单（`menu.rs`，仅桌面端，整模块 `#[cfg(desktop)]`）**：应用/文件/编辑/帮助；文件项有标准加速键（Cmd+O 选文件夹、Cmd+Return 开始处理）。**菜单项只发 `menu-action` 事件**，动作仍由前端已有按钮的 `click` 实现——逻辑只写一次，「处理中禁止开始/选图」等守卫都在按钮 `disabled` 上，因此菜单项不随运行状态灰显。帮助项在 Rust 侧直接开链接。**菜单语言运行时同步**：`set_menu_lang` 重建菜单（前端在 init 与语言切换时调用），失败只记一行日志、不影响处理。**有菜单时前端跳过自己的 Cmd+O/Cmd+Enter 处理**（macOS 菜单会先消费按键，否则弹两次对话框）：Rust 在 `on_page_load` 里 `eval` 置 `window.__WM_HAS_MENU`（页面加载与 JS 初始化先后不定，故同时回调 `window.__WM_MENU_READY`），浏览器预览无此标志、仍走 JS 快捷键。**菜单 API 在移动端不存在**：`pub mod menu`、`.on_menu_event`、`set_menu` 全部要 `#[cfg(desktop)]` 守卫，否则 Android 编译失败（`tools/android-check.sh` 可验）。
+- **panic 兜底**：后台任务一律走 `spawn_guarded`（`run_pipeline`/`setup_model`）——panic 会被 `catch_unwind` 转成失败 `pipeline-exit` 并复位 `running`；**不做的话**线程静默死掉、`running` 永远 true，前端卡"处理中"、关窗被永久 `prevent_close`、Dock 进度条不收回，只能强杀。同步重型命令 `learn_watermark` 走 `guard`（panic 会 unwind 击穿 Tauri 事件循环 → App 直接崩掉）。
+- **无障碍**：图标型按钮（主题 🌙/EN）用 `data-i18n-aria` + `aria-hidden` 包 emoji；`#log` 是 `role="log" aria-live="polite"`；两个遮罩与灯箱是 `role="dialog" aria-modal`；处理中 `body[aria-busy]`；动态插入的图片有 `alt`；`:focus-visible` 全局焦点环；`applyI18n` 同步 `<html lang>`。
+- **Intel / universal 包不做**（已定：macOS 全线 Apple Silicon；`ort-sys` 的 `download-binaries` 也无 `x86_64-apple-darwin` 产物）。
 - 自动更新**尚未接入**，启用步骤（需先有签名密钥对）见 `docs/ci.md`「自动更新」。
 
 ## UI 本地联调（零 SDK）

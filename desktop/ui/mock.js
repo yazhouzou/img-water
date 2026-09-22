@@ -106,6 +106,10 @@
         );
       case 'delete_watermark':
         return Promise.resolve();
+      case 'set_menu_lang':
+        // 浏览器预览没有系统菜单；真实端由 Rust 重建菜单
+        console.log('[mock] set_menu_lang:', args && args.lang);
+        return Promise.resolve();
       case 'run_pipeline':
         fakeRun();
         return Promise.resolve();

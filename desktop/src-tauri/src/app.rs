@@ -64,6 +64,61 @@ fn set_dock_progress(app: &AppHandle, done: usize, total: usize) {
 #[cfg(not(desktop))]
 fn set_dock_progress(_app: &AppHandle, _done: usize, _total: usize) {}
 
+/// 从 panic 载荷里取出可读文本（`panic!("{}", x)` / `panic!("literal")` 都能取到）。
+fn panic_text(payload: &Box<dyn std::any::Any + Send + 'static>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// 同步 Tauri 命令的 panic 兜底：把 panic 转成 `Err`。
+///
+/// 必要性：同步命令跑在 Tauri 事件循环线程上，panic 会一路 unwind 击穿事件循环 → 整个
+/// App 直接崩掉（用户还没看到任何提示）。图片/模型解码这类第三方代码最容易踩到。
+fn guard<T>(lang: &str, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        let detail = panic_text(&payload);
+        Err(tr(
+            lang,
+            &format!("内部错误：{}", detail),
+            &format!("Internal error: {}", detail),
+        ))
+    })
+}
+
+/// 后台任务统一入口：**兜住 panic 并按失败收尾**。
+///
+/// 必要性：任务跑在 `thread::spawn` 里，一旦 panic（解码/推理/索引越界）线程静默死掉，
+/// `running` 永远停在 true——前端卡在"处理中"、关窗被 `prevent_close` 永久拦下、Dock
+/// 进度条不收回，用户只能强杀进程。这里把 panic 转成失败事件，行为与"任务返回 Err"一致。
+fn spawn_guarded<F>(app: AppHandle, lang: String, task: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    thread::spawn(move || {
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)) {
+            let detail = panic_text(&payload);
+            let _ = app.emit(EVENT_LOG, format!("[Panic] {}", detail));
+            finish(
+                &app,
+                serde_json::json!({
+                    "code": -1,
+                    "success": false,
+                    "error": tr(
+                        &lang,
+                        &format!("内部错误（本次任务已中止，原图未被改动）：{}", detail),
+                        &format!("Internal error (task aborted, originals untouched): {}", detail),
+                    ),
+                }),
+            );
+        }
+    });
+}
+
 #[derive(Serialize)]
 struct EnvStatus {
     ready: bool,
@@ -86,6 +141,19 @@ fn env_status() -> EnvStatus {
     }
 }
 
+/// 按当前界面语言重建系统菜单（语言可运行时切换；菜单文案在 Rust，故由前端通知）。
+#[tauri::command]
+fn set_menu_lang(app: AppHandle, lang: Option<String>) -> Result<(), String> {
+    let lang = lang_of(lang);
+    #[cfg(desktop)]
+    return crate::menu::apply(&app, &lang).map_err(|e| e.to_string());
+    #[cfg(not(desktop))]
+    {
+        let _ = (app, lang);
+        Ok(())
+    }
+}
+
 #[tauri::command]
 fn setup_model(app: AppHandle, storage: State<'_, AppStorage>, lang: Option<String>) -> Result<(), String> {
     let lang = lang_of(lang);
@@ -102,7 +170,7 @@ fn setup_model(app: AppHandle, storage: State<'_, AppStorage>, lang: Option<Stri
         Err(_) => MODEL_URLS.iter().map(|s| s.to_string()).collect(),
     };
     let app_handle = app.clone();
-    thread::spawn(move || {
+    spawn_guarded(app.clone(), lang.clone(), move || {
         let log = |line: &str| {
             let _ = app_handle.emit(EVENT_LOG, line);
         };
@@ -197,6 +265,16 @@ fn list_pngs(root: String, lang: Option<String>) -> Result<Vec<String>, String> 
 /// 只有自检通过的档案才落盘——否则存下来也定位不到，等于白学。
 #[tauri::command]
 fn learn_watermark(
+    root: String,
+    files: Vec<String>,
+    label: String,
+    lang: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let l = lang_of(lang.clone());
+    guard(&l, move || learn_watermark_impl(root, files, label, lang))
+}
+
+fn learn_watermark_impl(
     root: String,
     files: Vec<String>,
     label: String,
@@ -347,7 +425,7 @@ fn run_pipeline(
     }
 
     let app_handle = app.clone();
-    thread::spawn(move || {
+    spawn_guarded(app.clone(), lang.clone(), move || {
         let mask = mask_box.and_then(|b| {
             (b.len() == 4).then(|| pipeline::MaskBox {
                 x1: b[0],
@@ -851,12 +929,22 @@ pub fn run_tauri_app() {
                 }
             }))
             .plugin(tauri_plugin_window_state::Builder::default().build());
+        // 菜单事件（菜单 API 在移动端不存在，必须 cfg 守卫）
+        builder = builder.on_menu_event(|app, event| {
+            let _ = crate::menu::forward(app, &event);
+        });
     }
     builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .manage(AppStorage::default())
         .setup(|app| {
+            // 桌面端安装自定义系统菜单（语言先给默认值，前端 init 时用 set_menu_lang 同步）。
+            // 失败要吵：菜单静默不出现很难排查，故这里显式打 stderr。
+            #[cfg(desktop)]
+            if let Err(err) = crate::menu::apply(app.handle(), "zh") {
+                eprintln!("[menu] 创建系统菜单失败: {err}");
+            }
             if cfg!(target_os = "android") || cfg!(target_os = "ios") {
                 let data_dir = app
                     .path()
@@ -876,6 +964,7 @@ pub fn run_tauri_app() {
         .invoke_handler(tauri::generate_handler![
             env_status,
             setup_model,
+            set_menu_lang,
             list_pngs,
             import_files,
             learn_watermark,
@@ -894,6 +983,26 @@ pub fn run_tauri_app() {
             reveal_path,
             write_text_file
         ])
+        .on_page_load(|window, _payload| {
+            // 告诉前端"系统菜单已就绪"：带标准快捷键的菜单项在 macOS 上会先消费按键，
+            // 前端据此跳过自己的 Cmd+O / Cmd+Enter 处理，避免弹两次对话框。
+            // 在 page_load 时注入（setup 里网页还没加载，赋值会丢）。
+            #[cfg(desktop)]
+            {
+                if window.label() == "main" {
+                    // 置标志 + 若前端已初始化则回调它（页面加载与 JS 初始化的先后不确定，
+                    // 两边都要能生效），前端据此同步菜单语言并跳过本地快捷键处理。
+                    let _ = window.eval(
+                        "window.__WM_HAS_MENU = true; \
+                         if (window.__WM_MENU_READY) window.__WM_MENU_READY();",
+                    );
+                }
+            }
+            #[cfg(not(desktop))]
+            {
+                let _ = window;
+            }
+        })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let running = window

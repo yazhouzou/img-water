@@ -92,6 +92,7 @@ function setState(state) {
 
 function setRunning(value) {
   running = value;
+  document.body.setAttribute('aria-busy', value ? 'true' : 'false');
   els.btnRun.disabled = value || !targetRoot;
   els.btnRun.hidden = value;
   els.btnCancel.hidden = !value;
@@ -217,6 +218,7 @@ function showReview(container, path) {
       container.innerHTML = '';
       const img = document.createElement('img');
       img.src = dataUrl;
+      img.alt = t('viewLarge');
       img.title = t('viewLarge');
       img.addEventListener('click', () => openLightbox(dataUrl));
       container.appendChild(img);
@@ -669,7 +671,7 @@ function renderResultList(paths) {
 
     const img = document.createElement('img');
     img.className = 'result-thumb pending';
-    img.alt = '';
+    img.alt = basename(path);
     img.title = t('viewLarge');
     img.addEventListener('click', () => {
       if (img.dataset.ready) openLightbox(img.src);
@@ -878,7 +880,7 @@ async function init() {
     const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
     const dark = mode === 'dark' || (mode !== 'light' && prefersDark);
     document.documentElement.dataset.theme = dark ? 'dark' : 'light';
-    btnTheme.textContent = dark ? t('themeLight') : t('themeDark');
+    document.getElementById('btn-theme-icon').textContent = dark ? t('themeLight') : t('themeDark');
   };
   const themeMode = () => localStorage.getItem('wm-theme') || 'auto';
   applyTheme(themeMode());
@@ -892,10 +894,22 @@ async function init() {
 
   // 语言切换
   const btnLang = document.getElementById('btn-lang');
+  // 系统菜单文案在 Rust 侧：装了菜单就把当前语言同步过去（页面加载与 JS 初始化先后
+  // 不确定，故既在这里主动调一次，也留给原生回调 __WM_MENU_READY 再调一次）。
+  const syncMenuLang = () => {
+    if (window.__WM_HAS_MENU) {
+      invoke('set_menu_lang', { lang: window.i18n.lang }).catch((err) => {
+        // 菜单重建失败（加速键/平台）只影响菜单文案，不影响处理；记一行便于排查
+        logLine(t('logMenuLangFailed')(String(err)));
+      });
+    }
+  };
+  window.__WM_MENU_READY = syncMenuLang;
   const applyLang = () => {
     btnLang.textContent = window.i18n.lang === 'zh' ? 'EN' : '中';
     window.i18n.applyI18n();
     applyDynamicLabels();
+    syncMenuLang();
   };
   applyLang();
   btnLang.addEventListener('click', () => {
@@ -944,6 +958,20 @@ async function init() {
     const p = event.payload;
     setRunProgress(p.stage, p.done, p.total, p.name);
   });
+  // 系统菜单（桌面端）：菜单项只发动作 id，动作仍走下面已有的按钮点击——
+  // 逻辑只实现一次，「处理中禁止开始/选图」等守卫都在按钮的 disabled 上。
+  listen('menu-action', (event) => {
+    const id = event.payload;
+    if (id === 'menu-pick') {
+      if (!running && !els.btnPick.disabled) els.btnPick.click();
+    } else if (id === 'menu-start') {
+      if (!els.btnRun.hidden && !els.btnRun.disabled) els.btnRun.click();
+    } else if (id === 'menu-export-log') {
+      if (!els.btnExportLog.disabled) els.btnExportLog.click();
+    } else if (id === 'menu-cleanup') {
+      if (!els.btnCleanup.disabled) els.btnCleanup.click();
+    }
+  });
 
   if (isMobile) {
     setPickLabel();
@@ -967,6 +995,9 @@ async function init() {
     }
     const mod = e.metaKey || e.ctrlKey;
     if (!mod) return;
+    // 桌面端装了系统菜单时，带快捷键的菜单项会先消费按键 → 这里跳过，避免弹两次对话框。
+    // 浏览器预览（ui-preview.sh）没有菜单，仍由这里兜底。
+    if (window.__WM_HAS_MENU) return;
     const el = document.activeElement;
     const typing = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
     if (typing) return;
