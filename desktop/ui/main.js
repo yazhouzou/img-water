@@ -77,6 +77,9 @@ const els = {
   lightboxZoomOut: document.getElementById('lightbox-zoom-out'),
   lightboxReset: document.getElementById('lightbox-reset'),
   lightboxClose: document.getElementById('lightbox-close'),
+  lightboxPrev: document.getElementById('lightbox-prev'),
+  lightboxNext: document.getElementById('lightbox-next'),
+  lightboxCounter: document.getElementById('lightbox-counter'),
 };
 
 let targetRoot = null;
@@ -226,7 +229,11 @@ function showReview(container, path) {
       img.src = dataUrl;
       img.alt = t('viewLarge');
       img.title = t('viewLarge');
-      img.addEventListener('click', () => openLightbox(dataUrl));
+      img.addEventListener('click', () => {
+        lbIndex = -1; // 复查预览图不在结果列表里，不启用左右切换
+        updateLightboxNav();
+        openLightbox(dataUrl);
+      });
       container.appendChild(img);
       container.classList.add('has-image');
     })
@@ -241,6 +248,24 @@ const LB_MAX_SCALE = 8;
 const LB_MIN_FACTOR = 0.2; // 相对"适应窗口"的最小缩放
 let lbScale = 1, lbTx = 0, lbTy = 0, lbFit = 1;
 let lbNatural = { w: 0, h: 0 };
+// 结果列表里当前预览的是第几张（-1 = 非列表来源，如复查预览图）→ 决定是否显示左右切换
+let lbIndex = -1;
+
+function updateLightboxNav() {
+  const has = resultPaths.length > 1 && lbIndex >= 0;
+  els.lightboxPrev.hidden = !has;
+  els.lightboxNext.hidden = !has;
+  els.lightboxCounter.hidden = !has;
+  if (has) els.lightboxCounter.textContent = t('imageCounter')(lbIndex + 1, resultPaths.length);
+}
+
+// 灯箱内切换上一张/下一张（首尾循环），复用列表顺序
+function lightboxStep(delta) {
+  const n = resultPaths.length;
+  if (n < 2 || lbIndex < 0) return;
+  lbIndex = ((lbIndex + delta) % n + n) % n;
+  openLightboxPath(resultPaths[lbIndex]);
+}
 
 function setLightboxTransform() {
   els.lightboxImg.style.transform =
@@ -278,6 +303,8 @@ function openLightbox(dataUrl) {
 }
 
 async function openLightboxPath(path) {
+  lbIndex = resultPaths.indexOf(path);
+  updateLightboxNav();
   els.lightboxImg.hidden = true;
   els.lightboxImg.src = '';
   els.lightboxLoading.hidden = false;
@@ -299,6 +326,7 @@ function closeLightbox() {
   els.lightboxLoading.hidden = true;
   els.lightboxStage.classList.remove('grabbing');
   lbNatural = { w: 0, h: 0 };
+  lbIndex = -1;
 }
 
 // 以屏幕坐标点为锚缩放：该点下的图像像素保持不动（缩放体验自然）
@@ -378,6 +406,8 @@ function bindLightbox() {
   els.lightboxZoomOut.addEventListener('click', () => centerZoom(1 / 1.25));
   els.lightboxReset.addEventListener('click', resetLightboxView);
   els.lightboxClose.addEventListener('click', closeLightbox);
+  els.lightboxPrev.addEventListener('click', () => lightboxStep(-1));
+  els.lightboxNext.addEventListener('click', () => lightboxStep(1));
   window.addEventListener('resize', () => {
     if (els.lightbox.classList.contains('open') && !els.lightboxImg.hidden) resetLightboxView();
   });
@@ -737,7 +767,17 @@ function clearReviews() {
   els.resultBanner.hidden = true;
   els.reviewCandidate.innerHTML = `<div class="placeholder">${t('placeholderBefore')}</div>`;
   els.reviewFinal.innerHTML = `<div class="placeholder">${t('placeholderAfter')}</div>`;
+  els.reviewCandidate.classList.remove('has-image');
+  els.reviewFinal.classList.remove('has-image');
   clearResultList();
+  clearCompare();
+}
+
+// 清空前后对比 slider：避免"恢复原图"后仍显示已失效的处理结果对比
+function clearCompare() {
+  els.compareBox.hidden = true;
+  els.compareSource.removeAttribute('src');
+  els.compareFinal.removeAttribute('src');
 }
 
 function basename(p) {
@@ -939,12 +979,19 @@ function renderExitBanner(payload) {
       restore.textContent = t('restoreOriginal');
       restore.title = t('restoreHint');
       restore.addEventListener('click', async () => {
-        const ok = await confirm(t('restoreConfirm'), { title: t('restoreOriginal'), kind: 'warning' });
+        const ok = await confirm(t('restoreConfirm'), {
+          title: t('restoreOriginal'),
+          kind: 'warning',
+          okLabel: t('ok'),
+          cancelLabel: t('cancel'),
+        });
         if (!ok) return;
         try {
           const n = await invoke('restore_backup', { root: targetRoot, lang: window.i18n.lang });
           logLine(t('restoreDone')(n));
-          clearResultList();
+          // 原图已还原：清掉结果列表、前后对比与两张复查预览，避免残留"已处理"假象
+          clearReviews();
+          els.resultBanner.hidden = false;
           els.resultBanner.className = 'result-banner ok';
           els.resultBanner.innerHTML = '';
           const box = document.createElement('div');
@@ -1131,6 +1178,11 @@ async function init() {
       if (!els.maskOverlay.hidden) closeMaskEditor();
       return;
     }
+    // 灯箱打开时用 ←/→ 在结果列表里翻页
+    if (els.lightbox.classList.contains('open') && lbIndex >= 0) {
+      if (e.key === 'ArrowLeft') { e.preventDefault(); lightboxStep(-1); return; }
+      if (e.key === 'ArrowRight') { e.preventDefault(); lightboxStep(1); return; }
+    }
     const mod = e.metaKey || e.ctrlKey;
     if (!mod) return;
     // 桌面端装了系统菜单时，带快捷键的菜单项会先消费按键 → 这里跳过，避免弹两次对话框。
@@ -1224,7 +1276,7 @@ async function init() {
       await refreshFiles();
     } catch (err) {
       logLine(`[${t('importFailed')}] ` + String(err));
-      await message(String(err), { title: t('importFailed') }).catch(() => {});
+      await message(String(err), { title: t('importFailed'), okLabel: t('ok') }).catch(() => {});
     }
   }
 
@@ -1352,6 +1404,8 @@ async function init() {
     const ok = await confirm(t('profileDeleteConfirm')(current.label || current.id), {
       title: t('profileDelete'),
       kind: 'warning',
+      okLabel: t('ok'),
+      cancelLabel: t('cancel'),
     }).catch(() => false);
     if (!ok) return;
     try {
@@ -1373,6 +1427,8 @@ async function init() {
       const ok = await confirm(t('confirmOverwrite')(files.length), {
         title: t('overwriteTitle'),
         kind: 'warning',
+        okLabel: t('ok'),
+        cancelLabel: t('cancel'),
       }).catch(() => false);
       if (!ok) return;
     }
@@ -1405,6 +1461,16 @@ async function init() {
   });
 
   els.btnCancel.addEventListener('click', async () => {
+    // 模型下载可断点续传、取消无损失；处理任务取消会丢弃本批（未落盘）→ 二次确认防误触
+    if (taskKind !== 'model') {
+      const ok = await confirm(t('cancelConfirm'), {
+        title: t('cancelConfirmTitle'),
+        kind: 'warning',
+        okLabel: t('ok'),
+        cancelLabel: t('cancel'),
+      }).catch(() => false);
+      if (!ok) return;
+    }
     els.btnCancel.disabled = true;
     logLine(t('cancelLog'));
     try {

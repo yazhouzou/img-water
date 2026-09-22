@@ -96,7 +96,12 @@ star(draw, 772 * S, 130 * S, 26 * S, (255, 255, 255, 160))
 alpha = rounded_rect(230 * S)
 out = bg.convert('RGBA')
 out.putalpha(alpha)
+# macOS 图标网格：圆角矩形只占 824/1024（Apple 模板），四周留透明边距——否则程序坞里
+# 会比其它 App 明显偏大。半径随比例缩到 ≈185（824×22.5%，与模板一致）。
+inner = out.resize((824, 824), Image.LANCZOS)
+canvas = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
+canvas.paste(inner, (100, 100), inner)
 import os
 out_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'desktop', 'icon-source.png')
-out.resize((1024, 1024), Image.LANCZOS).save(out_path)
+canvas.save(out_path)
 print('icon source saved')
