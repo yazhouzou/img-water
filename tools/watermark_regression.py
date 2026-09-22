@@ -890,6 +890,81 @@ def run_sd_checks(rdw, only):
     return rows
 
 
+def run_detect_floor_checks(rdw, only):
+    """再误检防线（无模型）：已去水印的强纹理图右下角会被**再检测**成水印，重跑把成品
+    修坏。两道独立下限（均在原判据**之外另加**，且新增后老的正样本仍过）：
+
+    ① 模板命中除 raw gap-score ≥ TEMPLATE_MIN_SCORE 外，另须**顶帽**分 ≥
+       TEMPLATE_TOPHAT_MIN——raw 会把"水印处整体偏亮"（花丛/地毯亮块，尺度 > 顶帽核）
+       计入，顶帽（扣局部背景）只认"字形相对**紧邻**背景更亮"。用大尺度亮台阶复现
+       raw 高(36.8)/顶帽平(2.6) 的误检（实测 1.png raw 27.3、6.png raw 34.6 皆≤6.4 顶帽）；
+    ② 右下角兜底行块除宽高比 ≤8 外，另须 ≥ CORNER_ROW_ASPECT_MIN(=2.5)——防"矮胖单块"
+       （地毯/纸面背景碎块 比 1.2~1.9）被 9x3 膨胀粘连成"水印行"。附**宽行正样本**
+       （比 ~5.5）仍须检出，保证下限不误伤真水印。"""
+    import cv2
+    import numpy as np
+    if only and 'detect-floor' not in only:
+        return []
+    tpl, _a, meta = rdw.load_template()
+    if tpl is None:
+        return []
+    rows = []
+
+    # ① 顶帽下限：背景在字形处整体偏亮（大尺度台阶），raw 过线、顶帽不过 → 拒绝
+    h, w = 900, 1600
+    scale = min(h, w) / meta['ref_short_side']
+    th = max(1, int(round(tpl.shape[0] * scale)))
+    tw = max(1, int(round(tpl.shape[1] * scale)))
+    px, py = w - tw - 8, h - th - 8
+    gray = np.full((h, w), 100, np.float32)
+    gray[py:py + th, px:px + tw // 2] = 220      # 左半亮块：尺度远大于 31px 顶帽核
+    raw_peak = top_peak = 0.0
+    resp = rdw._template_response(gray, w, h, with_tophat=True)
+    if resp is not None:
+        response, _t, _tw, top = resp
+        wx, wy = max(0, response.shape[1] - 41), max(0, response.shape[0] - 41)
+        _, _, _, peak = cv2.minMaxLoc(response[wy:, wx:])
+        raw_peak = float(response[peak[1] + wy, peak[0] + wx])
+        top_peak = float(top[peak[1] + wy, peak[0] + wx])
+    mask, _score, _info = rdw.template_stroke_mask(gray, w, h)
+    rows.append(({'group': 'detect-floor', 'name': 'tophat floor rejects flat bright block', 'expect': 'ok'},
+                 raw_peak >= rdw.TEMPLATE_MIN_SCORE and top_peak < rdw.TEMPLATE_TOPHAT_MIN and mask is None,
+                 f'raw_peak={raw_peak:.1f} tophat_peak={top_peak:.1f} '
+                 f'mask={"hit" if mask is not None else "none"}'))
+
+    # ② 行块宽高比下限：矮胖单块（旧判据误当"水印行"）→ 拒绝；宽行正样本 → 仍检出
+    W, H = 2848, 1600
+    x0, y0 = int(W * 0.70), int(H * 0.88)
+    pad = max(10, H // 150)
+    rh, rw = H - y0, W - x0
+
+    def skyline(heights, gap, bar):
+        white = np.zeros((rh, rw), np.uint8)
+        by1 = rh - 8 - 56
+        xx = rw - 8 - (len(heights) * (bar + gap) - gap)
+        for hgt in heights:
+            white[by1:by1 + hgt, xx:xx + bar] = 1
+            xx += bar + gap
+        return white
+
+    fat = skyline([52, 30, 46, 22, 40], 13, 8)                              # 比 ~1.9（矮胖误检）
+    wide = skyline([(56 if k % 2 == 0 else 42) for k in range(18)], 8, 10)  # 比 ~5.5（真水印行）
+    saved = rdw.CORNER_ROW_ASPECT_MIN
+    try:
+        rdw.CORNER_ROW_ASPECT_MIN = 0.0                                     # 旧口径（无下限）
+        fat_pre = rdw._corner_row_boxes(fat, H, W, x0, y0, pad)
+    finally:
+        rdw.CORNER_ROW_ASPECT_MIN = saved
+    fat_post = rdw._corner_row_boxes(fat, H, W, x0, y0, pad)
+    rows.append(({'group': 'detect-floor', 'name': 'row aspect floor rejects fat corner block', 'expect': 'ok'},
+                 bool(fat_pre) and not fat_post,
+                 f'pre_floor_boxes={len(fat_pre)} post_floor_boxes={len(fat_post)}'))
+    wide_boxes = rdw._corner_row_boxes(wide, H, W, x0, y0, pad)
+    rows.append(({'group': 'detect-floor', 'name': 'wide genuine row still detected', 'expect': 'ok'},
+                 bool(wide_boxes), f'boxes={len(wide_boxes)}'))
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser(description='watermark processing regression corpus')
     ap.add_argument('--e2e', action='store_true', help='also run full pipeline + result verification (slow)')
@@ -911,6 +986,7 @@ def main():
     rows += run_skip_checks(rdw, args.only)
     rows += run_anchor_checks(rdw, args.only)
     rows += run_sd_checks(rdw, args.only)
+    rows += run_detect_floor_checks(rdw, args.only)
 
     print(f'{"layer":5s} {"case":40s} {"expect":6s} {"mark":5s} detail')
     fails = 0

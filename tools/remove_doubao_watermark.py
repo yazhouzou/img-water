@@ -55,6 +55,13 @@ TEMPLATE_META = TEMPLATE_ASSET.with_suffix('.json')
 # 沙滩 96 / 纸面 33；已去水印图（负样本）≤8.4。阈值 20 取中间空档：3.png 纸面
 # 低对比水印并入模板路径走笔画级 α mask，避免回退整框重绘抹平纸面折痕。
 TEMPLATE_MIN_SCORE = 20.0
+# 顶帽口径下限（**防"已去水印图被再误检"**，2026-09）：raw 口径把"水印处整体偏亮"
+# 也计入 gap，强纹理背景（花丛/地毯）即使在**无水印**处也能凑出高分——已去水印的
+# 1.png/6.png raw 27.3/34.6（≥20）被再检出，重跑会把成品再修坏。顶帽口径（局部背景
+# 扣除）只有"字形相对**紧邻**背景更亮"才给分：真水印顶帽 ≥19.9（最弱 12.png），
+# 误检仅 ≤6.4（1.png 6.4、6.png 5.7）。故在 raw 阈值之外**另要求顶帽过线**，
+# 取两者之间空档 15。实测全 23 张原图真水印顶帽均 ≥19.9、全部通过。
+TEMPLATE_TOPHAT_MIN = 15.0
 # 相对残留判据（触发自动重试）：模板笔画 α mask 只覆盖亮字核心，盖不住豆包水印的
 # 暗色描边——低对比背景（4.png 纸面）上 MAT 只重绘笔画区，暗描边残留成字形凹痕。
 # 修复后模板分本应大幅下降（高对比图 120→<5，去除率 >95%）；残影图的残留占比很高
@@ -172,7 +179,7 @@ def load_template():
     return tpl, alpha, meta
 
 
-def _template_response(gray, width, height):
+def _template_response(gray, width, height, with_tophat=False):
     """模板 gap-score 响应图 + 模板尺寸 (th, tw)；模板缺失/大于图时返回 None。
     两种预处理逐像素取更强者（峰值都落在水印处，命中位置不变）：
       - 顶帽（局部背景扣除）抑制纹理/光照梯度，救"亮背景压平笔画"（3.png raw 15 → 顶帽 33）；
@@ -204,7 +211,12 @@ def _template_response(gray, width, height):
         s_all = cv2.matchTemplate(src, ones, cv2.TM_CCORR)
         return s_in / n_in - (s_all - s_in) / n_out
 
-    return np.maximum(_gap_score(gray), _gap_score(tophat)), th_t, tw_t
+    raw = _gap_score(gray)
+    top = _gap_score(tophat)
+    combined = np.maximum(raw, top)
+    if with_tophat:
+        return combined, th_t, tw_t, top
+    return combined, th_t, tw_t
 
 
 def template_stroke_mask(gray, width, height, model='mat'):
@@ -221,10 +233,10 @@ def template_stroke_mask(gray, width, height, model='mat'):
     tpl, alpha, meta = load_template()
     if tpl is None:
         return None, 0.0, 'template asset missing'
-    resp = _template_response(gray, width, height)
+    resp = _template_response(gray, width, height, with_tophat=True)
     if resp is None:
         return None, 0.0, 'template larger than image'
-    response, th_t, tw_t = resp
+    response, th_t, tw_t, tophat_resp = resp
     # 水印必贴右下角：只在右下角 40px 余量窗口内取峰
     y0 = max(0, response.shape[0] - 41)
     x0 = max(0, response.shape[1] - 41)
@@ -232,8 +244,15 @@ def template_stroke_mask(gray, width, height, model='mat'):
     _, _, _, peak = cv2.minMaxLoc(window)
     px, py = peak[0] + x0, peak[1] + y0
     score = float(response[py, px])
+    tophat_score = float(tophat_resp[py, px])
     if score < TEMPLATE_MIN_SCORE:
         return None, score, f'template score {score:.1f} < {TEMPLATE_MIN_SCORE}'
+    if tophat_score < TEMPLATE_TOPHAT_MIN:
+        # 顶帽过不了线＝"水印处整体偏亮"而非"字形相对**紧邻**背景更亮" → 纹理误检。
+        # 上报的 score 用（过不了线的）顶帽分，使调用方（prepare/回归/looks_processed）
+        # 一律按"未命中"处理——避免把已去水印的强纹理图再检出、重跑把成品修坏。
+        return None, tophat_score, (f'template tophat {tophat_score:.1f} < {TEMPLATE_TOPHAT_MIN}'
+                                    f' (raw score {score:.1f}) — texture false positive, skipped')
     stamp_a, _ = _load_stamp()
     if stamp_a is not None:
         # stamp 完整 footprint（含暗色描边）：只盖亮字的 mask 会在低对比背景留暗字形
@@ -720,6 +739,11 @@ CORNER_ROW_H_MAX_REL = 0.046
 # 行块模式：合并后的整行宽高比上限。水印行块实测 4.0~4.6（豆包）/ 4.6~9（通用
 # 文字），而背景亮斑成行后 6.8~10.8（已去水印图 6.png 花丛 859x79）→ 上限 8。
 CORNER_ROW_ASPECT_MAX = 8.0
+# 行块模式宽高比**下限**（2026-09，防"已去水印图再误检"）：真水印整行 ≈ 5 字符 → 宽高比
+# 4.0~4.6（豆包）；而已去水印图右下角的**单个**背景亮斑（地毯 1.png 30x25 比 1.20、草丛
+# 7.png 80x60 比 1.33）会被行块模式当"粘连成行的水印"检出（`_text_likeness` 段数判据在
+# 纹理上也会过）。加下限 2.5 把这类"矮胖单块"挡在门外，真水印行（≥4.0）稳过。
+CORNER_ROW_ASPECT_MIN = 2.5
 
 
 def _corner_row_boxes(white, H, W, x0, y0, pad):
@@ -737,7 +761,7 @@ def _corner_row_boxes(white, H, W, x0, y0, pad):
     for i in range(1, count):
         x, y, cw, ch, area = (int(v) for v in stats[i])
         gx1, gy1, gx2, gy2 = x0 + x, y0 + y, x0 + x + cw, y0 + y + ch
-        if area < 400 or cw < ch or cw / ch > CORNER_ROW_ASPECT_MAX:
+        if area < 400 or cw < ch * CORNER_ROW_ASPECT_MIN or cw / ch > CORNER_ROW_ASPECT_MAX:
             continue
         fill = area / float(cw * ch)
         if not (0.15 <= fill <= 0.95):
