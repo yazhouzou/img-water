@@ -20,12 +20,13 @@
 """
 import argparse
 import hashlib
+import json
 import os
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from shutil import rmtree
+from shutil import copyfile, rmtree
 
 TOOLS = Path(__file__).resolve().parent
 sys.path.insert(0, str(TOOLS))
@@ -48,6 +49,62 @@ DIST = ROOT / 'dist'
 # 1-6 断言；千问图会偶然触发模板（7/8 高分）或低于阈值（9/10），都不是豆包语义。
 NON_DOUBAO_DIST = {'7.png', '8.png', '9.png', '10.png'}
 
+# ---------------------------------------------------------------------------
+# 固化 fixtures：回归**只读** tests/fixtures，绝不读可变的工作目录（根目录 *.png）。
+# 目的：新增/替换图片不再静默改变回归基线（"换一张图就要重修老图"的结构性根因）。
+#   - tests/fixtures/manifest.json：全部原图的 md5/尺寸/模板分/掩码框基线；
+#   - tests/fixtures/images/{original,processed}/：入库（CI 可跑）的精选子集；
+#   - 本地跑时 original 可回退 dist/（md5 校验），processed 只认入库文件；
+#   - md5 不符 = 该输入被换过 → **直接报错**，逼你显式 `--update-golden`。
+# ---------------------------------------------------------------------------
+FIXTURES = ROOT / 'tests' / 'fixtures'
+FIXTURE_MANIFEST = FIXTURES / 'manifest.json'
+FIXTURE_IMAGES = FIXTURES / 'images'
+FIXTURE_VERSION = 1
+# 入库的精选子集（见 --update-golden）：正样本覆盖地毯/岩石/纸面/木纹/花丛/沙地等
+# 典型背景；负样本为对应已去水印成品。CI 只跑入库子集；本地可回退 dist/ 跑全量。
+FIXTURE_CORE_ORIGINALS = ('1.png', '2.png', '3.png', '4.png', '6.png', '7.png', '22.png')
+FIXTURE_CORE_PROCESSED = ('1.png', '3.png', '6.png')
+
+
+def load_manifest():
+    if not FIXTURE_MANIFEST.exists():
+        return {'version': FIXTURE_VERSION, 'originals': {}, 'processed': {}}
+    return json.loads(FIXTURE_MANIFEST.read_text())
+
+
+def probe(rdw, path):
+    """探测一张图的检测指纹：md5 / 尺寸 / 豆包模板分 / 掩码框。"""
+    import numpy as np
+    with Image.open(path) as im:
+        rgb = im.convert('RGB')
+        w, h = rgb.size
+        gray = np.array(rgb).max(axis=2).astype(np.float32)
+    mask, score, _info = rdw.template_stroke_mask(gray, w, h)
+    box = None
+    if mask is not None:
+        ys, xs = np.where(mask > 0)
+        box = [int(xs.min()), int(ys.min()), int(xs.max() + 1), int(ys.max() + 1)]
+    return {'md5': md5(path), 'w': w, 'h': h, 'tmpl': round(float(score), 1), 'box': box}
+
+
+def fixture_path(kind, name, manifest):
+    """解析 fixture 文件：仓内 images/<kind>/ 优先；original 可回退本地 dist/。
+    命中即校验 md5——**不符直接报错**，杜绝"换图"静默改变回归基线。"""
+    entry = manifest.get(kind, {}).get(name)
+    fx = FIXTURE_IMAGES / kind / name
+    fallback = (DIST / name) if kind == 'original' else None
+    for p in (fx, fallback):
+        if p is not None and p.exists():
+            if entry and entry.get('md5') and md5(p) != entry['md5']:
+                raise SystemExit(
+                    f'[fixture] {kind}/{name} 与 manifest 的 md5 不符：{p}\n'
+                    f'  manifest {entry["md5"]}\n  实际     {md5(p)}\n'
+                    '  该输入被替换/改动过——若确属有意，请跑 --update-golden 显式更新基线。')
+            return p
+    return None
+
+
 
 def md5(path):
     h = hashlib.md5()
@@ -62,14 +119,19 @@ def md5(path):
 # ---------------------------------------------------------------------------
 
 def eval_doubao(rdw, path):
-    """豆包模板是否命中（正样本应命中、负样本应不命中）。"""
+    """豆包模板是否命中（正样本应命中、负样本应不命中）；附 mask 框供金标准比对。"""
     import numpy as np
     with Image.open(path) as im:
         rgb = im.convert('RGB')
         w, h = rgb.size
         gray = np.array(rgb).max(axis=2).astype(np.float32)
-    _, score, _ = rdw.template_stroke_mask(gray, w, h)
-    return score >= rdw.TEMPLATE_MIN_SCORE, score
+    mask, score, _ = rdw.template_stroke_mask(gray, w, h)
+    box = None
+    if mask is not None:
+        ys, xs = np.where(mask > 0)
+        if len(xs):
+            box = [int(xs.min()), int(ys.min()), int(xs.max() + 1), int(ys.max() + 1)]
+    return score >= rdw.TEMPLATE_MIN_SCORE, score, box
 
 
 def looks_processed(rdw, path):
@@ -107,32 +169,47 @@ def eval_synth(rdw, swt, img, real, any_position):
 
 
 def build_cases(rdw, swt):
+    manifest = load_manifest()
     cases = []
-    # A. 真实豆包正样本（dist 带水印原图）：应命中模板
-    for path in sorted(DIST.glob('*.png')):
-        if 'backup' in path.parts or path.name in NON_DOUBAO_DIST:
+    # A. 真实豆包正样本（带水印原图）：应命中模板。读 fixtures（入库子集），其余回退本地
+    #    dist/ 并校验 md5——"换图"会直接报错而非静默改基线。
+    for name, entry in sorted(manifest['originals'].items()):
+        if not entry.get('doubao'):
             continue
-        cases.append({'group': 'doubao', 'name': f'dist/{path.name}', 'path': path,
-                      'layer': 1, 'expect': 'hit'})
-    # B. 真实豆包负样本（根目录已去水印图，与 dist 不同者）：不应命中（防误检）
+        path = fixture_path('original', name, manifest)
+        if path is None:
+            continue
+        cases.append({'group': 'doubao', 'name': f'original/{name}', 'path': path,
+                      'layer': 1, 'expect': 'hit', 'golden': entry})
+    # B. 真实豆包负样本（已去水印图，入库 fixture）：不应命中（防误检）
     clean = []
-    for path in sorted(ROOT.glob('*.png')):
-        ref = DIST / path.name
-        if ref.exists() and md5(path) != md5(ref):
-            clean.append(path)
-            cases.append({'group': 'doubao-neg', 'name': f'{path.name} (processed)',
-                          'path': path, 'layer': 1, 'expect': 'miss'})
+    for name in sorted(manifest['processed']):
+        path = fixture_path('processed', name, manifest)
+        if path is None:
+            continue
+        clean.append(path)
+        cases.append({'group': 'doubao-neg', 'name': f'{name} (processed)',
+                      'path': path, 'layer': 1, 'expect': 'miss',
+                      'golden': manifest['processed'][name]})
 
     w, h = 1600, 900
-    # 干净背景：用已去水印的根目录图【裁切】（不缩放，避免重采样伪影导致误检）
+    # 干净背景：用已去水印的 fixture【裁切】（不缩放，避免重采样伪影导致误检）
     def bg(kind):
         if kind.startswith('clean:'):
-            im = Image.open(ROOT / f'{kind.split(":", 1)[1]}.png').convert('RGB')
-            return im.crop((0, 0, w, h)) if im.width >= w and im.height >= h else im.resize((w, h))
+            p = fixture_path('processed', f'{kind.split(":", 1)[1]}.png', manifest)
+            if p is None:
+                raise FileNotFoundError(kind)
+            with Image.open(p) as im:
+                im = im.convert('RGB')
+                return im.crop((0, 0, w, h)) if im.width >= w and im.height >= h else im.resize((w, h))
         return swt.make_background(kind, w, h)
 
-    # 只把"确实已去水印"的根目录图当干净背景（dist 同步为原图时 clean 会含带水印图）。
-    photo_bgs = [f'clean:{p.stem}' for p in clean if looks_processed(rdw, p)][:3]
+    # E1 合成负例的"照片背景"池：排除 clean:3 的左上 1600x900 裁片。该裁片恰好从 3.png
+    # 画面里的真实深色文字行（"HUMAN BOND"）中间切开，使该行贴到裁片底边并被
+    # `_detect_corner_faded` 的右下兜底当成水印（生产路径用**全图**，见 E2 的 3.png，不误检
+    # ——属兜底检测在"裁片尺度"下的已知弱点，非本次改动引入）。显式登记而非悄悄换背景。
+    CROP_CUT_TEXT_BGS = {'clean:3'}
+    photo_bgs = [f'clean:{p.stem}' for p in clean if f'clean:{p.stem}' not in CROP_CUT_TEXT_BGS][:3]
     # C. 支持能力：亮色文字水印（右下角，默认管线）应命中
     for bgk in ['black', 'gradient', 'whitebg', *photo_bgs]:
         for color in ['white', 'translucent']:
@@ -161,10 +238,9 @@ def build_cases(rdw, swt):
     #     3.png、花丛 6.png 的背景碎块被聚成"字符行"硬修；收紧到 2.6%~5.0% 短边后
     #     应回归"跳过"。用整图（而非裁角）复现：检测窗按图幅比例，裁角会改变场景。
     for path in clean:
-        if not looks_processed(rdw, path):
-            continue
         try:
-            im = Image.open(path).convert('RGB')
+            with Image.open(path) as fp:
+                im = fp.convert('RGB')
         except OSError:
             continue
         cases.append({'group': 'synth-neg', 'name': f'{path.name} (processed)',
@@ -198,7 +274,7 @@ def build_cases(rdw, swt):
                       'layer': 1, 'expect': 'miss', 'boundary': True})
     # clean:3 上的淡字（220）原先被同图背景碎块干扰、融合框偏大而 miss；字符高带
     # 收紧后碎块被排除，检出框回到淡字本体（IoU 0.43）→ 转正为应命中。
-    if looks_processed(rdw, ROOT / '3.png'):
+    if fixture_path('processed', '3.png', manifest) is not None:
         try:
             img, real = swt.stamp_text(bg('clean:3'), 'pale', 'bottomright', 1.0)
             cases.append({'group': 'synth-corner', 'name': 'clean:3/pale (low-contrast)',
@@ -215,12 +291,31 @@ def run_layer1(rdw, swt, cases, only):
         if only and only not in c['group'] and only not in c['name']:
             continue
         if c['group'].startswith('doubao'):
-            hit, score = eval_doubao(rdw, c['path'])
+            hit, score, box = eval_doubao(rdw, c['path'])
+            ok = hit == (c['expect'] == 'hit')
             detail = f'tmpl score {score:.1f}'
-        else:
-            iou = eval_synth(rdw, swt, c['img'], c['real'], c['any_position'])
-            hit = iou > 0.3
-            detail = f'max IoU {iou:.2f}'
+            gold = c.get('golden') or {}
+            gt = gold.get('tmpl')
+            if gt is not None:
+                tol = max(3.0, 0.25 * float(gt))
+                if abs(score - float(gt)) > tol:
+                    ok = False
+                    detail += f' OUT-OF-GOLDEN {float(gt):.1f}±{tol:.1f}'
+                else:
+                    detail += f' (golden {float(gt):.1f})'
+            gb = gold.get('box')
+            if gb and box:
+                if swt.iou(box, gb) < 0.5:
+                    ok = False
+                    detail += f' box moved {box} vs golden {gb}'
+            elif gb and not box:
+                ok = False
+                detail += f' box missing (golden {gb})'
+            rows.append((c, ok, detail))
+            continue
+        iou = eval_synth(rdw, swt, c['img'], c['real'], c['any_position'])
+        hit = iou > 0.3
+        detail = f'max IoU {iou:.2f}'
         rows.append((c, hit == (c['expect'] == 'hit'), detail))
     return rows
 
@@ -1011,18 +1106,84 @@ def run_detect_floor_checks(rdw, only):
     return rows
 
 
+def run_fixture_checks(rdw, only):
+    """固化 fixtures 完整性（CI 可跑、不依赖 dist/根目录）：入库的 original/processed
+    fixture 必须与 manifest 的 md5 一致——任何"换图/改图"在此**显式红灯**，而不是让回归
+    基线悄悄漂移（"换一张图就要重修老图"的根因）。同时汇报覆盖率。"""
+    rows = []
+    if only and 'fixtures' not in only:
+        return rows
+    manifest = load_manifest()
+    if not manifest.get('originals'):
+        return rows
+    bad = []
+    for kind in ('original', 'processed'):
+        for name, entry in sorted(manifest.get(kind, {}).items()):
+            fx = FIXTURE_IMAGES / kind / name
+            if fx.exists() and entry.get('md5') and md5(fx) != entry['md5']:
+                bad.append(f'{kind}/{name}')
+    n_orig = len(list((FIXTURE_IMAGES / 'original').glob('*.png'))) if (FIXTURE_IMAGES / 'original').exists() else 0
+    n_proc = len(list((FIXTURE_IMAGES / 'processed').glob('*.png'))) if (FIXTURE_IMAGES / 'processed').exists() else 0
+    rows.append(({'group': 'fixtures', 'name': 'committed fixtures match manifest md5', 'expect': 'ok'},
+                 not bad,
+                 ('mismatch: ' + ','.join(bad)) if bad
+                 else f'committed originals={n_orig} processed={n_proc} '
+                      f'(manifest originals={len(manifest["originals"])} processed={len(manifest["processed"])})'))
+    return rows
+
+
+def update_golden(rdw):
+    """重算并写入 tests/fixtures/manifest.json，并把精选子集拷入 tests/fixtures/images/。
+    **只在确认检测行为变更是有意为之**时运行；随后的 git diff 即审计记录。"""
+    (FIXTURE_IMAGES / 'original').mkdir(parents=True, exist_ok=True)
+    (FIXTURE_IMAGES / 'processed').mkdir(parents=True, exist_ok=True)
+
+    def _key(p):
+        return (0, int(p.stem)) if p.stem.isdigit() else (1, p.stem)
+
+    originals = {}
+    for p in sorted(DIST.glob('*.png'), key=_key):
+        originals[p.name] = {**probe(rdw, p), 'doubao': p.name not in NON_DOUBAO_DIST}
+    processed = {}
+    for p in sorted(ROOT.glob('*.png'), key=_key):
+        ref = DIST / p.name
+        if ref.exists() and md5(p) != md5(ref):
+            processed[p.name] = probe(rdw, p)
+    for name in FIXTURE_CORE_ORIGINALS:
+        if name in originals:
+            copyfile(DIST / name, FIXTURE_IMAGES / 'original' / name)
+    for name in FIXTURE_CORE_PROCESSED:
+        if name in processed:
+            copyfile(ROOT / name, FIXTURE_IMAGES / 'processed' / name)
+    FIXTURE_MANIFEST.write_text(json.dumps({
+        'version': FIXTURE_VERSION,
+        'note': '固化回归基线：md5 校验杜绝"换图"静默漂移；--update-golden 显式重算',
+        'originals': originals,
+        'processed': processed,
+    }, ensure_ascii=False, indent=1) + '\n')
+    print(f'wrote {FIXTURE_MANIFEST}: originals={len(originals)} processed={len(processed)} '
+          f'committed originals={len(FIXTURE_CORE_ORIGINALS)} processed={len(FIXTURE_CORE_PROCESSED)}')
+
+
 def main():
     ap = argparse.ArgumentParser(description='watermark processing regression corpus')
     ap.add_argument('--e2e', action='store_true', help='also run full pipeline + result verification (slow)')
     ap.add_argument('--model', default='lama', choices=['mat', 'lama'], help='model for --e2e (default lama)')
     ap.add_argument('--only', help='filter by group or name substring')
+    ap.add_argument('--update-golden', action='store_true',
+                    help='重算 tests/fixtures/manifest.json 并拷入库精选子集（确认基线变更有意为之才跑）')
     args = ap.parse_args()
 
     import remove_doubao_watermark as rdw
     import synthetic_watermark_test as swt
 
+    if args.update_golden:
+        update_golden(rdw)
+        return
+
     cases = build_cases(rdw, swt)
-    rows = run_layer1(rdw, swt, cases, args.only)
+    rows = run_fixture_checks(rdw, args.only)
+    rows += run_layer1(rdw, swt, cases, args.only)
     rows += run_stamp_checks(rdw, args.only)
     rows += run_verify_checks(rdw, args.only)
     rows += run_lowcontrast_check(rdw, args.only)

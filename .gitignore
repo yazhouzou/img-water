@@ -6,6 +6,7 @@
 !tools/doubao-wm-stamp-alpha.png
 !tools/doubao-wm-stamp-color.png
 !tools/watermarks/**/*.png
+!tests/fixtures/images/**/*.png
 .img-inpaint-venv/
 original-watermark-backup/
 __pycache__/

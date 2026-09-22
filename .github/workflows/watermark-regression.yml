@@ -8,10 +8,12 @@ on:
     branches: [main]
     paths:
       - 'tools/**'
+      - 'tests/**'
       - '.github/workflows/watermark-regression.yml'
   pull_request:
     paths:
       - 'tools/**'
+      - 'tests/**'
       - '.github/workflows/watermark-regression.yml'
   workflow_dispatch:
 
