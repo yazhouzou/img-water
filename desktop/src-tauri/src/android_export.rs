@@ -45,6 +45,26 @@ where
         .map_err(|_| "Android 操作超时".to_string())?
 }
 
+/// 同步系统栏（状态栏/导航栏）图标深浅：`dark = true` 表示 App 处于深色主题，
+/// 图标应为浅色（`isAppearanceLight* = false`）。
+#[cfg(target_os = "android")]
+pub fn set_system_bar_appearance(window: &tauri::WebviewWindow, dark: bool) -> Result<(), String> {
+    on_activity(window, move |env, activity| {
+        env.call_method(
+            activity,
+            "setSystemBarAppearance",
+            "(Z)V",
+            &[jni::objects::JValue::Bool(dark as u8)],
+        )
+        .map_err(|e| e.to_string())?;
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+            return Err("设置系统栏外观失败".to_string());
+        }
+        Ok(())
+    })
+}
+
 /// 逐张写入系统相册，返回成功的张数。
 #[cfg(target_os = "android")]
 pub fn export_to_gallery(window: &tauri::WebviewWindow, paths: &[String]) -> Result<usize, String> {

@@ -56,7 +56,7 @@ jobs:
           if [ ! -d src-tauri/gen/android ]; then
             pnpm tauri android init 2>&1 | tee init.log
           fi
-          pnpm tauri icon icon-source.png 2>&1 | tee icon.log
+          pnpm tauri icon icon.json 2>&1 | tee icon.log
 
       - name: Init error summary
         if: failure()

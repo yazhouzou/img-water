@@ -21,6 +21,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONF="$ROOT/desktop/src-tauri/tauri.conf.json"
 DIST="$ROOT/dist"
 VERSION="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$CONF" | head -n 1)"
+# Tauri 按 productName 命名产物（注意不是 .app 内可执行文件名）
+PRODUCT="$(sed -n 's/.*"productName": *"\([^"]*\)".*/\1/p' "$CONF" | head -n 1)"
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 REMOTE=""
@@ -58,13 +60,17 @@ build_mac() {
   [[ "$OS" == Darwin ]] || die "macOS 打包需要在 macOS 上执行"
   "$ROOT/desktop/build.sh"
   local dmg_dir="$ROOT/desktop/src-tauri/target/release/bundle/dmg"
-  local x64="$dmg_dir/doubao-watermark-remover_${VERSION}_x64.dmg"
-  local arm="$dmg_dir/doubao-watermark-remover_${VERSION}_aarch64.dmg"
+  local x64="$dmg_dir/${PRODUCT}_${VERSION}_x64.dmg"
+  local arm="$dmg_dir/${PRODUCT}_${VERSION}_aarch64.dmg"
   if [[ "$ARCH" == arm64 && -f "$x64" ]]; then
     mv -f "$x64" "$arm"
   fi
   local dmg="$arm"
   [[ -f "$dmg" ]] || dmg="$x64"
+  if [[ ! -f "$dmg" ]]; then
+    # 命名兜底：Tauri 版本差异可能改变后缀，取版本号匹配的最新 dmg
+    dmg="$(ls -t "$dmg_dir"/*_"$VERSION"_*.dmg 2>/dev/null | head -n 1 || true)"
+  fi
   [[ -f "$dmg" ]] || die "未找到 DMG 产物: $dmg_dir"
   verify_mac_signing "$dmg"
   mkdir -p "$DIST"

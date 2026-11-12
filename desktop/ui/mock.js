@@ -12,6 +12,7 @@
 
   const handlers = {};
   const FAKE_PNGS = ['1.png', '2.png', '3.png', '4.png', '5.png'];
+  let mockNames = FAKE_PNGS.slice(); // 当前导入批（list_pngs/import/remove/clear 共用）
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const noModel = new URLSearchParams(location.search).get('nomodel') === '1';
 
@@ -28,16 +29,17 @@
   }
 
   async function fakeRun() {
+    const names = mockNames.length > 0 ? mockNames.slice() : FAKE_PNGS.slice();
     const lines = [
-      '[Start] processing ' + FAKE_PNGS.length + ' file(s)… (mock)',
+      '[Start] processing ' + names.length + ' file(s)… (mock)',
       'source review: /tmp/mock/source.png',
       'final review: /tmp/mock/final.png',
     ];
-    for (let i = 0; i < FAKE_PNGS.length; i++) {
+    for (let i = 0; i < names.length; i++) {
       await sleep(600);
-      emit('pipeline-progress', { stage: 'inpaint', done: i, total: FAKE_PNGS.length, name: FAKE_PNGS[i] });
-      emit('pipeline-log', 'inpainting ' + FAKE_PNGS[i] + '... (mock)');
-      emit('pipeline-progress', { stage: 'inpaint', done: i + 1, total: FAKE_PNGS.length, name: FAKE_PNGS[i] });
+      emit('pipeline-progress', { stage: 'inpaint', done: i, total: names.length, name: names[i] });
+      emit('pipeline-log', 'inpainting ' + names[i] + '... (mock)');
+      emit('pipeline-progress', { stage: 'inpaint', done: i + 1, total: names.length, name: names[i] });
     }
     for (const line of lines) {
       await sleep(300);
@@ -46,10 +48,10 @@
     emit('pipeline-exit', {
       code: 0,
       success: true,
-      processed: FAKE_PNGS.length,
+      processed: names.length,
       overwritten: false,
       outputDir: '/mock/Pictures/watermark/watermark-cleaned',
-      outputs: FAKE_PNGS.map((n) => '/mock/Pictures/watermark/watermark-cleaned/' + n),
+      outputs: names.map((n) => '/mock/Pictures/watermark/watermark-cleaned/' + n),
     });
   }
 
@@ -70,9 +72,55 @@
           hint: noModel ? '(mock) inpainting model not downloaded' : '',
         });
       case 'list_pngs':
-        return Promise.resolve(FAKE_PNGS);
-      case 'import_files':
-        return Promise.resolve({ dir: '(mock) /storage/emulated/0/Imported' });
+        return Promise.resolve(mockNames.slice());
+      case 'pick_images':
+        // Android 相册 Picker：真实端为 fire-and-forget，结果经全局回调异步回传
+        setTimeout(() => {
+          if (typeof window.__onAndroidPickResult === 'function') {
+            window.__onAndroidPickResult([
+              '/mock/DCIM/IMG_0001.jpg',
+              '/mock/DCIM/IMG_0002.png',
+              '/mock/DCIM/IMG_0003.jpg',
+            ]);
+          }
+        }, 400);
+        return Promise.resolve();
+      case 'rebuild_webview':
+        // 移动端真机：重建 WebView（ColorOS 从 picker 返回后触摸卡死的修复）；浏览器预览 no-op
+        return Promise.resolve();
+      case 'remove_import_file': {
+        const rmName = args && args.name;
+        mockNames = mockNames.filter((n) => n !== rmName);
+        return Promise.resolve(mockNames.length);
+      }
+      case 'clear_import_batch': {
+        const n = mockNames.length;
+        mockNames = [];
+        return Promise.resolve(n);
+      }
+      case 'import_files': {
+        const paths = (args && args.paths) || [];
+        if (!(args && args.dir)) mockNames = []; // 非追加 = 换批
+        return (async () => {
+          const names = [];
+          const skipped = [];
+          for (let i = 0; i < paths.length; i++) {
+            await sleep(200);
+            const base = String(paths[i]).split('/').pop() || 'image-' + i + '.png';
+            if (/heic/i.test(base)) {
+              skipped.push(base + ' 不是支持的图片格式（可能是 HEIC）');
+            } else {
+              names.push(base.replace(/\.\w+$/, '') + '.png');
+            }
+            emit('import-progress', { done: i + 1, total: paths.length });
+          }
+          mockNames = mockNames.concat(names);
+          return { dir: '/mock/import/import-1', names, skipped, total: mockNames.length };
+        })();
+      }
+      case 'set_system_bars':
+        // 浏览器预览没有系统栏；真实端由 MainActivity 同步图标深浅
+        return Promise.resolve();
       case 'read_image_base64':
         return new Promise((resolve) =>
           setTimeout(

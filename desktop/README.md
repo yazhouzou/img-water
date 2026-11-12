@@ -46,7 +46,8 @@ Rust 内核与流水线可直接交叉编译到 Android（Tauri v2 mobile），�
 ```bash
 cd desktop
 pnpm install
-pnpm tauri dev
+pnpm dev        # = dev.sh：先清掉 ~/.zshrc 旧 MacPorts 变量再 pnpm tauri dev
+pnpm tauri dev  # 原始命令；本机 ~/.zshrc 的 CFLAGS/DEPLOYMENT_TARGET 会破坏编译
 ```
 
 ## 构建
@@ -56,7 +57,7 @@ pnpm tauri dev
 cd desktop && pnpm tauri build  # 等价原始命令；但本机 ~/.zshrc 的 CFLAGS 会破坏构建
 ```
 
-原因：`~/.zshrc` 中的 `CFLAGS=-arch i386 -arch x86_64` 和 `MACOSX_DEPLOYMENT_TARGET=10.6`（旧 MacPorts 配置）会让 `objc2-exception-helper` 编译出错误架构的 fat 静态库导致构建失败。`build.sh` 已自动 `unset` 这些变量。
+原因：`~/.zshrc` 中的 `CFLAGS=-arch i386 -arch x86_64` 和 `MACOSX_DEPLOYMENT_TARGET=10.6`（旧 MacPorts 配置）会让 `objc2-exception-helper`/`mac-notification-sys` 编译出错误架构的产物导致构建失败。`build.sh`（构建）与 `dev.sh`（调试）都已自动 `unset` 这些变量。
 
 macOS Intel 版本：
 
@@ -99,7 +100,7 @@ tools/package-app.sh both --remote user@host --win-repo 'C:/code/remove_watermar
    ```
 
    `build.ps1` 会自动检查 node/cargo/pnpm/VS C++ 工作负载（pnpm 缺失时尝试 corepack 启用），然后 `pnpm install && pnpm tauri build`。Windows 下只出 NSIS 安装包（`tauri.windows.conf.json` 覆盖，避免 MSI 需在线下载 WiX 工具链导致失败）。
-3. 产物：`src-tauri\target\release\bundle\nsis\doubao-watermark-remover_0.1.0_x64-setup.exe`
+3. 产物：`src-tauri\target\release\bundle\nsis\watermark-cleaner_<版本>_x64-setup.exe`
 4. 分发时连同仓库一起给目标用户（小安装包 + 在线初始化运行时依赖）；目标机器运行应用后点“一键初始化修复环境”即可（需 Python 3.10+，脚本会自动创建 venv 并走国内 PyPI 镜像下载依赖和 LaMa 模型）
 
 ## 分发注意事项（当前里程碑）

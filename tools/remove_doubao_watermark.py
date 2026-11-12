@@ -223,7 +223,7 @@ def _template_response(gray, width, height, with_tophat=False):
     return combined, th_t, tw_t
 
 
-def template_stroke_mask(gray, width, height, model='mat', source='alpha'):
+def template_stroke_mask(gray, width, height, model='mat', source='alpha', box_out=None):
     """在右下角窗口内用模板做 gap-score 匹配（0/1 模板核取 S_in、全 1 核取窗口和，
     gap = S_in/N_in − S_out/N_out），返回 (mask_uint8, score, info)。
     模板按图片短边比例缩放（豆包水印随短边等比）。
@@ -234,7 +234,10 @@ def template_stroke_mask(gray, width, height, model='mat', source='alpha'):
       'footprint'——含暗描边的完整 stamp footprint。低对比背景（纸面/木纹）用它防
         "亮字 mask 盖不住暗描边 → MAT 留暗字形残影"；但它会圈进水印周围的高频纹理
         （花枝/花瓣），重绘时被抹平，故**只在结果确实残留时**由 _footprint_retry 升级。
-    分数低于阈值返回 (None, score, info) 交给整框检测回退。"""
+    分数低于阈值返回 (None, score, info) 交给整框检测回退。
+
+    box_out：可选 list，命中时 append 模板**画布**框 (x, y, w, h)——真实水印范围以
+    画布为准（笔画 α 只盖字形中部，--overlap-text 分层还原需要完整框定区域）。"""
     try:
         import cv2
         import numpy as np
@@ -286,6 +289,8 @@ def template_stroke_mask(gray, width, height, model='mat', source='alpha'):
                       cv2.getStructuringElement(cv2.MORPH_RECT, TEMPLATE_STROKE_DILATE), 1)
     full = np.zeros((height, width), np.uint8)
     full[py:py + th_t, px:px + tw_t] = mask * 255
+    if box_out is not None:
+        box_out.append((px, py, tw_t, th_t))
     return full, score, f'template matched at ({px},{py}) score {score:.1f} ({how})'
 
 
@@ -1141,6 +1146,22 @@ def _md5(path):
     return h.hexdigest()
 
 
+def _write_lbox(name, boxes):
+    """记录水印的完整外接框（检测框 / 模板画布并集）到 <name>.lbox，供 --overlap-text
+    分层还原定区域：mask 的语义是"污染像素"（模板 α 只盖字形中部），真实水印范围以
+    检测框/画布为准——分层还原若按 mask bbox 取区域会漏掉字形上下缘（8.png 实测：
+    α 笔画框 254x79，真实水印 307x102，残留 score 45.1 卡在 FAIL）。"""
+    boxes = [b for b in (boxes or []) if b is not None]
+    if not boxes:
+        return
+    x1 = int(min(b[0] for b in boxes))
+    y1 = int(min(b[1] for b in boxes))
+    x2 = int(max(b[2] for b in boxes))
+    y2 = int(max(b[3] for b in boxes))
+    (MASKS / f'{name}.lbox').write_text(json.dumps([x1, y1, x2, y2]))
+
+
+
 def prepare(names, custom_box, root, emit=True, model='mat', refine=False,
             any_position=False, use_profile=True):
     if WORK.exists():
@@ -1197,16 +1218,22 @@ def prepare(names, custom_box, root, emit=True, model='mat', refine=False,
                         print(f'{name}: profile {profile.id} matched at ({px},{py}) '
                               f'score {score:.1f} -> alpha mask + inverse')
                         continue
-            tpl_mask, tpl_score, tpl_info = template_stroke_mask(gray, width, height, model)
+            tpl_box = []
+            tpl_mask, tpl_score, tpl_info = template_stroke_mask(gray, width, height, model,
+                                                                 box_out=tpl_box)
             if tpl_mask is not None:
                 # 模板笔画 mask：精确贴笔画+小膨胀，复杂背景（书本/花丛）
                 # 也不会整块重绘
                 mask = Image.fromarray(tpl_mask)
                 (MASKS / f'{name}.tpl').write_text('')
+                canvas = ([tpl_box[0][0], tpl_box[0][1],
+                           tpl_box[0][0] + tpl_box[0][2], tpl_box[0][1] + tpl_box[0][3]]
+                          if tpl_box else [])
                 print(f'{name}: template mask ({tpl_info})')
                 if not any_position:
                     # 默认模式只处理贴右下角的豆包水印，模板命中即完成
                     mask.save(MASKS / name)
+                    _write_lbox(name, [canvas] if canvas else [])
                     continue
                 # any_position：模板与其它位置检测叠加——DBNet 检出的右下角
                 # 豆包水印框与模板重叠时丢弃，避免重复修复
@@ -1219,6 +1246,7 @@ def prepare(names, custom_box, root, emit=True, model='mat', refine=False,
                     for box in boxes:
                         draw.rounded_rectangle(box, radius=4, fill=255)
                 mask.save(MASKS / name)
+                _write_lbox(name, ([canvas] if canvas else []) + list(boxes))
                 continue
             with Image.open(backup) as probe:
                 boxes = detect_watermark_boxes(probe, extended=any_position)
@@ -1262,8 +1290,32 @@ def prepare(names, custom_box, root, emit=True, model='mat', refine=False,
                     draw.rounded_rectangle(box, radius=4, fill=255)
                 reason = 'refine failed' if refine else 'refine disabled'
                 print(f'{name}: {reason}, fallback to full box mask ({len(boxes)} box(es))')
+        if boxes and not (MASKS / f'{name}.lbox').exists():
+            _write_lbox(name, boxes)
         # skipped 也保存空 mask：inpaint 据此透传原图，不进模型
         mask.save(MASKS / name)
+
+    # 压字水印提示：mask 内深色像素占比高 → 水印很可能压在文字/线条上，普通生成式
+    # 修补会抹字/糊边。只提示不改流程（对齐 AGENTS.md "新增能力不影响默认行为"）。
+    import numpy as np
+    hinted = []
+    for name in names:
+        mask_path = MASKS / name
+        if not mask_path.exists():
+            continue
+        with Image.open(mask_path) as probe:
+            m = np.asarray(probe.convert('L')) > 0
+        if not m.any():
+            continue
+        with Image.open(SOURCE / name) as probe:
+            gray = np.asarray(probe.convert('RGB')).astype(np.float32).mean(axis=2)
+        frac = float((gray[m] < OVERLAP_TEXT_DARK).mean())
+        if frac >= OVERLAP_HINT_DARK_FRACTION:
+            hinted.append(f'{name} ({frac * 100:.0f}% dark)')
+    if hinted:
+        print(f'note: watermark mask overlaps dark content on {", ".join(hinted)} — '
+              f'if the watermark sits on text or lines, re-run inpaint with '
+              f'--overlap-text (layered restore keeps content, rebuilds background)')
 
     MANIFEST.write_text(json.dumps(manifest))
     output = REVIEW / 'source-corner-review.png'
@@ -1394,8 +1446,12 @@ def verify_repaired(name, root):
     # 逆解已采用的图不做模板残留判据：gap-score 是为"亮于背景的笔画"设计的，对逆解
     # 恢复的真实纹理（同样有高频结构）会误报 WARN/FAIL，而逆解正确性已由结果择优把关
     # （inverse 残留 <20 且 ≤ MAT×1.75 才采用）。mask 外零改动等检查仍照常。
+    # 分层还原（.layered）同理跳过：它有意保留内容像素（文字/线条），而该场景模板
+    # gap-score 往往由**文字**驱动（8.png 实测：把文字涂成背景色后锚点分 48.9→0.0）——
+    # 残留判据测到的是被保留的文字而非水印，属假 FAIL。
     tpl_applied = ((MASKS / f'{name}.tpl').exists()
-                   and not (MASKS / f'{name}.inv').exists())
+                   and not (MASKS / f'{name}.inv').exists()
+                   and not (MASKS / f'{name}.layered').exists())
     return verify_paths(orig, LAMA / name, MASKS / name, template_applied=tpl_applied)
 
 
@@ -1834,8 +1890,165 @@ def _footprint_retry(names, model, skip=()):
             print(f'{name}: after footprint retry tmpl {score:.1f}')
 
 
+# ---------------------------------------------------------------------------
+# 压字水印分层还原（--overlap-text，2026-10，7.png 案例）：水印与文字/线条重叠时，
+# 所有"整块修补 / 精确反解"路线都失败——生成式修补（MAT/LaMa/SD）把文字当背景一并
+# 抹掉或糊成灰带（"周边元素被影响"）；模板/stamp 与本图水印失配（corr 0.175）时，
+# 笔画级 mask 盖不住压在文字上的水印下缘，反复残留灰色横带并灰化字缘；TELEA 大区域
+# 填充变"灰墙"、纯物理逆解过冲成"白影"。正解是**分层**，不是修补——把水印框区域拆成：
+#   ① 内容层：深色文字笔画 + 彩色线条，**原样保留**、绝不重绘（生成式修补碰内容即毁）；
+#   ② 背景层（区域内其余像素）：用框上下**干净采样带**逐列中值 + 垂直插值重建，再叠加
+#      **行向光晕校正**（从区域外侧干净参考列逐行求"实际−插值"偏差，捕捉真实边框投影/
+#      渐变；没有它，真实阴影会被抹平成一色）；
+#   ③ 采样带逐列污染检测：带内包含内容/线条的列 → 从两侧干净列**水平插值回退**。防
+#      "橙色边框穿进采样带 → 逐列中值取到橙色 → 沿列把橙色涂抹到整个区域"（V21 实测
+#      事故：残余 cluster [1486,2733] 实为橙色涂抹，不是水印残留）。
+# 适用前提：浅色背景 + 深色文字/彩色线条 + 半透明水印（本案例形态，显式开启）。
+# 只写回区域内的背景层像素；mask 文件同步改写为"实际重绘像素"以对齐 verify 的
+# "mask 外零改动"判据（沿用旧笔画 mask 会把整个重建区误报为越界改动）。
+OVERLAP_TEXT_DARK = 95.0        # 文字笔画核心：lum < 该值视为内容
+OVERLAP_TEXT_DILATE = 3         # 笔画核心外扩 ±1px（保留抗锯齿边缘）
+OVERLAP_LINE_CHROMA = 40.0      # 彩色线条：R−B 超过（背景 R−B 的 p25 + 该值）视为内容
+OVERLAP_LINE_DILATE = 5         # 线条外扩 ±2px
+OVERLAP_REGION_PAD_X = 14       # 处理区水平外扩下限（实际取 max(该值, 框宽/16)）
+OVERLAP_REGION_PAD_Y = 12       # 处理区垂直外扩下限（实际取 max(该值, 框高/10)）
+OVERLAP_BAND_H = 10             # 上下采样带高度
+OVERLAP_BAND_GAP = 12           # 采样带与处理区最小间隔（另加 字高/8，防字形虚边）
+OVERLAP_REF_W = 40              # 行向光晕校正的参考列宽
+OVERLAP_REF_GAP = 6             # 参考列与处理区的间隔
+OVERLAP_GLOW_CLIP = 40.0        # 行向校正逐通道幅度上限
+OVERLAP_HINT_DARK_FRACTION = 0.025  # prepare 提示阈值：mask 内深色像素占比
+
+
+def layered_text_restore(src, wm_mask, region_box=None):
+    """压字水印分层还原核心（见上方常量注释）：src HxWx3、wm_mask HxW 布尔，
+    region_box=[x1,y1,x2,y2] 为水印完整框（检测框/模板画布；缺省退回 mask 包围盒，
+    但模板 α 只盖字形中部会低估真实范围——8.png 实测笔画框 254x79、真实水印 307x102,
+    按 mask bbox 取区域会漏掉上下缘残留）。
+    返回 (out_uint8, rep_mask, info)；采样带不可用时返回 (None, None, reason)。"""
+    import cv2
+    import numpy as np
+    src = np.asarray(src).astype(np.float32)
+    H, W = src.shape[:2]
+    mask = np.asarray(wm_mask) > 0
+    box = None
+    if region_box is not None:
+        bx0, by0, bx1, by1 = (int(v) for v in region_box)
+        if bx1 - bx0 >= 4 and by1 - by0 >= 4:
+            box = (max(0, bx0), max(0, by0), min(W, bx1), min(H, by1))
+    if box is None:
+        ys, xs = np.nonzero(mask)
+        if len(xs) == 0:
+            return None, None, 'empty mask'
+        box = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+    wx0, wy0, wx1, wy1 = box
+    bw, bh = wx1 - wx0, wy1 - wy0
+    # 区域外扩按水印框尺寸比例：检测框/画布通常比真实水印略紧（画布外仍有 ~1-2 成延伸），
+    # 小框给固定下限
+    pad_x = max(OVERLAP_REGION_PAD_X, bw // 16)
+    pad_y = max(OVERLAP_REGION_PAD_Y, bh // 10)
+    gap = OVERLAP_BAND_GAP + bh // 8
+    ry0, ry1 = max(0, wy0 - pad_y), min(H, wy1 + pad_y)
+    rx0, rx1 = max(0, wx0 - pad_x), min(W, wx1 + pad_x)
+    ty0, ty1 = ry0 - gap - OVERLAP_BAND_H, ry0 - gap
+    by0, by1 = ry1 + gap, ry1 + gap + OVERLAP_BAND_H
+    if ty0 < 0:
+        ty0, ty1 = 0, ry0 - 2
+    if by1 > H:
+        by0, by1 = ry1 + 2, H
+    if ty1 - ty0 < 3 or by1 - by0 < 3:
+        return None, None, 'no clean sampling bands near the watermark box'
+    band = np.concatenate([src[ty0:ty1].reshape(-1, 3), src[by0:by1].reshape(-1, 3)])
+    bg_rb = float(np.percentile(band[:, 0] - band[:, 2], 25))
+    line_ref = bg_rb + OVERLAP_LINE_CHROMA
+    pT = np.median(src[ty0:ty1], axis=0)
+    pB = np.median(src[by0:by1], axis=0)
+    bad = ((pT.mean(1) < OVERLAP_TEXT_DARK) | (pT[:, 0] - pT[:, 2] > line_ref)
+           | (pB.mean(1) < OVERLAP_TEXT_DARK) | (pB[:, 0] - pB[:, 2] > line_ref))
+    good = ~bad
+    if not good.any():
+        return None, None, 'sampling bands fully contaminated'
+    for P in (pT, pB):
+        for c in range(3):
+            P[~good, c] = np.interp(np.nonzero(~good)[0], np.nonzero(good)[0], P[good, c])
+    ytop, ybot = (ty0 + ty1 - 1) / 2.0, (by0 + by1 - 1) / 2.0
+    wrow = np.clip((np.arange(H) - ytop) / max(1.0, ybot - ytop), 0, 1)
+    bg = pT[None] * (1 - wrow[:, None, None]) + pB[None] * wrow[:, None, None]
+    lum = src.mean(2)
+    rb = src[:, :, 0] - src[:, :, 2]
+    dark = lum < OVERLAP_TEXT_DARK
+    line = rb > line_ref
+    # 行向光晕校正：区域外侧干净参考列（左右各 3 个滑动候选取有效行最多者）
+    gr = np.zeros((H, 3), np.float32)
+    best_rows = 0
+    for k in range(3):
+        for r0, r1 in ((rx0 - OVERLAP_REF_GAP - OVERLAP_REF_W * (k + 1),
+                        rx0 - OVERLAP_REF_GAP - OVERLAP_REF_W * k),
+                       (rx1 + OVERLAP_REF_GAP + OVERLAP_REF_W * k,
+                        rx1 + OVERLAP_REF_GAP + OVERLAP_REF_W * (k + 1))):
+            r0, r1 = max(0, r0), min(W, r1)
+            if r1 - r0 < 8:
+                continue
+            seg = src[:, r0:r1]
+            valid = (seg.mean(2) >= OVERLAP_TEXT_DARK) & ((seg[:, :, 0] - seg[:, :, 2]) <= line_ref)
+            acc = np.zeros((H, 3), np.float32)
+            rows = 0
+            for y in range(ry0, ry1):
+                rv = valid[y]
+                if rv.sum() < (r1 - r0) * 0.3:
+                    continue
+                acc[y] = np.median(seg[y][rv] - bg[y, r0:r1][rv], axis=0)
+                rows += 1
+            if rows > best_rows:
+                best_rows = rows
+                gr = np.clip(acc, -OVERLAP_GLOW_CLIP, OVERLAP_GLOW_CLIP)
+    keep = cv2.dilate(dark.astype(np.uint8) * 255,
+                      np.ones((OVERLAP_TEXT_DILATE,) * 2, np.uint8)) > 0
+    keep |= cv2.dilate(line.astype(np.uint8) * 255,
+                       np.ones((OVERLAP_LINE_DILATE,) * 2, np.uint8)) > 0
+    region = np.zeros((H, W), bool)
+    region[ry0:ry1, rx0:rx1] = True
+    rep = region & ~keep
+    out = src.copy()
+    out[rep] = (bg + gr[:, None, :])[rep]
+    out8 = np.clip(out, 0, 255).astype(np.uint8)
+    info = (f'region {rx1 - rx0}x{ry1 - ry0}, kept {int((keep & region).sum())}px content, '
+            f'rebuilt {int(rep.sum())}px')
+    return out8, rep, info
+
+
+def restore_overlap_text(name, emit=True):
+    """对工作目录中的一张图做分层还原并写回 LAMA / 改写 mask；
+    False=条件不足，该图交回普通修补路径（保持既有行为）。"""
+    import numpy as np
+    with Image.open(SOURCE / name) as im:
+        src = np.asarray(im.convert('RGB'))
+    with Image.open(MASKS / name) as im:
+        wm_mask = np.asarray(im.convert('L')) > 0
+    region_box = None
+    lbox_path = MASKS / f'{name}.lbox'
+    if lbox_path.exists():
+        try:
+            region_box = json.loads(lbox_path.read_text())
+        except ValueError:
+            region_box = None
+    out, rep, info = layered_text_restore(src, wm_mask, region_box)
+    if out is None:
+        if emit:
+            print(f'{name}: overlap-text unavailable ({info}), keep normal inpainting')
+        return False
+    Image.fromarray(out).save(LAMA / name)
+    Image.fromarray((rep * 255).astype(np.uint8)).save(MASKS / name)
+    # .layered 标记：verify 据此跳过模板残留判据（该场景 gap-score 由被有意保留的
+    # 文字/线条驱动，属假 FAIL；同 .inv 的处理），mask 外零改动等检查仍照常。
+    (MASKS / f'{name}.layered').write_text('')
+    if emit:
+        print(f'{name}: overlap-text layered restore ({info})')
+    return True
+
+
 def inpaint(model='mat', inverse=False, retry=True, use_profile=True, sd=False,
-            sd_threshold=SD_TEXTURE_MIN):
+            sd_threshold=SD_TEXTURE_MIN, overlap_text=False):
     if not IOPAINT.exists():
         raise SystemExit('missing project env; run tools/ensure-inpaint-env.sh (or .ps1 on Windows) first')
     try:
@@ -1845,6 +2058,22 @@ def inpaint(model='mat', inverse=False, retry=True, use_profile=True, sd=False,
     # 注：iopaint 推理时会把 mask 区域的 source 像素置零（MAT/LaMa 均如此，
     # 受控实验输出逐像素相同），任何粗填/预处理都无法影响模型输入——
     # 修复质量完全由 mask 外的上下文决定，mask 精度是唯一杠杆。
+    if overlap_text:
+        # 压字水印分层还原（--overlap-text，显式开启）：不走 iopaint，见上方常量注释。
+        # 成功的图从 SOURCE 移除（后续批量/重试/逆解自然跳过）。
+        restored = []
+        for mask_path in sorted(MASKS.glob('*.png')):
+            name = mask_path.name
+            if (MASKS / f'{name}.wprof').exists():
+                continue  # 档案库逆解优先，不抢注
+            with Image.open(mask_path) as im:
+                if np.asarray(im.convert('L')).max() == 0:
+                    continue  # 空 mask 交下面的透传分支
+            if restore_overlap_text(name):
+                (SOURCE / name).unlink()
+                restored.append(name)
+        if restored:
+            print(f'overlap-text layered restore applied: {", ".join(restored)}')
     # 全部透传后 source 为空：无需进模型，直接结束（避免 iopaint 空目录报错）
     for mask_path in sorted(MASKS.glob('*.png')):
         name = mask_path.name
@@ -1856,7 +2085,10 @@ def inpaint(model='mat', inverse=False, retry=True, use_profile=True, sd=False,
             mask_path.unlink()
             print(f'{name}: empty mask, passed through without inpainting')
     if not any(SOURCE.iterdir()):
-        print('all images passed through: no watermark to remove')
+        if overlap_text and restored:
+            print('all images handled by overlap-text layered restore')
+        else:
+            print('all images passed through: no watermark to remove')
         return
     active_names = [p.name for p in sorted(SOURCE.glob('*.png'), key=numeric_key)]
     # MAT（mask-aware transformer）对结构边界的重建显著优于 LaMa：
@@ -2090,11 +2322,11 @@ def learn_auto(names, root, label, custom_box=None, any_position=False, ref_shor
     print(f'saved profile {profile.id} -> {base}')
 
 
-def run_all(names, custom_box, keep_work, root, model='mat', refine=False, any_position=False, inverse=False, force=False, retry=True, use_profile=True, sd=False, sd_threshold=SD_TEXTURE_MIN):
+def run_all(names, custom_box, keep_work, root, model='mat', refine=False, any_position=False, inverse=False, force=False, retry=True, use_profile=True, sd=False, sd_threshold=SD_TEXTURE_MIN, overlap_text=False):
     prepare(names, custom_box, root, emit=False, model=model, refine=refine,
             any_position=any_position, use_profile=use_profile)
     inpaint(model, inverse=inverse, retry=retry, use_profile=use_profile,
-            sd=sd, sd_threshold=sd_threshold)
+            sd=sd, sd_threshold=sd_threshold, overlap_text=overlap_text)
     candidate_review = review_lama(names, emit=False, root=root)
     final_review, skipped = overwrite_review(names, root, emit=False, force=force)
     skipped_set = set(skipped)
@@ -2209,6 +2441,18 @@ def main():
              'no match -> the normal generative pipeline runs unchanged.',
     )
     parser.add_argument(
+        '--overlap-text',
+        dest='overlap_text',
+        action='store_true',
+        default=False,
+        help='layered restore for watermarks that sit ON TOP of text/lines (e.g. a '
+             'translucent grey logo overlapping a caption): content pixels (dark '
+             'strokes + coloured lines) are kept byte-identical and only the '
+             'background inside the watermark box is rebuilt from the clean bands '
+             'above/below it — no generative inpainting, no grey band left on the '
+             'text. Off by default: the normal generative path is unchanged.',
+    )
+    parser.add_argument(
         '--label',
         help='learn-auto only: human label / profile id for the discovered '
              'watermark, e.g. "qwen" (stored under tools/watermarks/<id>).',
@@ -2242,13 +2486,15 @@ def main():
     if args.command == 'run':
         run_all(names, args.mask_box, args.keep_work, root, args.model, args.refine,
                 args.any_position, args.inverse, force=args.force, retry=args.retry,
-                use_profile=args.profile, sd=args.sd, sd_threshold=args.sd_threshold)
+                use_profile=args.profile, sd=args.sd, sd_threshold=args.sd_threshold,
+                overlap_text=args.overlap_text)
     elif args.command == 'prepare':
         prepare(names, args.mask_box, root, model=args.model, refine=args.refine,
                 any_position=args.any_position, use_profile=args.profile)
     elif args.command == 'inpaint':
         inpaint(args.model, inverse=args.inverse, retry=args.retry, use_profile=args.profile,
-                sd=args.sd, sd_threshold=args.sd_threshold)
+                sd=args.sd, sd_threshold=args.sd_threshold,
+                overlap_text=args.overlap_text)
     elif args.command == 'review-lama':
         review_lama(names, root=root)
     elif args.command == 'overwrite-review':

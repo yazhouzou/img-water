@@ -11,6 +11,9 @@ const EVENT_LOG: &str = "pipeline-log";
 const EVENT_EXIT: &str = "pipeline-exit";
 const EVENT_MODEL_PROGRESS: &str = "model-progress";
 const EVENT_PROGRESS: &str = "pipeline-progress";
+/// 移动端导入相册副本：每张复制完成上报一次（导入几十张大图要数秒~十几秒，
+/// 没有进度用户会以为应用卡死）。
+const EVENT_IMPORT_PROGRESS: &str = "import-progress";
 /// 处理中用户尝试关窗：窗口被拦下，前端提示"任务进行中"。
 const EVENT_QUIT_BLOCKED: &str = "quit-blocked";
 
@@ -488,6 +491,7 @@ fn run_pipeline(
                         "outputs": summary.outputs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
                         "processed": summary.processed,
                         "skipped": summary.skipped.iter().map(|(n, r)| serde_json::json!({ "name": n, "reason": r })).collect::<Vec<_>>(),
+                        "noWatermark": summary.no_watermark,
                         "overwritten": options.overwrite_original,
                     }),
                 );
@@ -619,6 +623,22 @@ fn restore_backup(root: String, lang: Option<String>) -> Result<usize, String> {
     })
 }
 
+/// 移动端系统栏图标外观跟随 App 主题：targetSdk 36 的 edge-to-edge 下状态栏/导航栏
+/// 透明、图标深浅由系统按"系统主题"决定；App 内手动切主题时会与系统主题不一致
+/// （深色 App + 浅色系统 → 深色图标压在深色背景上看不清），故由前端在切换时同步。
+#[tauri::command]
+fn set_system_bars(window: tauri::WebviewWindow, dark: bool) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return crate::android_export::set_system_bar_appearance(&window, dark);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (&window, dark);
+        Ok(())
+    }
+}
+
 #[tauri::command]
 fn cleanup_pipeline(storage: State<'_, AppStorage>, lang: Option<String>) -> Result<(), String> {
     let lang = lang_of(lang);
@@ -652,43 +672,174 @@ fn cleanup_pipeline(storage: State<'_, AppStorage>, lang: Option<String>) -> Res
     pipeline::cleanup_preserved()
 }
 
+/// 追加模式判定：`dir` 只有确属应用私有 imports/ 下的已有批次目录（import-*）才接受，
+/// 防止前端误传任意路径把照片拷进不该去的地方。
+fn resolve_append_dir(base: &std::path::Path, dir: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(dir);
+    if p.parent() != Some(base) {
+        return None;
+    }
+    let name = p.file_name()?.to_string_lossy();
+    if !name.starts_with("import-") || !p.is_dir() {
+        return None;
+    }
+    Some(p)
+}
+
+/// 列出批次目录顶层的 PNG 名（排序，稳定）。用于追加导入的重名去重基准与合并计数；
+/// 不递归，故不会把 watermark-cleaned/ 里的结果算进来。
+fn list_png_names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().is_file())
+                .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+                .filter(|n| n.to_lowercase().ends_with(".png"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+/// 导入图片到应用私有副本目录。`dir` 给定且合法时**追加**到该批次（不清旧图、
+/// 重名加后缀），否则新建批次并替换旧批（移动端处理的是副本，结果走保存到相册）。
 #[tauri::command]
-fn import_files(app: AppHandle, window: tauri::WebviewWindow, paths: Vec<String>, lang: Option<String>) -> Result<ImportResult, String> {
+fn import_files(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    paths: Vec<String>,
+    dir: Option<String>,
+    lang: Option<String>,
+) -> Result<ImportResult, String> {
     let lang = lang_of(lang);
     let base = app
         .path()
         .app_data_dir()
         .map_err(|e| e.to_string())?
         .join("imports");
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_millis();
-    let dir = base.join(format!("import-{}", stamp));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // 换批即替换：删掉上一次导入的副本目录（含其 watermark-cleaned 结果）。否则每次选图
-    // 都往应用私有目录里塞一份照片副本，永久累积且用户无法感知。结果导出走「保存到相册/
-    // 分享」，故这里保留当前这一批即可。
-    if let Ok(entries) = std::fs::read_dir(&base) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let is_old_import = p.file_name()
-                .map(|n| n.to_string_lossy().starts_with("import-"))
-                .unwrap_or(false);
-            if is_old_import && p != dir {
-                let _ = std::fs::remove_dir_all(&p);
+    // 追加模式：dir 必须是 base 下的合法批次目录，否则按未指定处理（新建批次）
+    let append_dir = dir.as_deref().and_then(|d| resolve_append_dir(&base, d));
+    let append = append_dir.is_some();
+    let dir = match append_dir {
+        Some(d) => d,
+        None => {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_millis();
+            let d = base.join(format!("import-{}", stamp));
+            std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+            d
+        }
+    };
+
+    // 重名去重基准：追加模式下必须包含目录里已有的图，否则同名新图会覆盖旧图
+    let mut existing: Vec<String> = if append { list_png_names(&dir) } else { Vec::new() };
+    let total = paths.len();
+    let mut names: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut first_error: Option<String> = None;
+    for (index, raw) in paths.iter().enumerate() {
+        match copy_one(&window, raw, &dir, index, &existing, &lang) {
+            Ok(name) => {
+                existing.push(name.clone());
+                names.push(name);
+            }
+            Err(err) => {
+                // 单张失败（HEIC/权限/超限）只跳过这一张，不拖垮整批——一次误选
+                // 一张 HEIC 就让 29 张好图全部导入失败，会让用户以为应用坏了。
+                // 明细由返回值 skipped 带回前端（日志 + 提示），不在这里重复发日志。
+                if first_error.is_none() {
+                    first_error = Some(err.clone());
+                }
+                skipped.push(err);
+            }
+        }
+        let _ = app.emit(
+            EVENT_IMPORT_PROGRESS,
+            serde_json::json!({ "done": index + 1, "total": total }),
+        );
+    }
+    if names.is_empty() {
+        // 全部失败：新批次清掉空目录、**不碰上一批**（旧批次是用户的当前工作集；
+        // 旧实现在拷贝前就删旧批次，一次导入失败会让界面上的文件列表变成幽灵文件）；
+        // 追加模式则什么都不动，旧批次原样保留。
+        if !append {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        return Err(first_error.unwrap_or_else(|| tr(&lang, "未选择图片", "No images selected")));
+    }
+    if !append {
+        // 换批即替换：**全部拷贝成功之后**才删上一次导入的副本目录（含其 watermark-cleaned
+        // 结果）。否则每次选图都往应用私有目录里塞一份照片副本，永久累积且用户无法感知。
+        // 结果导出走「保存到相册/分享」，故这里保留当前这一批即可。
+        if let Ok(entries) = std::fs::read_dir(&base) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                let is_old_import = p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with("import-"))
+                    .unwrap_or(false);
+                if is_old_import && p != dir {
+                    let _ = std::fs::remove_dir_all(&p);
+                }
             }
         }
     }
-    let mut names: Vec<String> = Vec::new();
-    for (index, raw) in paths.iter().enumerate() {
-        let name = copy_one(&window, raw, &dir, index, &names, &lang)?;
-        names.push(name);
+    Ok(ImportResult {
+        dir: dir.display().to_string(),
+        names,
+        total: existing.len(),
+        skipped,
+    })
+}
+
+/// 导入副本统一用 `.png` 扩展名（替换原扩展名，而不是追加）：处理管线输出恒为 PNG，
+/// 若保留 `.jpg` 名字会出现"名字是 jpg、内容是 PNG"的错配（分享给其它应用可能解码
+/// 失败）；旧实现追加成 `.jpg.png` 也让文件名列表很难看。
+pub(crate) fn to_png_name(name: &str) -> String {
+    let lower = name.to_lowercase();
+    for ext in [".jpg", ".jpeg", ".webp"] {
+        if lower.ends_with(ext) && name.len() > ext.len() {
+            return format!("{}.png", &name[..name.len() - ext.len()]);
+        }
     }
-    if names.is_empty() {
-        return Err(tr(&lang, "未选择图片", "No images selected"));
+    if lower.ends_with(".png") {
+        name.to_string()
+    } else {
+        format!("{}.png", name)
     }
-    Ok(ImportResult { dir: dir.display().to_string(), names })
+}
+
+/// 校验导入文件确实是 PNG/JPEG/WebP（按魔数）。Android 相册里常见的 HEIC/HEIF
+/// 不在 `image` crate 支持范围内，若不在这里拦下，用户会在"开始处理"后才看到
+/// 难以理解的解码失败；且 HEIC 文件被改名为 .png 后更看不出原因。
+fn image_magic_ok(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 12];
+    let n = file.read(&mut head).unwrap_or(0);
+    let h = &head[..n];
+    let png = h.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let jpeg = h.starts_with(&[0xFF, 0xD8, 0xFF]);
+    let webp = h.len() >= 12 && &h[..4] == b"RIFF" && &h[8..12] == b"WEBP";
+    png || jpeg || webp
+}
+
+/// 拷完再验：不符即删文件并给出可读错误（返回的错误文本会进跳过列表/界面日志）。
+fn validate_imported(dir: &std::path::Path, name: String, lang: &str) -> Result<String, String> {
+    if image_magic_ok(&dir.join(&name)) {
+        return Ok(name);
+    }
+    let _ = std::fs::remove_file(dir.join(&name));
+    Err(tr(
+        lang,
+        &format!("{} 不是支持的图片格式（可能是 HEIC），请先在系统相册里导出为 JPEG/PNG 再试", name),
+        &format!("{} is not a supported image format (possibly HEIC). Export it as JPEG/PNG first.", name),
+    ))
 }
 
 fn copy_one(
@@ -702,19 +853,17 @@ fn copy_one(
 ) -> Result<String, String> {
     #[cfg(target_os = "android")]
     if raw.starts_with("content://") {
-        return crate::android_uri::copy_content_uri(window, raw, dir, index, existing);
+        let name = crate::android_uri::copy_content_uri(window, raw, dir, index, existing)?;
+        return validate_imported(dir, name, lang);
     }
     let source = PathBuf::from(raw);
     if !source.is_file() {
         return Err(tr(lang, &format!("文件不存在: {}", raw), &format!("File not found: {}", raw)));
     }
-    let mut name = source
+    let name = source
         .file_name()
-        .map(|n| n.to_string_lossy().to_string())
+        .map(|n| to_png_name(&n.to_string_lossy()))
         .unwrap_or_else(|| format!("image-{}.png", index));
-    if !name.to_lowercase().ends_with(".png") {
-        name.push_str(".png");
-    }
     let final_name = {
         let mut final_name = name.clone();
         let mut n = 1;
@@ -725,20 +874,28 @@ fn copy_one(
         }
         final_name
     };
-    std::fs::copy(&source, dir.join(&final_name)).map_err(|e| {
-        tr(
+    let dest = dir.join(&final_name);
+    if let Err(e) = std::fs::copy(&source, &dest) {
+        // copy 中途失败会留下部分文件，清掉避免污染批次
+        let _ = std::fs::remove_file(&dest);
+        return Err(tr(
             lang,
             &format!("拷贝 {} 失败: {}", final_name, e),
             &format!("Failed to copy {}: {}", final_name, e),
-        )
-    })?;
-    Ok(final_name)
+        ));
+    }
+    validate_imported(dir, final_name, lang)
 }
 
 #[derive(Serialize)]
 struct ImportResult {
     dir: String,
+    /// 本次成功导入（新增）的文件名
     names: Vec<String>,
+    /// 合并后批次内的 PNG 总数（追加模式下 > names.len()）
+    total: usize,
+    /// 无法导入的文件（含原因）：前端提示"N 张被跳过"并在日志里列出明细。
+    skipped: Vec<String>,
 }
 
 /// 预览图：`width`/`height` 是**原图**尺寸（`data_url` 可能是缩小后的预览）。
@@ -909,6 +1066,105 @@ fn write_text_file(path: String, content: String, lang: Option<String>) -> Resul
     })
 }
 
+/// 移动端：调起系统图片选择器（Android 13+ 系统 Photo Picker / 旧版本回退）。
+/// 启动即返回；选择结果由 Kotlin 侧 `evaluateJavascript` 调
+/// `window.__onAndroidPickResult(uris)` 异步回传（与 `__onAndroidBack` 同模式）。
+#[tauri::command]
+fn pick_images(window: tauri::WebviewWindow, max: Option<i32>) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let max = max.unwrap_or(0).clamp(0, 200);
+        return crate::android_pick::pick_images(&window, max);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = (window, max);
+        Err("当前平台不支持系统相册选择器".to_string())
+    }
+}
+
+/// 移动端：重建 WebView，修复从系统 picker 返回后的触摸卡死（ColorOS 12 实测，
+/// 详见 android_pick.rs）。桌面端为 no-op——前端只在移动端 pick 导入完成后调用。
+#[tauri::command]
+fn rebuild_webview(window: tauri::WebviewWindow) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return crate::android_pick::rebuild_webview(&window);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = window;
+        Ok(())
+    }
+}
+
+/// 文件名安全校验：只允许批次目录下的直接子文件名（防路径穿越）。
+fn safe_import_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.starts_with('.')
+        && !name.contains("..")
+}
+
+/// 从当前导入批次中移除单张图片（列表页"移除"用）。文件已不存在时按成功处理（幂等）；
+/// 结果目录（watermark-cleaned）里的旧结果不清理（无引用、随批次一起删除）。
+#[tauri::command]
+fn remove_import_file(
+    app: AppHandle,
+    dir: String,
+    name: String,
+    lang: Option<String>,
+) -> Result<(), String> {
+    let lang = lang_of(lang);
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("imports");
+    let batch = resolve_append_dir(&base, &dir)
+        .ok_or_else(|| tr(&lang, "无效的批次目录", "Invalid batch directory"))?;
+    if !safe_import_name(&name) {
+        return Err(tr(&lang, "无效的文件名", "Invalid file name"));
+    }
+    let path = batch.join(&name);
+    if path.is_file() {
+        std::fs::remove_file(&path).map_err(|e| {
+            tr(
+                &lang,
+                &format!("移除失败: {}", e),
+                &format!("Failed to remove: {}", e),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// 清空当前导入批次（设置页"清除图片"）：删除应用私有 imports/ 下的全部批次目录，
+/// 含各自的结果副本。用户相册原图不受影响（处理的始终是副本）。
+#[tauri::command]
+fn clear_import_batch(app: AppHandle) -> Result<usize, String> {
+    let base = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("imports");
+    let mut removed = 0usize;
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let is_import = p
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with("import-"))
+                .unwrap_or(false);
+            if is_import && std::fs::remove_dir_all(&p).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run_tauri_app() {
     // 移动端 cfg(desktop) 块被编译掉，builder 不再需要 mut
@@ -967,6 +1223,10 @@ pub fn run_tauri_app() {
             set_menu_lang,
             list_pngs,
             import_files,
+            pick_images,
+            rebuild_webview,
+            remove_import_file,
+            clear_import_batch,
             learn_watermark,
             list_watermarks,
             delete_watermark,
@@ -975,6 +1235,7 @@ pub fn run_tauri_app() {
             open_path,
             cleanup_pipeline,
             restore_backup,
+            set_system_bars,
             export_results,
             share_results,
             read_image_base64,
@@ -1019,9 +1280,20 @@ pub fn run_tauri_app() {
                     let _ = window.set_focus();
                     let _ = window.app_handle().emit(EVENT_QUIT_BLOCKED, ());
                 } else {
-                    // 关窗即退出。macOS 默认"关最后一个窗口不退出进程"，会留下一个
-                    // 没有窗口、仍占着 ONNX 模型内存的后台进程（点 Dock 也回不来）。
-                    window.app_handle().exit(0);
+                    // macOS 惯例：关窗只隐藏窗口，App 留在 Dock（点 Dock 图标经
+                    // RunEvent::Reopen 恢复），Cmd+Q / 菜单「退出」才真正结束进程。
+                    // 代价是进程与 ONNX 模型内存常驻，属用户明确选择的标准语义。
+                    #[cfg(target_os = "macos")]
+                    {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                    // Windows/Linux 没有 Reopen 事件，窗口一关就再也回不来，
+                    // 隐藏等于留下无窗口的后台进程，故保持关窗即退出。
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        window.app_handle().exit(0);
+                    }
                 }
             }
         })
@@ -1046,4 +1318,85 @@ pub fn run_tauri_app() {
                 _ => {}
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_png_name_replaces_supported_extensions() {
+        assert_eq!(to_png_name("IMG_0001.jpg"), "IMG_0001.png");
+        assert_eq!(to_png_name("IMG_0001.JPEG"), "IMG_0001.png");
+        assert_eq!(to_png_name("shot.WebP"), "shot.png");
+        assert_eq!(to_png_name("already.png"), "already.png");
+        // 无扩展名/奇怪名字：追加 .png 兜底（扩展名校验交给魔数，不看名字）
+        assert_eq!(to_png_name("noext"), "noext.png");
+        assert_eq!(to_png_name("photo.heic"), "photo.heic.png");
+    }
+
+    #[test]
+    fn image_magic_accepts_supported_rejects_heic_like() {
+        let dir = std::env::temp_dir().join(format!("wm-import-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("a.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0]).unwrap();
+        let jpg = dir.join("b.png");
+        std::fs::write(&jpg, [0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0]).unwrap();
+        let webp = dir.join("c.png");
+        std::fs::write(&webp, *b"RIFF\x00\x00\x00\x00WEBP").unwrap();
+        // HEIC（ftyp box 第三、四字节起）
+        let heic = dir.join("d.png");
+        std::fs::write(&heic, *b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00").unwrap();
+        let empty = dir.join("e.png");
+        std::fs::write(&empty, []).unwrap();
+        assert!(image_magic_ok(&png));
+        assert!(image_magic_ok(&jpg));
+        assert!(image_magic_ok(&webp));
+        assert!(!image_magic_ok(&heic));
+        assert!(!image_magic_ok(&empty));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_dir_only_accepts_owned_batch_dirs() {
+        let base = std::env::temp_dir().join(format!("wm-append-base-{}", std::process::id()));
+        let batch = base.join("import-123");
+        std::fs::create_dir_all(&batch).unwrap();
+        let outside = std::env::temp_dir().join(format!("wm-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        // 合法：base 下的 import-* 目录
+        assert_eq!(resolve_append_dir(&base, batch.to_str().unwrap()), Some(batch.clone()));
+        // 非法：目录不存在 / 名字不是 import-* / 非 base 直属（防目录穿越）
+        assert!(resolve_append_dir(&base, base.join("import-404").to_str().unwrap()).is_none());
+        assert!(resolve_append_dir(&base, base.join("evil").to_str().unwrap()).is_none());
+        assert!(resolve_append_dir(&base, outside.to_str().unwrap()).is_none());
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn safe_import_name_rejects_traversal() {
+        assert!(safe_import_name("IMG_0001.png"));
+        assert!(safe_import_name("a b-c.png"));
+        assert!(!safe_import_name("../evil.png"));
+        assert!(!safe_import_name("a/b.png"));
+        assert!(!safe_import_name("a\\b.png"));
+        assert!(!safe_import_name(".hidden"));
+        assert!(!safe_import_name(""));
+    }
+
+    #[test]
+    fn list_png_names_only_top_level_png_sorted() {
+        let dir = std::env::temp_dir().join(format!("wm-list-png-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("watermark-cleaned")).unwrap();
+        std::fs::write(dir.join("b.png"), []).unwrap();
+        std::fs::write(dir.join("a.PNG"), []).unwrap();
+        std::fs::write(dir.join("note.txt"), []).unwrap();
+        std::fs::write(dir.join("c.png.tpl"), []).unwrap();
+        std::fs::write(dir.join("watermark-cleaned/out.png"), []).unwrap();
+        let names = list_png_names(&dir);
+        assert_eq!(names, vec!["a.PNG".to_string(), "b.png".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

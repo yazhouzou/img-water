@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.5.6",
   "scripts": {
+    "dev": "bash dev.sh",
     "tauri": "tauri"
   },
   "devDependencies": {

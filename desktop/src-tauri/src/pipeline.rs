@@ -2414,6 +2414,9 @@ pub struct FinalizeOutcome {
     /// 真正落盘的文件名（顺序同 names，已剔除被跳过的）。
     pub written: Vec<String>,
     pub skipped: Vec<Skipped>,
+    /// 未检测到水印（mask 为空、原样透传）的图——App 端用于提示"这几张没改动"，
+    /// 避免用户误以为"去水印失败"或"处理完成"却看不出实际未处理。
+    pub no_watermark: Vec<String>,
 }
 
 pub fn finalize_outputs(
@@ -2431,6 +2434,7 @@ pub fn finalize_outputs(
     // FAIL 就整批拒绝、一张都不写）。WARN 只提示。`--force` 跳过自检、全部照写。
     let mut written: Vec<String> = Vec::new();
     let mut skipped: Vec<Skipped> = Vec::new();
+    let mut no_watermark: Vec<String> = Vec::new();
     let backup_root = backup_dir(&options.root);
     let mut webp_noted = false;
     for name in names {
@@ -2450,6 +2454,9 @@ pub fn finalize_outputs(
                         reasons: report.reasons.clone(),
                     });
                     continue;
+                }
+                if report.passthrough {
+                    no_watermark.push(name.clone());
                 }
             }
         }
@@ -2504,6 +2511,7 @@ pub fn finalize_outputs(
         review: output,
         written,
         skipped,
+        no_watermark,
     })
 }
 
@@ -2607,6 +2615,8 @@ pub struct RunSummary {
     pub outputs: Vec<PathBuf>,
     /// (文件名, 原因) —— 未过自检被跳过、保留原图的图。
     pub skipped: Vec<(String, String)>,
+    /// 未检测到水印（mask 为空、原样输出）的图。
+    pub no_watermark: Vec<String>,
 }
 
 pub fn run(
@@ -2621,7 +2631,12 @@ pub fn run(
     if is_cancelled() {
         return Err(CANCELLED.to_string());
     }
+    // 阶段级进度：此前只有 inpaint 内部报进度，准备/保存阶段进度条一直停在 0%，
+    // 单图长推理期间看不出"正在进行"。补齐 prepare/save 两端的事件。
+    let total = names.len();
+    progress("prepare", 0, total, "");
     prepare(options, &names, log)?;
+    progress("prepare", total, total, "");
     let (_, _, _, review_dir) = work_dirs();
     let source_review = review_dir.join("source-corner-review.png");
     inpaint(model_path, options.inverse, log, progress, is_cancelled)?;
@@ -2633,9 +2648,12 @@ pub fn run(
         residual_retry(options, &names, model_path, log)?;
     }
     let candidate_review = review_lama(&names, &options.root)?;
+    progress("save", 0, 1, "");
     let outcome = finalize_outputs(options, &names, log)?;
+    progress("save", 1, 1, "");
     let final_review = outcome.review;
     let output_dir_path = output_dir(options);
+    let no_watermark = outcome.no_watermark.clone();
     let outputs: Vec<PathBuf> = outcome
         .written
         .iter()
@@ -2658,6 +2676,7 @@ pub fn run(
             output_dir: output_dir_path,
             outputs,
             skipped,
+            no_watermark,
         });
     }
     let (source_review, candidate_review, final_review) =
@@ -2688,6 +2707,7 @@ pub fn run(
         output_dir: output_dir_path,
         outputs,
         skipped,
+        no_watermark,
     })
 }
 

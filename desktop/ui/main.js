@@ -80,10 +80,29 @@ const els = {
   lightboxPrev: document.getElementById('lightbox-prev'),
   lightboxNext: document.getElementById('lightbox-next'),
   lightboxCounter: document.getElementById('lightbox-counter'),
+  toastRoot: document.getElementById('toast-root'),
+  // 移动端 App 化界面（v0.6）
+  btnSettings: document.getElementById('btn-settings'),
+  btnBackList: document.getElementById('btn-back-list'),
+  btnTheme: document.getElementById('btn-theme'),
+  btnLang: document.getElementById('btn-lang'),
+  mRun: document.getElementById('m-run'),
+  mRunRingFg: document.getElementById('m-run-ring-fg'),
+  mRunCount: document.getElementById('m-run-count'),
+  mRunStage: document.getElementById('m-run-stage'),
+  mRunName: document.getElementById('m-run-name'),
+  mRunCancel: document.getElementById('m-run-cancel'),
+  mSettings: document.getElementById('m-settings'),
+  mSettingsBack: document.getElementById('m-settings-back'),
+  mSettingsOptions: document.getElementById('m-settings-options'),
+  mThemeSeg: document.getElementById('m-theme-seg'),
+  mLangSeg: document.getElementById('m-lang-seg'),
+  mClearBatch: document.getElementById('m-clear-batch'),
 };
 
 let targetRoot = null;
 let running = false;
+let importing = false;
 let taskKind = null;
 let lastRunCount = 0;
 let lastModelPath = null;
@@ -99,6 +118,8 @@ const isMobile =
 function setState(state) {
   document.body.classList.remove('state-empty', 'state-picked', 'state-running', 'state-done');
   document.body.classList.add('state-' + state);
+  // 移动端结果页顶栏的「返回列表」只在结果页出现（桌面端始终隐藏）
+  els.btnBackList.hidden = !(isMobile && state === 'done');
 }
 
 function setRunning(value) {
@@ -109,17 +130,33 @@ function setRunning(value) {
   els.btnCancel.hidden = !value;
   els.btnPick.disabled = value;
   els.btnSetup.disabled = value;
+  els.btnRefresh.disabled = value || !targetRoot;
   els.btnMask.disabled = value || !targetRoot;
   els.btnLearn.disabled = value;
   els.btnProfileDelete.disabled = value;
+  els.btnSettings.disabled = value;
   els.runProgress.hidden = !value;
+  // 处理中锁定文件勾选：改选择只会让"开始处理（N）"与本次任务对不上，徒增困惑
+  const checkboxes = els.fileList.querySelectorAll('input[type=checkbox]');
+  checkboxes.forEach((el) => { el.disabled = value; });
+  els.btnSelectAll.disabled = value || checkboxes.length === 0;
+  els.btnSelectNone.disabled = value || checkboxes.length === 0;
   if (!value) {
     els.runProgressBar.style.width = '0%';
     els.runProgressText.textContent = '';
+  } else if (isMobile) {
+    // 移动端全屏进度页复位（等第一个 pipeline-progress 事件填充）
+    els.mRunRingFg.style.strokeDashoffset = String(RUN_RING_LEN);
+    els.mRunCount.textContent = '0/0';
+    els.mRunStage.textContent = t('runPrep');
+    els.mRunName.textContent = '';
   }
 }
 
 function overwriteMode() {
+  // 移动端处理的始终是导入到应用私有目录的副本，"替换原图"只会误导用户
+  // （相册里的原图根本不会被碰），固定走副本模式 + 保存到相册/分享导出。
+  if (isMobile) return false;
   const checked = els.outputRow.querySelector('input[name=output-mode]:checked');
   return checked && checked.value === 'overwrite';
 }
@@ -143,6 +180,9 @@ function renderOutputDir() {
 // 只存"跨会话仍成立"的偏好，不存与单张图绑定的状态（如手动框选）。
 const SETTINGS_KEY = 'wm-settings';
 const LAST_ROOT_KEY = 'wm-last-root';
+// 移动端当前导入批次目录：pick 导入成功后写入；页面重建（rebuild_webview）或进程
+// 重启后由 restoreLastFolder 用它把已导入列表恢复出来
+const MOBILE_BATCH_KEY = 'wm-mobile-batch';
 
 function readSettings() {
   try {
@@ -154,7 +194,7 @@ function readSettings() {
 
 function applySettings() {
   const s = readSettings();
-  if (s.outputMode === 'overwrite') {
+  if (s.outputMode === 'overwrite' && !isMobile) {
     const radio = els.outputRow.querySelector('input[name=output-mode][value=overwrite]');
     if (radio) radio.checked = true;
   }
@@ -188,9 +228,28 @@ function rememberRoot(root) {
   try { localStorage.setItem(LAST_ROOT_KEY, root); } catch (_) {}
 }
 
-// 启动时恢复上次目录；目录已被删/移动就清掉记录，不打扰用户
+// 启动时恢复上次目录；目录已被删/移动就清掉记录，不打扰用户。
+// 移动端恢复的是"上次导入批次"（pick 导入成功时写入 MOBILE_BATCH_KEY）——
+// rebuild_webview 重建页面与进程重启后靠它把列表拉回来。
 async function restoreLastFolder() {
-  if (isMobile) return;
+  if (isMobile) {
+    const batchDir = localStorage.getItem(MOBILE_BATCH_KEY);
+    if (!batchDir) return;
+    try {
+      const names = await invoke('list_pngs', { root: batchDir, lang: window.i18n.lang });
+      if (!names.length) {
+        try { localStorage.removeItem(MOBILE_BATCH_KEY); } catch (_) {}
+        return;
+      }
+      targetRoot = batchDir;
+      clearMaskSelection();
+      renderFolderPath();
+      renderFiles(names);
+    } catch (_) {
+      try { localStorage.removeItem(MOBILE_BATCH_KEY); } catch (_) {}
+    }
+    return;
+  }
   const lastRoot = localStorage.getItem(LAST_ROOT_KEY);
   if (!lastRoot) return;
   try {
@@ -207,17 +266,68 @@ async function restoreLastFolder() {
 
 const STAGE_LABEL = () => ({ prepare: t('stagePrepare'), inpaint: t('stageInpaint'), save: t('stageSave') });
 
+// 移动端进度环：周长 2πr（r=52）
+const RUN_RING_LEN = 2 * Math.PI * 52;
+
 function setRunProgress(stage, done, total, name) {
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
   els.runProgressBar.style.width = pct + '%';
   const labels = STAGE_LABEL();
   const stageText = labels[stage] || stage;
   els.runProgressText.textContent = t('progressLine')(stageText, done, total, name);
+  if (isMobile) {
+    // 全屏进度页：环 + 张数 + 当前文件
+    const frac = total > 0 ? Math.min(1, done / total) : 0;
+    els.mRunRingFg.style.strokeDashoffset = String(RUN_RING_LEN * (1 - frac));
+    els.mRunCount.textContent = `${done}/${total}`;
+    els.mRunStage.textContent = stageText;
+    els.mRunName.textContent = name || '';
+  }
 }
 
 function logLine(text) {
   els.log.textContent += text + '\n';
   els.log.scrollTop = els.log.scrollHeight;
+}
+
+// —— 轻提示（Toast）——
+// 移动端日志区默认折叠，导出/分享/导入这类操作的成败只写日志等于没有反馈；
+// 统一用浮层提示。key 相同的提示原地复用（导入进度每秒刷新不闪烁），
+// sticky 提示不自动消失（进行中状态），由调用方替换或关闭。
+const TOAST_LIMIT = 3;
+
+function showToast(message, opts) {
+  if (!els.toastRoot || !message) return null;
+  const { type = 'info', key = '', sticky = false, timeout = type === 'error' ? 5000 : 3200 } = opts || {};
+  let el = null;
+  if (key) {
+    el = els.toastRoot.querySelector(`.toast[data-key="${CSS.escape(key)}"]`);
+  }
+  if (el) {
+    el.className = 'toast toast-' + type;
+    el.textContent = message;
+  } else {
+    el = document.createElement('div');
+    el.className = 'toast toast-' + type + ' toast-enter';
+    el.textContent = message;
+    if (key) el.dataset.key = key;
+    el.addEventListener('click', () => el.remove());
+    els.toastRoot.appendChild(el);
+    while (els.toastRoot.children.length > TOAST_LIMIT) els.toastRoot.firstChild.remove();
+  }
+  if (el._toastTimer) clearTimeout(el._toastTimer);
+  if (!sticky) {
+    el._toastTimer = setTimeout(() => el.remove(), timeout);
+  } else {
+    el._toastTimer = null;
+  }
+  return el;
+}
+
+function dismissToast(key) {
+  if (!els.toastRoot || !key) return;
+  const el = els.toastRoot.querySelector(`.toast[data-key="${CSS.escape(key)}"]`);
+  if (el) el.remove();
 }
 
 function showReview(container, path) {
@@ -351,9 +461,24 @@ function bindLightbox() {
   let downOnImg = false;
   let moved = false;
   let startX = 0, startY = 0, startTx = 0, startTy = 0;
+  // 双指缩放（触屏）：pointer 事件在多指下语义复杂，单独用 touch 事件实现
+  let pinching = false;
+  let pinchStartDist = 0;
+  let pinchStartScale = 1;
+
+  const touchDist = (touches) =>
+    Math.hypot(touches[0].clientX - touches[1].clientX, touches[0].clientY - touches[1].clientY);
 
   stage.addEventListener('pointerdown', (ev) => {
     if (els.lightboxImg.hidden) return;
+    if (!ev.isPrimary) {
+      // 第二根手指落下 → 进入双指缩放，终止单指拖动
+      pinching = true;
+      dragging = false;
+      stage.classList.remove('grabbing');
+      return;
+    }
+    if (pinching) return;
     dragging = true;
     moved = false;
     downOnImg = ev.target === els.lightboxImg;
@@ -365,7 +490,7 @@ function bindLightbox() {
     try { stage.setPointerCapture(ev.pointerId); } catch (_) {}
   });
   stage.addEventListener('pointermove', (ev) => {
-    if (!dragging) return;
+    if (pinching || !dragging || !ev.isPrimary) return;
     const dx = ev.clientX - startX;
     const dy = ev.clientY - startY;
     if (Math.abs(dx) > 4 || Math.abs(dy) > 4) moved = true;
@@ -374,7 +499,7 @@ function bindLightbox() {
     setLightboxTransform();
   });
   const endDrag = (ev) => {
-    if (!dragging) return;
+    if (!ev.isPrimary || !dragging) return;
     dragging = false;
     stage.classList.remove('grabbing');
     try {
@@ -387,6 +512,44 @@ function bindLightbox() {
   };
   stage.addEventListener('pointerup', endDrag);
   stage.addEventListener('pointercancel', endDrag);
+  stage.addEventListener('touchstart', (ev) => {
+    if (els.lightboxImg.hidden || ev.touches.length !== 2) return;
+    pinching = true;
+    dragging = false;
+    stage.classList.remove('grabbing');
+    pinchStartDist = touchDist(ev.touches);
+    pinchStartScale = lbScale;
+    ev.preventDefault();
+  }, { passive: false });
+  stage.addEventListener('touchmove', (ev) => {
+    if (!pinching || ev.touches.length !== 2) return;
+    ev.preventDefault();
+    const dist = touchDist(ev.touches);
+    if (pinchStartDist <= 0 || dist <= 0) return;
+    const minScale = Math.max(lbFit * LB_MIN_FACTOR, 0.05);
+    const target = Math.max(minScale, Math.min(LB_MAX_SCALE, pinchStartScale * (dist / pinchStartDist)));
+    const cx = (ev.touches[0].clientX + ev.touches[1].clientX) / 2;
+    const cy = (ev.touches[0].clientY + ev.touches[1].clientY) / 2;
+    zoomLightboxAt(cx, cy, target / lbScale);
+  }, { passive: false });
+  const endPinch = (ev) => {
+    if (!pinching) return;
+    if (ev.touches.length >= 2) return;
+    pinching = false;
+    if (ev.touches.length === 1) {
+      // 松开一指后无缝继续单指拖动：以剩余手指为新起点
+      dragging = true;
+      downOnImg = false;
+      moved = true;
+      startX = ev.touches[0].clientX;
+      startY = ev.touches[0].clientY;
+      startTx = lbTx;
+      startTy = lbTy;
+      stage.classList.add('grabbing');
+    }
+  };
+  stage.addEventListener('touchend', endPinch);
+  stage.addEventListener('touchcancel', endPinch);
   stage.addEventListener('dblclick', (ev) => {
     if (els.lightboxImg.hidden) return;
     if (Math.abs(lbScale - lbFit) < 0.01) zoomLightboxAt(ev.clientX, ev.clientY, (lbFit * 2) / lbScale);
@@ -415,6 +578,7 @@ function bindLightbox() {
 
 // Android 返回键（MainActivity 经 evaluateJavascript 调用）：
 // 返回 true = 已消费（关闭了弹层或正在处理），返回 false = 交由原生退出应用。
+let backExitAt = 0;
 window.__onAndroidBack = () => {
   const lightbox = document.getElementById('lightbox');
   if (lightbox && lightbox.classList.contains('open')) {
@@ -429,10 +593,137 @@ window.__onAndroidBack = () => {
     els.disclaimerOverlay.hidden = true;
     return true;
   }
-  // 处理中拦下返回，避免进程被杀导致任务中断、输出半成品
-  if (running) return true;
+  // 设置页打开：返回键先关设置页
+  if (document.body.classList.contains('m-settings-open')) {
+    closeSettings();
+    return true;
+  }
+  // 处理中拦下返回，避免进程被杀导致任务中断、输出半成品；按返回没反应会让用户
+  // 以为应用卡死，故明确提示一次（同 key 复用，连按不刷屏）
+  if (running) {
+    showToast(t('backBlockedToast'), { type: 'error', key: 'back-block' });
+    return true;
+  }
+  // 结果页：返回列表页（结果保留、可再次导出），而不是直接退出
+  if (document.body.classList.contains('state-done')) {
+    setState('picked');
+    return true;
+  }
+  // 已有导入批次时退出会丢掉整个会话（框选/结果都没有持久化）：2.5 秒内连按两次才退出
+  if (targetRoot && Date.now() - backExitAt > 2500) {
+    backExitAt = Date.now();
+    showToast(t('backExitHint'), { key: 'back-exit' });
+    return true;
+  }
   return false;
 };
+
+// —— 移动端：App 式布局与设置页 ——
+
+// Android 相册选择器（Photo Picker）：结果由原生侧经此全局回调异步回传
+// （与 __onAndroidBack 同一模式；空数组 = 用户取消）。
+let pendingPickResolve = null;
+window.__onAndroidPickResult = (uris) => {
+  const resolve = pendingPickResolve;
+  pendingPickResolve = null;
+  if (resolve) resolve(Array.isArray(uris) ? uris.filter(Boolean) : []);
+};
+
+function pickImagesAndroid() {
+  return new Promise((resolve, reject) => {
+    pendingPickResolve = resolve;
+    invoke('pick_images', { max: 0 }).catch((err) => {
+      pendingPickResolve = null;
+      reject(err);
+    });
+  });
+}
+
+function openSettings() {
+  if (!isMobile) return;
+  syncSettingsUi();
+  document.body.classList.add('m-settings-open');
+}
+
+function closeSettings() {
+  document.body.classList.remove('m-settings-open');
+}
+
+// 移动端 DOM 重排（仅 isMobile；桌面端结构保持不动）：
+// 1.「添加图片」按钮从面板头搬进底部操作栏（与「开始处理」并排）
+// 2. 高级选项/精确模式收进设置页（普通用户主流程零配置）
+// 3. 前后对比 + 复查图包进折叠面板（结果页以"汇总 + 结果网格"为主）
+function setupMobileLayout() {
+  const runButtons = document.querySelector('.run-buttons');
+  if (runButtons && els.btnPick) {
+    runButtons.insertBefore(els.btnPick, runButtons.firstChild);
+  }
+  if (els.mSettingsOptions) {
+    document.querySelectorAll('.run-area > .advanced-options').forEach((d) => {
+      els.mSettingsOptions.appendChild(d);
+    });
+    // 副本模式下没有备份概念，keep-work 对移动端无意义
+    if (els.keepWork && els.keepWork.parentElement) {
+      els.keepWork.parentElement.style.display = 'none';
+    }
+  }
+  const rightPanel = document.querySelector('.right-panel');
+  if (rightPanel && els.logBox) {
+    const box = document.createElement('details');
+    box.className = 'collapse';
+    const sum = document.createElement('summary');
+    sum.dataset.i18n = 'viewCompare';
+    sum.textContent = t('viewCompare');
+    box.appendChild(sum);
+    if (els.compareBox) box.appendChild(els.compareBox);
+    const reviewGrid = rightPanel.querySelector('.review-grid');
+    if (reviewGrid) box.appendChild(reviewGrid);
+    rightPanel.insertBefore(box, els.logBox);
+  }
+}
+
+// 设置页交互绑定（仅移动端调用）
+function bindMobileSettings() {
+  els.btnSettings.addEventListener('click', openSettings);
+  els.mSettingsBack.addEventListener('click', closeSettings);
+  els.mThemeSeg.querySelectorAll('button').forEach((b) => {
+    b.addEventListener('click', () => setThemeMode(b.dataset.mode));
+  });
+  els.mLangSeg.querySelectorAll('button').forEach((b) => {
+    b.addEventListener('click', () => {
+      const lang = b.dataset.lang;
+      if (lang !== window.i18n.lang) {
+        window.i18n.setLang(lang);
+        applyLang();
+      }
+    });
+  });
+  els.mClearBatch.addEventListener('click', async () => {
+    const ok = await confirm(t('clearBatchConfirm'), {
+      title: t('clearBatchConfirmTitle'),
+      kind: 'warning',
+      okLabel: t('ok'),
+      cancelLabel: t('cancel'),
+    }).catch(() => false);
+    if (!ok) return;
+    try {
+      const n = await invoke('clear_import_batch');
+      targetRoot = null;
+      try { localStorage.removeItem(MOBILE_BATCH_KEY); } catch (_) {}
+      clearReviews();
+      clearMaskSelection();
+      renderFiles([]);
+      closeSettings();
+      logLine(t('batchClearedLog'));
+      if (n > 0) showToast(t('clearBatchDone')(n), { type: 'success' });
+    } catch (err) {
+      logLine(t('logError')(String(err)));
+      showToast(t('logError')(String(err)), { type: 'error' });
+    }
+  });
+  els.mRunCancel.addEventListener('click', () => els.btnCancel.click());
+  els.btnBackList.addEventListener('click', () => setState('picked'));
+}
 
 function escapeHtml(text) {
   return text.replace(/[&<>"']/g, (ch) => ({
@@ -527,31 +818,94 @@ function renderEmptyState(messageKey) {
 
 function renderFiles(names) {
   els.fileList.innerHTML = '';
+  thumbQueue.length = 0; // 列表重渲染：取消遗留的缩略图任务（img 已脱离 DOM）
   setState(names.length > 0 ? 'picked' : 'empty');
   els.fileCount.textContent = t('fileCount')(names.length);
-  els.btnSelectAll.disabled = names.length === 0;
-  els.btnSelectNone.disabled = names.length === 0;
-  els.btnRun.disabled = running || names.length === 0;
+  els.btnSelectAll.disabled = importing || names.length === 0;
+  els.btnSelectNone.disabled = importing || names.length === 0;
+  els.btnRun.disabled = running || importing || names.length === 0;
   if (names.length === 0) {
     renderEmptyState(isMobile ? 'emptyNoPngMobile' : 'emptyNoPngDesktop');
     updateRunButton();
     return;
   }
+  if (isMobile) {
+    renderFileGrid(names);
+  } else {
+    for (const name of names) {
+      const item = document.createElement('label');
+      item.className = 'file-item';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.value = name;
+      checkbox.checked = true;
+      checkbox.disabled = running || importing;
+      checkbox.addEventListener('change', updateRunButton);
+      item.appendChild(checkbox);
+      const label = document.createElement('span');
+      label.textContent = name;
+      item.appendChild(label);
+      els.fileList.appendChild(item);
+    }
+  }
+  updateRunButton();
+}
+
+// 移动端文件网格：缩略图卡片（整卡点选/取消，左上角 × 单张移除）
+function renderFileGrid(names) {
   for (const name of names) {
-    const item = document.createElement('label');
-    item.className = 'file-item';
+    const card = document.createElement('label');
+    card.className = 'm-file-card';
+
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
     checkbox.value = name;
     checkbox.checked = true;
+    checkbox.disabled = running || importing;
     checkbox.addEventListener('change', updateRunButton);
-    item.appendChild(checkbox);
+    card.appendChild(checkbox);
+
+    const thumb = document.createElement('div');
+    thumb.className = 'm-file-thumb';
+    const img = document.createElement('img');
+    img.alt = name;
+    thumb.appendChild(img);
+    card.appendChild(thumb);
+    // 缩略图懒加载：复用结果列表的 3 并发队列（读 200px JPEG/PNG 缩略图）
+    thumbQueue.push({ path: targetRoot.replace(/\/+$/, '') + '/' + name, img });
+    pumpThumbQueue();
+
+    const check = document.createElement('span');
+    check.className = 'm-file-check';
+    check.textContent = '✓';
+    card.appendChild(check);
+
+    const del = document.createElement('button');
+    del.className = 'm-file-del';
+    del.type = 'button';
+    del.textContent = '×';
+    del.title = t('removeImageHint');
+    del.addEventListener('click', async (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (running || importing) return;
+      try {
+        await invoke('remove_import_file', { dir: targetRoot, name, lang: window.i18n.lang });
+        await refreshFiles();
+      } catch (err) {
+        logLine(t('logError')(String(err)));
+        showToast(t('removeImageFail')(String(err)), { type: 'error' });
+      }
+    });
+    card.appendChild(del);
+
     const label = document.createElement('span');
+    label.className = 'm-file-name';
     label.textContent = name;
-    item.appendChild(label);
-    els.fileList.appendChild(item);
+    card.appendChild(label);
+
+    els.fileList.appendChild(card);
   }
-  updateRunButton();
 }
 
 function selectedFiles() {
@@ -559,10 +913,17 @@ function selectedFiles() {
 }
 
 function updateRunButton() {
-  const count = selectedFiles().length;
+  const boxes = [...els.fileList.querySelectorAll('input[type=checkbox]')];
+  const count = boxes.filter((el) => el.checked).length;
+  // 老 WebView（Chromium <105，如 ColorOS 自带 97）不支持 :has()：勾选态落到卡片
+  // class 上（勾选圈/边框高亮），任何勾选变化路径都会经过这里，无需逐处同步
+  boxes.forEach((el) => {
+    const card = el.closest('.m-file-card');
+    if (card) card.classList.toggle('checked', el.checked);
+  });
   els.btnRun.textContent = count > 0 ? `${t('run')}（${count}）` : t('run');
-  els.btnRun.disabled = running || !targetRoot || count === 0;
-  els.btnMask.disabled = running || !targetRoot || count === 0;
+  els.btnRun.disabled = running || importing || !targetRoot || count === 0;
+  els.btnMask.disabled = running || importing || !targetRoot || count === 0;
   updateMaskUi();
 }
 
@@ -572,7 +933,8 @@ function clearMaskSelection() {
 }
 
 function setPickLabel() {
-  els.btnPick.textContent = isMobile ? t('pickPhotos') : t('pickFolder');
+  // 移动端始终是"追加"语义（可多次添加）；桌面端仍为选择文件夹
+  els.btnPick.textContent = isMobile ? t('addImages') : t('pickFolder');
 }
 
 function renderFolderPath() {
@@ -594,6 +956,59 @@ function applyDynamicLabels() {
   updateRunButton();
   if (document.body.classList.contains('state-empty')) renderEmptyState(lastEmptyKey);
   if (lastExitPayload) renderExitBanner(lastExitPayload);
+}
+
+// —— 主题（默认跟随系统，手动切换后记忆；设置页与顶栏按钮共用） ——
+function themeMode() {
+  return localStorage.getItem('wm-theme') || 'auto';
+}
+
+function applyTheme(mode) {
+  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const dark = mode === 'dark' || (mode !== 'light' && prefersDark);
+  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  const icon = document.getElementById('btn-theme-icon');
+  if (icon) icon.textContent = dark ? t('themeLight') : t('themeDark');
+  // Android edge-to-edge：状态栏/导航栏透明，图标深浅须与 App 主题同步（否则
+  // 深色主题 + 系统浅色时深色图标压在深色背景上看不清）；失败静默不影响主题
+  if (isMobile) invoke('set_system_bars', { dark }).catch(() => {});
+  syncSettingsUi();
+}
+
+function setThemeMode(mode) {
+  localStorage.setItem('wm-theme', mode);
+  applyTheme(mode);
+}
+
+// —— 语言（顶栏按钮 + 手机设置页共用） ——
+function syncMenuLang() {
+  if (window.__WM_HAS_MENU) {
+    invoke('set_menu_lang', { lang: window.i18n.lang }).catch((err) => {
+      // 菜单重建失败（加速键/平台）只影响菜单文案，不影响处理；记一行便于排查
+      logLine(t('logMenuLangFailed')(String(err)));
+    });
+  }
+}
+
+function applyLang() {
+  els.btnLang.textContent = window.i18n.lang === 'zh' ? 'EN' : '中';
+  window.i18n.applyI18n();
+  applyDynamicLabels();
+  syncMenuLang();
+  syncSettingsUi();
+}
+
+// 设置页分段按钮的选中态（主题/语言）：在主题或语言变化后同步
+function syncSettingsUi() {
+  if (!isMobile || !els.mThemeSeg || !els.mLangSeg) return;
+  const mode = themeMode();
+  els.mThemeSeg.querySelectorAll('button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.mode === mode);
+  });
+  const lang = window.i18n.lang;
+  els.mLangSeg.querySelectorAll('button').forEach((b) => {
+    b.classList.toggle('active', b.dataset.lang === lang);
+  });
 }
 
 // —— 精确模式：水印档案（学习/选择/删除）——
@@ -663,8 +1078,11 @@ async function learnProfile() {
 function updateMaskUi() {
   const has = !!manualMask;
   els.btnMaskClear.hidden = !has;
+  // 显示可读的框选尺寸（约 W×H 像素），原始右下角偏移量对普通用户没有意义
+  const w = has ? Math.abs(manualMask.dx2 - manualMask.dx1) : 0;
+  const h = has ? Math.abs(manualMask.dy2 - manualMask.dy1) : 0;
   els.maskStatus.textContent = has
-    ? t('maskSelectedLabel')(`${manualMask.dx1}, ${manualMask.dy1}, ${manualMask.dx2}, ${manualMask.dy2}`)
+    ? t('maskSelectedLabel')(`${w}×${h}`)
     : t('maskAuto');
   els.maskStatus.classList.toggle('manual', has);
 }
@@ -791,7 +1209,7 @@ let thumbActive = 0;
 const THUMB_CONCURRENCY = 3;
 
 // 桌面完成通知：批量任务要几分钟，用户多半已经切走去看别的
-const notif = !isMobile && window.__TAURI__.notification ? window.__TAURI__.notification : null;
+const notif = window.__TAURI__.notification ? window.__TAURI__.notification : null;
 let notifGranted = false;
 
 async function initNotifications() {
@@ -806,9 +1224,21 @@ async function initNotifications() {
 
 async function notifyDone(title, body) {
   if (!notif || !notifGranted || !title) return;
-  if (document.hasFocus()) return; // 用户正看着窗口就不打扰
+  // "用户正看着"就不打扰：桌面看窗口聚焦（hasFocus=false 表示切走了）；
+  // Android WebView 切后台后 hasFocus() 依然恒为 true（实测 focusLog 全 1），
+  // 必须改用 visibilityState——否则通知永远被这个判断挡掉
+  const watching = isMobile ? document.visibilityState === 'visible' : document.hasFocus();
+  if (watching) return;
   try {
-    await notif.sendNotification({ title, body: body || '' });
+    if (isMobile) {
+      // 移动端经 IPC 直传 autoCancel（插件 JS 封装不透传该字段）：点击通知即消失，
+      // 否则通知会一直挂在通知栏直到用户手动划掉
+      await window.__TAURI_INTERNALS__.invoke('plugin:notification|notify', {
+        options: { title, body: body || '', autoCancel: true },
+      });
+    } else {
+      await notif.sendNotification({ title, body: body || '' });
+    }
   } catch (_) { /* 通知失败不影响主流程 */ }
 }
 
@@ -919,14 +1349,29 @@ function renderExitBanner(payload) {
     const main = document.createElement('div');
     main.className = 'banner-main';
     const written = typeof payload.processed === 'number' ? payload.processed : lastRunCount;
+    const noWm = Array.isArray(payload.noWatermark) ? payload.noWatermark : [];
     const title = document.createElement('div');
     title.className = 'banner-title';
-    title.textContent = `✓ ${t('doneBanner')} · ${t('fileCount')(written)}`;
+    // 全部图都没有水印（passthrough）时"处理完成"会让人误会真的做了什么：直接说清
+    title.textContent = noWm.length > 0 && noWm.length >= written
+      ? `✓ ${t('noWatermarkBanner')(written)}`
+      : `✓ ${t('doneBanner')} · ${t('fileCount')(written)}`;
     const sub = document.createElement('div');
     sub.className = 'banner-sub';
-    sub.textContent = payload.overwritten ? t('doneSubOverwrite') : t('doneSubSave')(dir);
+    // 移动端处理的是应用内副本、输出走「保存到相册/分享」，显示 watermark-cleaned
+    // 目录路径没有意义（用户在系统文件管理里也看不到应用私有目录）
+    sub.textContent = payload.overwritten
+      ? t('doneSubOverwrite')
+      : (isMobile ? t('doneSubSaveMobile') : t('doneSubSave')(dir));
     main.appendChild(title);
     main.appendChild(sub);
+    // 部分图未检测到水印：它们是原样输出，用户需要知道"这几张没改"
+    if (noWm.length > 0 && noWm.length < written) {
+      const note = document.createElement('div');
+      note.className = 'banner-sub';
+      note.textContent = t('noWatermarkNote')(noWm.length);
+      main.appendChild(note);
+    }
     // 未过自检的图不写坏结果：明确告诉用户"这几张还是带水印的原图"
     if (skipped.length) {
       const warn = document.createElement('div');
@@ -958,9 +1403,16 @@ function renderExitBanner(payload) {
           btn.disabled = true;
           try {
             const n = await invoke(cmd, { paths, lang: window.i18n.lang });
-            logLine(n > 0 ? doneText(n) : noneText);
+            if (n > 0) {
+              logLine(doneText(n));
+              showToast(doneText(n), { type: 'success' });
+            } else {
+              logLine(noneText);
+              showToast(noneText, { type: 'error' });
+            }
           } catch (err) {
             logLine(failText(String(err)));
+            showToast(failText(String(err)), { type: 'error' });
           } finally {
             btn.disabled = false;
           }
@@ -971,8 +1423,9 @@ function renderExitBanner(payload) {
       wrap.appendChild(mk(t('shareResults'), 'share_results', t('shareDone'), t('shareFailed'), t('shareNone')));
       els.resultBanner.appendChild(wrap);
     }
-    // 覆盖模式：备份保留在 original-watermark-backup/，给一个"后悔药"
-    if (payload.overwritten && targetRoot) {
+    // 覆盖模式：备份保留在 original-watermark-backup/，给一个"后悔药"。
+    // 移动端无覆盖模式（处理的是应用内副本），不显示。
+    if (payload.overwritten && targetRoot && !isMobile) {
       const restore = document.createElement('button');
       restore.className = 'btn small danger ghost';
       restore.type = 'button';
@@ -989,6 +1442,7 @@ function renderExitBanner(payload) {
         try {
           const n = await invoke('restore_backup', { root: targetRoot, lang: window.i18n.lang });
           logLine(t('restoreDone')(n));
+          showToast(t('restoreDone')(n), { type: 'success' });
           // 原图已还原：清掉结果列表、前后对比与两张复查预览，避免残留"已处理"假象
           clearReviews();
           els.resultBanner.hidden = false;
@@ -1001,6 +1455,7 @@ function renderExitBanner(payload) {
           await refreshFiles();
         } catch (err) {
           logLine(t('restoreFailed')(String(err)));
+          showToast(t('restoreFailed')(String(err)), { type: 'error' });
         }
       });
       els.resultBanner.appendChild(restore);
@@ -1027,6 +1482,14 @@ function handleExit(payload) {
       payload.success ? t('notifyModelDoneTitle') : t('notifyModelFailTitle'),
       payload.success ? t('notifyModelDoneBody') : (payload.error || '')
     );
+    // 移动端系统通知只在切后台后可见；用户正看着 App 时补浮层提示（下载进度条
+    // 消失后状态只在折叠的日志里）
+    if (isMobile) {
+      showToast(payload.success ? t('notifyModelDoneTitle') : t('notifyModelFailTitle'), {
+        type: payload.success ? 'success' : 'error',
+        timeout: payload.success ? 3200 : 6000,
+      });
+    }
     refreshEnv();
     return;
   }
@@ -1043,6 +1506,13 @@ function handleExit(payload) {
         ? t('notifyDoneBody')(typeof payload.processed === 'number' ? payload.processed : lastRunCount)
         : (payload.error || `exit ${payload.code}`)
     );
+    // 移动端：用户正在前台时补浮层提示（结果区较长，banner 常在屏幕外）
+    if (payload.success) {
+      showToast(
+        t('notifyDoneBody')(typeof payload.processed === 'number' ? payload.processed : lastRunCount),
+        { type: 'success' }
+      );
+    }
   }
   const logText = els.log.textContent;
   const lastMatch = (re) => [...logText.matchAll(re)].pop();
@@ -1061,45 +1531,19 @@ async function init() {
   const ready = await refreshEnv();
   await refreshProfiles();
 
-  // 主题：默认跟随系统，手动切换后记忆
-  const btnTheme = document.getElementById('btn-theme');
-  const applyTheme = (mode) => {
-    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    const dark = mode === 'dark' || (mode !== 'light' && prefersDark);
-    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
-    document.getElementById('btn-theme-icon').textContent = dark ? t('themeLight') : t('themeDark');
-  };
-  const themeMode = () => localStorage.getItem('wm-theme') || 'auto';
+  // 主题 / 语言（实现见模块级 applyTheme/applyLang，设置页与顶栏按钮共用）
   applyTheme(themeMode());
-  btnTheme.addEventListener('click', () => {
+  els.btnTheme.addEventListener('click', () => {
     const dark = document.documentElement.dataset.theme === 'dark';
-    const next = dark ? 'light' : 'dark';
-    localStorage.setItem('wm-theme', next);
-    applyTheme(next);
+    setThemeMode(dark ? 'light' : 'dark');
   });
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => applyTheme(themeMode()));
 
-  // 语言切换
-  const btnLang = document.getElementById('btn-lang');
   // 系统菜单文案在 Rust 侧：装了菜单就把当前语言同步过去（页面加载与 JS 初始化先后
   // 不确定，故既在这里主动调一次，也留给原生回调 __WM_MENU_READY 再调一次）。
-  const syncMenuLang = () => {
-    if (window.__WM_HAS_MENU) {
-      invoke('set_menu_lang', { lang: window.i18n.lang }).catch((err) => {
-        // 菜单重建失败（加速键/平台）只影响菜单文案，不影响处理；记一行便于排查
-        logLine(t('logMenuLangFailed')(String(err)));
-      });
-    }
-  };
   window.__WM_MENU_READY = syncMenuLang;
-  const applyLang = () => {
-    btnLang.textContent = window.i18n.lang === 'zh' ? 'EN' : '中';
-    window.i18n.applyI18n();
-    applyDynamicLabels();
-    syncMenuLang();
-  };
   applyLang();
-  btnLang.addEventListener('click', () => {
+  els.btnLang.addEventListener('click', () => {
     window.i18n.setLang(window.i18n.lang === 'zh' ? 'en' : 'zh');
     applyLang();
   });
@@ -1134,6 +1578,12 @@ async function init() {
 
   listen('pipeline-log', (event) => logLine(event.payload));
   listen('pipeline-exit', (event) => handleExit(event.payload));
+  // 导入进度（Rust 每复制完一张上报一次）：同一 key 原地刷新，结束由 importPaths 收尾
+  listen('import-progress', (event) => {
+    if (!importing) return;
+    const p = event.payload || {};
+    showToast(t('importingToast')(p.done || 0, p.total || 0), { key: 'import', sticky: true });
+  });
   // 处理中尝试关窗被原生拦下：把窗口带回前台并说明原因
   listen('quit-blocked', () => {
     els.logBox.open = true;
@@ -1160,8 +1610,6 @@ async function init() {
 
   if (isMobile) {
     setPickLabel();
-    els.keepWork.parentElement.style.display = 'none';
-    document.body.classList.add('mobile');
   } else {
     els.logBox.open = true;
   }
@@ -1172,6 +1620,10 @@ async function init() {
   });
 
   bindLightbox();
+  // 长按/右键图片不弹系统菜单：WebView 的"保存图片/复制图片"会把预览当原图导出，误导用户
+  document.addEventListener('contextmenu', (ev) => {
+    if (ev.target && ev.target.tagName === 'IMG') ev.preventDefault();
+  });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       closeLightbox();
@@ -1265,32 +1717,87 @@ async function init() {
     }
   });
 
-  async function importPaths(paths) {
+  async function importPaths(paths, opts = {}) {
+    if (importing) return;
+    const append = !!(opts.append && targetRoot);
+    importing = true;
+    // 导入大图/多图要数秒~十几秒（复制到应用私有目录），期间锁住会串状态的按钮
+    els.btnPick.disabled = true;
+    els.btnRefresh.disabled = true;
+    els.btnRun.disabled = true;
+    showToast(t('importingToast')(0, paths.length), { key: 'import', sticky: true });
     try {
-      const imported = await invoke('import_files', { paths, lang: window.i18n.lang });
+      const imported = await invoke('import_files', {
+        paths,
+        dir: append ? targetRoot : null,
+        lang: window.i18n.lang,
+      });
       targetRoot = imported.dir;
-      els.btnRefresh.disabled = false;
-      clearReviews();
-      clearMaskSelection();
-      logLine(`[${t('importedLog')}] ${paths.length}`);
+      // 追加：不清结果与框选（同一批次的旧结果仍然有效，处理时会整体重跑）；
+      // 换批：清掉旧预览，避免"结果对不上新图片"的假象
+      if (!append) {
+        clearReviews();
+        clearMaskSelection();
+      }
+      const names = imported.names || [];
+      const skipped = imported.skipped || [];
+      const total = typeof imported.total === 'number' ? imported.total : names.length;
+      if (append) {
+        logLine(t('importAddedLog')(names.length, total));
+      } else {
+        logLine(`[${t('importedLog')}] ${names.length}`);
+      }
+      skipped.forEach((reason) => logLine(`[${t('importFailed')}] ${reason}`));
+      if (skipped.length === 0) {
+        showToast(
+          append ? t('importAddedToast')(names.length, total) : t('importDoneToast')(names.length),
+          { key: 'import', type: 'success' }
+        );
+      } else {
+        showToast(t('importSkippedToast')(names.length, skipped.length), {
+          key: 'import', type: 'error', timeout: 6000,
+        });
+      }
       await refreshFiles();
+      if (isMobile && targetRoot) {
+        try { localStorage.setItem(MOBILE_BATCH_KEY, targetRoot); } catch (_) {}
+      }
     } catch (err) {
+      dismissToast('import');
       logLine(`[${t('importFailed')}] ` + String(err));
+      showToast(t('importFailToast'), { type: 'error' });
       await message(String(err), { title: t('importFailed'), okLabel: t('ok') }).catch(() => {});
+    } finally {
+      importing = false;
+      els.btnPick.disabled = running;
+      els.btnRefresh.disabled = !targetRoot;
+      updateRunButton();
     }
   }
 
   els.btnPick.addEventListener('click', async () => {
     if (isMobile) {
-      const picked = await open({
-        multiple: true,
-        filters: [{ name: t('imageFilter'), extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
-        title: t('pickPhotosTitle'),
-      });
-      if (!picked) return;
-      const paths = Array.isArray(picked) ? picked : [picked];
-      if (paths.length === 0) return;
-      await importPaths(paths);
+      // 首选系统相册选择器（Android 13+ 系统 Photo Picker，旧版本系统自动回退）；
+      // 启动失败（如极旧版本）回退系统文件选择器，保证总能选到图。
+      let paths = null;
+      try {
+        paths = await pickImagesAndroid();
+      } catch (err) {
+        logLine(`[Picker] ${String(err)}`);
+        const picked = await open({
+          multiple: true,
+          filters: [{ name: t('imageFilter'), extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+          title: t('pickPhotosTitle'),
+        });
+        if (!picked) return;
+        paths = Array.isArray(picked) ? picked : [picked];
+      }
+      if (!paths || paths.length === 0) return; // 用户取消
+      await importPaths(paths, { append: !!targetRoot });
+      // ColorOS 12 从系统 picker 返回后 WebView 输入分发会卡死（点击全部失效、轻量
+      // 解冻救不回），导入完成后整体重建 WebView（等价冷启动、必然恢复）。取消返回
+      // 无此问题，故只在有实际选择时触发；重建后主题/语言自 localStorage 恢复。
+      invoke('rebuild_webview').catch(() => {});
       return;
     }
     const picked = await open({ directory: true, multiple: false, title: t('pickFolderTitle') });
@@ -1471,6 +1978,11 @@ async function init() {
       }).catch(() => false);
       if (!ok) return;
     }
+    // 确认框停留期间处理可能已自然完成：说清楚，避免"点了确定却没反应"的困惑
+    if (taskKind !== 'model' && !running) {
+      showToast(t('cancelAlreadyDone'), { type: 'info' });
+      return;
+    }
     els.btnCancel.disabled = true;
     logLine(t('cancelLog'));
     try {
@@ -1488,6 +2000,14 @@ async function init() {
   setState('empty');
   renderEmptyState();
   await restoreLastFolder();
+}
+
+// 移动端布局在 init 之前同步完成（DOM 已解析）：避免首帧闪现桌面双栏结构
+if (isMobile) {
+  document.body.classList.add('mobile');
+  els.btnSettings.removeAttribute('hidden');
+  setupMobileLayout();
+  bindMobileSettings();
 }
 
 init();

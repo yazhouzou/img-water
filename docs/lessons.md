@@ -122,3 +122,11 @@
 - **缩放图仍非逐像素**（4.png 1728×2304 IoU 0.948）：`image` crate 的 Triangle 与 cv2 `INTER_LINEAR` 重采样在边界带差 ~2%（**亮字 α 通路同样存在**，实测 0.9607），是**既有**限制、非本次引入。别为它改 resize（牵连全链路）。
 - **残留分与模型绑定**：Rust/LaMa 对 4.png 亮字 α 结果残留 **0.0**（LaMa 平滑掉字形结构），Python/MAT 是 **6.8**（MAT 保留结构）→ 同一阈值两端触发时机不同，属正常（模型本质不同）。footprint 升级是兜底，触发即生效（强制测试：Rust 4.png mask 12327→16977px）。
 - **回归**：Python `default mask is alpha (keeps texture)` + `footprint mask covers dark outline` + `result-driven upgrade wired`；Rust `template_footprint_mask_covers_dark_outline` + `template_footprint_mask_matches_python`（`tools/footprint_parity_dump.py`，非缩放 0.995/缩放 0.93）。
+
+## 17. 水印压在文字/线条上：分层还原（`--overlap-text`，v0.5.7）
+- **失败模式**：水印叠在正文文字/橙色边框上时，① 生成式修补把被压文字当背景**抹掉或糊成灰带**（MAT/SD 都无解——被遮挡的文字信息本就不存在）；② 模板亮字 α mask 只盖字形中部（8.png 实测 254x79，真实水印 307x102），区域不足会切坏文字边缘；③ 手动采样带被橙边框污染 → 橙色沿列**涂抹**（残余 cluster [1486,2733] 实为橙色涂抹，非水印残留）。用户 4 轮"未清干净"皆此类。
+- **正解＝分层**：内容像素（暗文字笔画 lum<95 膨胀 3x3、有色线条 chroma>40 膨胀 5x5）**原样保留**；只重建 rep=region&~keep 的背景像素：上下干净带（10px，gap=12+bh//8）逐列中值 + **污染列检测**（列中值 lum<95 或 rb>bg_rb(p25)+40）→ 污染列改 `np.interp` 水平回退，全污染放弃交回普通修补；垂直插值 + **行向光晕校正**（左右各 3 个滑动参考列取有效行多者，逐通道 clip ±40）。文字是已知文本、描边有语义——保住它们即保住语义与形貌。
+- **区域必须用检测框 `.lbox`**：模板 α bbox 会低估（8.png 254x79 vs 真实 307x102、含橙色边框），prepare 落 `.lbox`（模板路径=画布框、检测/custom=boxes 并集）供分层还原定区域（8.png=345x126，rebuilt 35978px、kept 7492px）。
+- **模板分可能是"文字驱动"的假残留**：8.png 上实验把文字涂成背景色后锚点分 48.9→0.0——半透明浅色水印本身不产生正 gap，verify 的模板残留判据在压字图上**必然假 FAIL**。故分层还原写 `.layered` 侧车、verify 跳过模板残留（同 `.inv` 处理；实测无侧车 FAIL、有侧车 PASS）。
+- **验收两级目检（1:1 + 高倍）**：只做高倍放大看不出问题——灰带/矩形块必须 **1:1 与原图并排**才能发现（V23 事故）；反之 1:1 通过仍要抽查高倍边缘。
+- **回归**：`run_overlap_text_checks`（rep-only-change / text preserved / watermark rebuilt / no orange smear / detection box widens region）+ `run_verify_checks` 的 `layered result skips template residual`；默认关，老路径逐字节不变。

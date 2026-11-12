@@ -50,7 +50,6 @@ html[data-theme='dark'] .badge.ok { background: #13301f; }
 html[data-theme='dark'] .badge.bad { background: #381a1a; }
 html[data-theme='dark'] .file-item.active { background: var(--primary-soft); }
 html[data-theme='dark'] .btn { background: #232734; }
-html[data-theme='dark'] body.mobile #btn-refresh,
 html[data-theme='dark'] #btn-refresh { background: #232734; }
 html[data-theme='dark'] .dot { background: #3a4050; }
 
@@ -81,13 +80,12 @@ body {
 .logo {
   width: 40px; height: 40px;
   display: grid; place-items: center;
-  background: linear-gradient(135deg, #4f46e5, #8b5cf6);
-  color: #fff;
+  background: linear-gradient(135deg, #4c3fdf, #9557f2);
   border-radius: 10px;
-  font-size: 20px;
-  font-weight: 700;
+  overflow: hidden;
   box-shadow: 0 2px 6px rgba(79, 70, 229, 0.35);
 }
+.logo svg { width: 100%; height: 100%; display: block; }
 .brand h1 { margin: 0; font-size: 17px; }
 .subtitle { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
 
@@ -172,6 +170,7 @@ body {
   font-size: 13px;
   cursor: pointer;
   transition: border-color 0.15s, color 0.15s, background 0.15s;
+  white-space: nowrap;
 }
 .btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
@@ -377,7 +376,10 @@ body:not(.mobile) .files-panel::-webkit-scrollbar-thumb:hover {
 .result-banner.warn { background: #fff4e5; color: var(--warn); }
 .banner-sub.warn { opacity: 1; }
 .banner-actions { display: flex; gap: 8px; margin-top: 8px; }
-.banner-actions .btn { flex: 1; }
+.banner-actions .btn { flex: 1; min-width: 0; }
+/* 移动端：横幅为竖排，按钮组必须整行占满——否则 flex:1 的按钮按"内容宽"均分，
+   "保存到相册"会被挤成两行（实测宽度只有 ~63px） */
+body.mobile .banner-actions { width: 100%; }
 html[data-theme='dark'] .result-banner.ok { background: #16301f; }
 html[data-theme='dark'] .result-banner.err { background: #3a1d1d; }
 html[data-theme='dark'] .result-banner.warn { background: #3a2c14; }
@@ -437,7 +439,6 @@ html[data-theme='dark'] .result-banner.warn { background: #3a2c14; }
   cursor: pointer;
 }
 .result-item-btn:hover { border-color: var(--primary); color: var(--primary); }
-body.mobile .result-list-grid { grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); }
 
 /* 桌面拖拽导入高亮 */
 .drop-overlay {
@@ -484,85 +485,162 @@ body.mobile .result-list-grid { grid-template-columns: repeat(auto-fill, minmax(
   max-height: 32vh;
 }
 
-/* ===== 移动端（Android/iOS WebView）：状态驱动单任务流 ===== */
-/* 状态语义：state-empty 引导选图 / state-picked 列表+操作栏 / state-running 处理中 / state-done 结果 */
+/* ===== 移动端：App 式四视图（home/list/run/done）单页切换 ===== */
+/* 关键与桌面端不同：整页自然滚动（body 高度由内容决定，顶栏 sticky、操作栏 fixed），
+   彻底废弃"固定一屏 + 面板内部滚动"——旧模型把两个面板压成各半屏的小窗口：
+   文件列表只露一条缝、结果区要在一个 368px 的窗口里滚 950px（真机实测，页面还锁死不能滚）。 */
 body.mobile {
-  overflow: auto;
-  height: 100vh;
+  height: auto;
+  min-height: 100vh;
+  overflow-y: auto;
+  overflow-x: hidden;
   -webkit-text-size-adjust: 100%;
+  background: var(--bg);
 }
 
-/* 顶栏：精简为一行品牌信息，badge 就绪时隐藏（JS 控制 hidden） */
-body.mobile .topbar { padding: 14px 16px 12px; }
-body.mobile .logo { width: 36px; height: 36px; font-size: 18px; border-radius: 10px; }
-body.mobile .brand h1 { font-size: 16px; }
-body.mobile .subtitle { font-size: 11.5px; }
-body.mobile .env-area { width: 100%; justify-content: flex-start; }
-body.mobile .model-progress { min-width: 110px; flex: 1; }
-body.mobile .badge { font-size: 12px; padding: 6px 12px; }
+/* 顶栏：App Bar 风格——56px 吸顶，左品牌、右设置（主题/语言收进设置页） */
+body.mobile .topbar {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  min-height: 56px;
+  padding: 6px 10px 6px 14px;
+  gap: 8px;
+  align-items: center;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  box-shadow: none;
+}
+body.mobile .brand { gap: 10px; min-width: 0; flex: 1 1 auto; }
+body.mobile .logo { width: 30px; height: 30px; border-radius: 9px; flex-shrink: 0; }
+body.mobile .brand > div { min-width: 0; }
+body.mobile .brand h1 {
+  font-size: 17px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+body.mobile .subtitle { display: none; }
+body.mobile .env-area { width: auto; margin-left: auto; flex: 0 0 auto; justify-content: flex-end; gap: 6px; }
+body.mobile .badge { font-size: 11px; padding: 4px 10px; }
+/* 主题/语言按钮在移动端收进设置页；顶栏只留一个齿轮入口 */
+body.mobile #btn-theme,
+body.mobile #btn-lang { display: none; }
+/* 模型下载进度条超出顶栏宽度时换到第二行，独占整行 */
+body.mobile .model-progress { min-width: 120px; flex: 1 1 100%; order: 5; }
 
+/* 图标按钮（顶栏齿轮 / 结果页返回）：44px 触控目标 */
+.icon-btn {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+.icon-btn:active { background: rgba(127, 127, 127, 0.14); }
+/* .icon-btn 的 display 会盖掉 [hidden] 的 UA 样式，这里显式还原隐藏语义 */
+#btn-settings { display: none; }
+#btn-back-list { display: none; }
+body.mobile #btn-settings { display: grid; }
+body.mobile #btn-back-list:not([hidden]) { display: grid; }
+
+/* 布局：单列、内容自由增长；面板取消卡片化（直接平铺更像 App） */
 body.mobile .layout {
-  grid-template-columns: minmax(0, 1fr);
-  gap: 12px;
-  padding: 12px 14px 24px;
+  display: block;
+  flex: none;
+  min-height: 0;
+  padding: 12px 16px 16px;
 }
-body.mobile .panel { padding: 16px 14px; border-radius: 16px; box-shadow: none; }
-body.mobile .panel-head h2 { font-size: 15px; }
+body.mobile .panel {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 0;
+  overflow: visible;
+}
+
+/* ---- 视图切换（与 setState 的 state-* class 联动） ---- */
+/* 处理中：只显示全屏进度页 */
+body.mobile.state-running .files-panel,
+body.mobile.state-running .right-panel,
+body.mobile.state-running .run-area { display: none; }
+body.mobile.state-running .m-run { display: flex; }
 
 /* import 模式下路径条无意义，始终隐藏 */
 body.mobile .folder-path { display: none; }
 
-/* ---- state-empty：只展示一张居中引导卡 ---- */
-body.mobile.state-empty .files-panel .panel-head,
+/* 移动端处理的是应用内副本："覆盖/另存"选择是误导（相册原图永远不会被改），
+   结果统一走「保存到相册/分享」导出，直接隐藏整组选项 */
+body.mobile .output-row,
+body.mobile #output-hint,
+body.mobile .output-dir-row { display: none; }
+
+/* ---- view-home（state-empty）：一屏居中引导 ---- */
 body.mobile.state-empty .list-actions,
 body.mobile.state-empty .run-area,
 body.mobile.state-empty .right-panel { display: none; }
-body.mobile.state-empty .files-panel { padding: 8px 14px 24px; }
+/* 空态只保留文件面板里的引导卡（其余部件整体隐藏） */
+body.mobile.state-empty .files-panel > *:not(#file-list) { display: none; }
+body.mobile.state-empty .file-list {
+  display: block; /* 覆盖 state-picked 的二列网格：空态占满整行 */
+  border: none;
+  padding: 0;
+  background: transparent;
+}
 
 .empty-state {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 6px;
-  padding: 36px 20px;
   text-align: center;
 }
 .empty-icon {
-  width: 72px;
-  height: 72px;
-  padding: 14px;
   color: var(--primary);
   background: var(--primary-soft);
-  border-radius: 24px;
-  margin-bottom: 10px;
 }
 .empty-icon svg { width: 100%; height: 100%; }
-.empty-title { margin: 0; font-size: 16px; font-weight: 600; color: var(--text); }
-.empty-sub { margin: 0 0 18px; font-size: 13px; color: var(--muted); max-width: 260px; line-height: 1.5; }
-
-/* ---- state-picked：列表 + 底部操作栏，结果面板隐藏 ---- */
-body.mobile.state-picked .right-panel { display: none; }
-
-/* ---- state-running / state-done：显示结果面板 ---- */
-
-/* 面板头：标题独占一行，按钮在下一行铺满 */
-body.mobile .files-panel .panel-head {
-  flex-wrap: wrap;
-  row-gap: 10px;
+.empty-title { margin: 0; font-weight: 600; color: var(--text); }
+.empty-sub { margin: 0; color: var(--muted); line-height: 1.55; }
+/* 移动端空态：大图标 + 大标题 + 大按钮，垂直居中（旧版挤在顶部、下方一大片空白） */
+body.mobile .empty-state {
+  min-height: calc(100vh - 170px);
+  justify-content: center;
+  padding: 24px;
 }
-body.mobile .files-panel .panel-head h2 { flex-basis: 100%; font-size: 15px; }
-body.mobile .panel-head .actions { width: 100%; gap: 10px; }
-body.mobile .panel-head .actions .btn { flex: 1; }
-body.mobile #btn-pick {
-  background: var(--primary);
-  border-color: var(--primary);
-  color: #fff;
+body.mobile .empty-icon {
+  width: 104px;
+  height: 104px;
+  padding: 24px;
+  border-radius: 30px;
+  margin-bottom: 14px;
+}
+body.mobile .empty-title { font-size: 20px; }
+body.mobile .empty-sub { font-size: 14px; max-width: 300px; margin: 2px 0 24px; }
+body.mobile .empty-state .btn {
+  min-width: 224px;
+  min-height: 52px;
+  font-size: 16px;
   font-weight: 600;
+  border-radius: 14px;
 }
-body.mobile #btn-pick:hover:not(:disabled) { background: var(--primary-dark); color: #fff; }
-body.mobile #btn-refresh { background: #f2f4f8; border-color: transparent; color: var(--muted); }
 
-/* 大触控目标 */
+/* ---- view-list（state-picked）：缩略图网格 + 底部固定操作栏 ---- */
+body.mobile.state-picked .right-panel { display: none; }
+body.mobile.state-picked .layout { padding-bottom: calc(160px + env(safe-area-inset-bottom)); }
+/* 面板头在移动端由底部操作栏替代（JS 把「添加图片」按钮搬进操作栏） */
+body.mobile .files-panel .panel-head { display: none; }
+/* 导入模式下目录内容不会变，刷新按钮没有意义 */
+body.mobile #btn-refresh { display: none; }
+
+/* 大触控目标基线 */
 body.mobile .btn {
   min-height: 46px;
   padding: 11px 18px;
@@ -570,217 +648,418 @@ body.mobile .btn {
   border-radius: 12px;
 }
 body.mobile .btn.small { min-height: 34px; padding: 5px 12px; font-size: 13px; border-radius: 999px; }
+body.mobile .btn:active:not(:disabled) { transform: scale(0.98); }
 
 /* 全选/清空：轻量胶囊 + 计数右对齐 */
-body.mobile .list-actions { gap: 8px; margin-bottom: 10px; }
-body.mobile .list-actions .btn.small { background: #f2f4f8; border: none; color: var(--text); }
+body.mobile .list-actions { gap: 8px; margin-bottom: 12px; }
+body.mobile .list-actions .btn.small { background: var(--primary-soft); border: none; color: var(--primary); }
 body.mobile .list-actions .btn.small:disabled { opacity: 0.4; }
 body.mobile .list-actions .muted { margin-left: auto; font-size: 13px; }
 
-body.mobile .file-item {
-  padding: 13px 12px;
-  font-size: 15px;
-  gap: 12px;
-  border-radius: 12px;
-  margin-bottom: 6px;
-  background: #f7f8fb;
-  border: 1px solid #eef0f5;
-}
-body.mobile .file-item:has(input:checked) {
-  background: var(--primary-soft);
-  border-color: #cdd4ff;
-}
-body.mobile .file-item input[type="checkbox"] {
-  width: 22px;
-  height: 22px;
-  accent-color: var(--primary);
-  flex-shrink: 0;
-}
-body.mobile .file-item span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+/* 文件网格：两列缩略图卡片（比纯文件名列表更有"相册"感） */
 body.mobile .file-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
   flex: none;
   border: none;
   background: transparent;
-  padding: 2px;
+  padding: 0;
+  overflow: visible;
+}
+body.mobile .m-file-card {
+  position: relative;
+  border-radius: 14px;
+  overflow: hidden;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+body.mobile .m-file-card.checked {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.22);
+}
+/* 隐藏原生复选框（整卡可点，勾选圈由 CSS 画） */
+body.mobile .m-file-card input[type="checkbox"] {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+body.mobile .m-file-thumb {
+  aspect-ratio: 1 / 1;
+  background: var(--bg);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+body.mobile .m-file-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+body.mobile .m-file-thumb .spinner { margin: 0; }
+body.mobile .m-file-name {
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 勾选圈（右上角） */
+body.mobile .m-file-check {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1.5px solid #c8cfdd;
+  display: grid;
+  place-items: center;
+  color: transparent;
+  font-size: 14px;
+  line-height: 1;
+  box-shadow: 0 1px 4px rgba(16, 24, 40, 0.18);
+}
+body.mobile .m-file-card.checked .m-file-check {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+/* 移除按钮（左上角） */
+body.mobile .m-file-del {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(15, 17, 22, 0.55);
+  color: #fff;
+  font-size: 16px;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+  cursor: pointer;
 }
 body.mobile .placeholder { font-size: 14px; padding: 24px 14px; }
 
-/* 底部操作栏：粘性、实底、只留一个主按钮；清理按钮仅完成后出现 */
+/* 底部操作栏：固定贴底、实底、主次双按钮 */
 body.mobile .run-area {
-  position: sticky;
+  position: fixed;
+  left: 0;
+  right: 0;
   bottom: 0;
-  z-index: 5;
+  z-index: 30;
   flex-direction: column;
   align-items: stretch;
-  gap: 6px;
-  margin: 12px -14px calc(-16px);
-  padding: 10px 14px calc(12px + env(safe-area-inset-bottom));
+  gap: 10px;
+  margin: 0;
+  padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
   background: var(--panel);
   border-top: 1px solid var(--border);
   box-shadow: 0 -8px 20px rgba(16, 24, 40, 0.06);
 }
+body.mobile .mask-row { justify-content: space-between; gap: 8px; flex-wrap: nowrap; }
+body.mobile .mask-row #mask-status {
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: right;
+}
+body.mobile .run-buttons { display: flex; gap: 10px; }
+body.mobile #btn-pick {
+  flex: 1 1 40%;
+  min-height: 52px;
+  border: none;
+  border-radius: 14px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 15px;
+  font-weight: 600;
+}
 body.mobile #btn-run {
+  flex: 1 1 60%;
   margin-left: 0;
-  width: 100%;
   min-height: 52px;
   font-size: 16px;
   font-weight: 600;
   border-radius: 14px;
+  box-shadow: 0 4px 14px rgba(79, 70, 229, 0.28);
 }
 body.mobile #btn-run:disabled { box-shadow: none; }
 body.mobile .checkbox { font-size: 13px; padding: 4px 0; }
+body.mobile .run-progress { margin: 0; }
 
-/* 结果卡片 */
-body.mobile .review-grid { grid-template-columns: minmax(0, 1fr); gap: 10px; }
-body.mobile .review-box { border-radius: 14px; }
-body.mobile .review-box figcaption { font-size: 13px; padding: 10px 12px; }
-body.mobile .review-img { min-height: 180px; }
-
-body.mobile .log-box summary { font-size: 14px; padding: 10px 2px; }
-body.mobile .log {
-  min-height: 100px;
-  max-height: 220px;
-  font-size: 12px;
-  padding: 10px;
-  border-radius: 10px;
+/* ---- view-run（state-running）：全屏进度页 ---- */
+.m-run { display: none; }
+body.mobile .m-run {
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 56px; /* 顶栏之下 */
+  bottom: 0;
+  z-index: 25;
+  background: var(--bg);
+  align-items: center;
+  justify-content: center;
 }
-
-body.mobile .topbar {
-  padding: 14px 16px 10px;
-  gap: 8px;
-}
-body.mobile .logo { width: 36px; height: 36px; font-size: 18px; border-radius: 10px; }
-body.mobile .brand h1 { font-size: 16px; }
-body.mobile .subtitle { font-size: 11.5px; }
-body.mobile .env-area { width: 100%; justify-content: space-between; }
-body.mobile .model-progress { min-width: 110px; flex: 1; }
-body.mobile .badge { font-size: 12px; padding: 6px 12px; }
-
-body.mobile .layout {
-  grid-template-columns: minmax(0, 1fr);
+.m-run-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   gap: 12px;
-  padding: 12px 14px 24px;
+  width: 100%;
+  max-width: 340px;
+  padding: 24px;
+  text-align: center;
 }
-body.mobile .panel { padding: 16px 14px; border-radius: 16px; }
-body.mobile .panel-head h2 { font-size: 15px; }
-
-/* 面板头：标题独占一行，按钮在下一行铺满，避免标题被挤压换行 */
-body.mobile .files-panel .panel-head {
-  flex-wrap: wrap;
-  row-gap: 10px;
+.m-run-ring { position: relative; width: 150px; height: 150px; }
+.m-run-ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+.m-run-ring-bg { fill: none; stroke: var(--border); stroke-width: 9; }
+.m-run-ring-fg {
+  fill: none;
+  stroke: var(--primary);
+  stroke-width: 9;
+  stroke-linecap: round;
+  stroke-dasharray: 326.7;
+  stroke-dashoffset: 326.7;
+  transition: stroke-dashoffset 0.35s ease;
 }
-body.mobile .files-panel .panel-head h2 { flex-basis: 100%; font-size: 15px; }
-body.mobile .panel-head .actions { width: 100%; gap: 10px; }
-body.mobile .panel-head .actions .btn { flex: 1; }
-/* 选择图片是移动端核心入口，做成主按钮 */
-body.mobile #btn-pick {
-  background: var(--primary);
-  border-color: var(--primary);
-  color: #fff;
-  font-weight: 600;
-}
-body.mobile #btn-pick:hover:not(:disabled) { background: var(--primary-dark); color: #fff; }
-/* 刷新弱化为次要 */
-body.mobile #btn-refresh { background: #f2f4f8; border-color: transparent; color: var(--muted); }
-
-/* 大触控目标 */
-body.mobile .btn {
-  min-height: 46px;
-  padding: 11px 18px;
-  font-size: 15px;
-  border-radius: 12px;
-}
-body.mobile .btn.small { min-height: 34px; padding: 5px 12px; font-size: 13px; border-radius: 999px; }
-
-/* 全选/清空：轻量胶囊 + 计数右对齐 */
-body.mobile .list-actions { gap: 8px; margin-bottom: 10px; }
-body.mobile .list-actions .btn.small {
-  background: #f2f4f8;
-  border: none;
+.m-run-ring-center {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 26px;
+  font-weight: 700;
   color: var(--text);
+  font-variant-numeric: tabular-nums;
 }
-body.mobile .list-actions .btn.small:disabled { opacity: 0.4; }
-body.mobile .list-actions .muted { margin-left: auto; font-size: 13px; }
-
-body.mobile .file-item {
-  padding: 13px 12px;
-  font-size: 15px;
-  gap: 12px;
-  border-radius: 12px;
-  margin-bottom: 6px;
-  background: #f7f8fb;
-  border: 1px solid #eef0f5;
-}
-body.mobile .file-item:has(input:checked) {
-  background: var(--primary-soft);
-  border-color: #cdd4ff;
-}
-body.mobile .file-item input[type="checkbox"] {
-  width: 22px;
-  height: 22px;
-  accent-color: var(--primary);
-  flex-shrink: 0;
-}
-body.mobile .file-item span {
+.m-run-stage { font-size: 17px; font-weight: 600; color: var(--text); }
+.m-run-name {
+  font-size: 13px;
+  color: var(--muted);
+  max-width: 280px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-body.mobile .file-list {
-  flex: none;
-  border: none;
+body.mobile .m-run .btn.danger {
+  min-height: 48px;
+  padding: 0 44px;
+  margin-top: 12px;
+  border-radius: 14px;
+  border: 1px solid var(--danger);
+  color: var(--danger);
   background: transparent;
-  padding: 2px;
 }
-body.mobile .placeholder { font-size: 14px; padding: 24px 14px; }
-body.mobile .empty-state { padding: 40px 16px; }
-body.mobile .empty-title { font-size: 16px; }
-body.mobile .empty-sub { font-size: 13px; }
-body.mobile .empty-state .btn { min-width: 180px; }
 
-/* 操作区：粘性底栏（实底+描边+投影，视觉上是一条工具栏而非悬浮按钮） */
-body.mobile .run-area {
-  position: sticky;
-  bottom: 0;
-  z-index: 5;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 8px;
-  margin: 12px -14px calc(-16px);
-  padding: 10px 14px calc(12px + env(safe-area-inset-bottom));
-  background: var(--panel);
-  border-top: 1px solid var(--border);
-  box-shadow: 0 -8px 20px rgba(16, 24, 40, 0.06);
+/* ---- view-result（state-done）：结果为主舞台，整页可滚 ---- */
+body.mobile.state-done .files-panel,
+body.mobile.state-done .run-area { display: none; }
+body.mobile.state-done .layout { padding-bottom: calc(24px + env(safe-area-inset-bottom)); }
+body.mobile .right-panel { gap: 12px; overflow: visible; min-height: 0; }
+body.mobile .right-panel .panel-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 2px;
 }
-body.mobile #btn-run {
-  margin-left: 0;
-  width: 100%;
+body.mobile .right-panel .panel-head h2 { font-size: 20px; font-weight: 700; }
+
+body.mobile .result-banner { display: block; border-radius: 16px; padding: 16px; margin-bottom: 0; }
+body.mobile .banner-title { font-size: 18px; font-weight: 700; }
+body.mobile .banner-sub { font-size: 13px; }
+body.mobile .banner-actions { gap: 10px; margin-top: 14px; }
+body.mobile .banner-actions .btn {
+  flex: 1;
   min-height: 52px;
   font-size: 16px;
   font-weight: 600;
   border-radius: 14px;
-  box-shadow: 0 4px 14px rgba(79, 70, 229, 0.3);
 }
-body.mobile .checkbox { font-size: 13px; padding: 4px 0; }
 
-/* 结果卡片 */
+body.mobile .result-list { border-radius: 16px; padding: 12px; margin-bottom: 0; }
+body.mobile .result-list-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  max-height: none;
+  overflow: visible;
+}
+
+/* 折叠区（JS 把前后对比 + 复查图包进 details） */
+body.mobile .collapse {
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--panel);
+  overflow: hidden;
+  margin-top: 12px;
+}
+body.mobile .collapse > summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+body.mobile .collapse > summary::-webkit-details-marker { display: none; }
+body.mobile .collapse > summary::after {
+  content: '▸';
+  color: var(--muted);
+  font-size: 12px;
+  transition: transform 0.15s ease;
+}
+body.mobile .collapse[open] > summary::after { transform: rotate(90deg); }
+body.mobile .collapse > .compare-box,
+body.mobile .collapse > .review-grid { margin: 0 12px 12px; }
 body.mobile .review-grid { grid-template-columns: minmax(0, 1fr); gap: 10px; }
 body.mobile .review-box { border-radius: 12px; }
 body.mobile .review-box figcaption { font-size: 13px; padding: 10px 12px; }
 body.mobile .review-img { min-height: 180px; }
 
-body.mobile .log-box summary { font-size: 14px; padding: 10px 2px; }
-body.mobile .log {
+/* 运行日志：折叠卡片风格 */
+body.mobile .log-box {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--panel);
+  overflow: hidden;
+}
+body.mobile .log-box summary { font-size: 14px; font-weight: 600; color: var(--text); padding: 14px 16px; }
+body.mobile .log-box .log {
+  margin: 0 12px 12px;
   min-height: 100px;
-  max-height: 220px;
+  max-height: 260px;
   font-size: 12px;
   padding: 10px;
   border-radius: 10px;
 }
+
+/* ---- 设置页 ---- */
+.m-settings { display: none; }
+body.m-settings-open .m-settings {
+  display: flex;
+  flex-direction: column;
+  position: fixed;
+  inset: 0;
+  z-index: 800;
+  background: var(--bg);
+}
+.m-settings-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 56px;
+  padding: 6px 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.m-settings-head h2 { margin: 0; font-size: 17px; font-weight: 600; }
+.m-settings-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 16px calc(24px + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.m-settings-group {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  overflow: hidden;
+}
+.m-settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+}
+.m-settings-row + .m-settings-row { border-top: 1px solid var(--border); }
+.m-settings-label { font-size: 14px; color: var(--text); }
+.segmented { display: inline-flex; background: var(--bg); border-radius: 10px; padding: 3px; gap: 2px; }
+.segmented button {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.segmented button.active {
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: var(--shadow);
+}
+.m-settings-danger {
+  width: 100%;
+  border: none;
+  background: transparent;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+  cursor: pointer;
+}
+.m-settings-danger span { font-size: 14px; color: var(--danger); font-weight: 600; }
+.m-settings-danger small { font-size: 12px; color: var(--muted); font-weight: 400; line-height: 1.5; }
+/* 设置页内的高级选项 / 精确模式（由 JS 从主界面搬入） */
+.m-settings .advanced-options { border-top: none; padding-top: 0; }
+.m-settings .advanced-options + .advanced-options { border-top: 1px solid var(--border); }
+.m-settings .advanced-options > summary {
+  padding: 14px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.m-settings .advanced-options .checkbox {
+  padding: 10px 16px;
+  font-size: 14px;
+  align-items: flex-start;
+  line-height: 1.5;
+}
+.m-settings .advanced-options > .checkbox,
+.m-settings .advanced-options > .checkbox + .checkbox { margin-top: 0; }
+.m-settings .advanced-options .checkbox input[type="checkbox"] {
+  width: 22px;
+  height: 22px;
+  margin-top: 1px;
+}
+.m-settings .precise-hint { margin: 0 16px 10px; font-size: 13px; }
+.m-settings .precise-row { margin: 0 16px 10px; }
+.m-settings .precise-row select,
+.m-settings .precise-row input[type="text"] { height: 42px; font-size: 14px; }
+.m-settings .precise-status { margin: 0 16px 14px; font-size: 13px; }
+
+/* 移动端新组件的深色适配 */
+html[data-theme='dark'] body.mobile .m-file-check {
+  background: rgba(32, 36, 46, 0.85);
+  border-color: #4a5163;
+}
+html[data-theme='dark'] body.mobile .m-file-card.checked .m-file-check {
+  background: var(--primary);
+  border-color: var(--primary);
+}
+html[data-theme='dark'] .segmented { background: #232734; }
+html[data-theme='dark'] .segmented button.active { background: #3a4050; }
+html[data-theme='dark'] body.mobile .list-actions .btn.small { background: var(--primary-soft); color: var(--primary); }
 
 @media (max-width: 720px) {
   .topbar { flex-wrap: wrap; gap: 8px; }
@@ -795,7 +1074,13 @@ body.mobile .log {
   body:not(.mobile) .right-panel { overflow-y: visible; }
 }
 
-/* 预览灯箱：点击缩略图/复查图打开高清大图，支持滚轮缩放、拖拽平移 */
+/* 预览灯箱：点击缩略图/复查图打开高清大图，支持滚轮/双指缩放、拖拽平移 */
+/* 长按图片不弹系统菜单（Android WebView 的"保存图片"会把预览/缩略图当原图导出） */
+img {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
 .review-img.has-image { cursor: zoom-in; }
 .review-img.has-image img:hover { outline: 2px solid var(--primary, #5b5bd6); }
 
@@ -859,6 +1144,7 @@ body.mobile .log {
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
+  max-width: calc(100vw - 20px);
 }
 .lightbox-btn {
   border: none;
@@ -871,6 +1157,8 @@ body.mobile .log {
   font-size: 13px;
   cursor: pointer;
   transition: background 0.15s;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .lightbox-btn:hover { background: rgba(255, 255, 255, 0.14); }
 .lightbox-btn:disabled { opacity: 0.4; cursor: default; }
@@ -921,6 +1209,15 @@ body.mobile .log {
 }
 .lightbox-counter[hidden] { display: none; }
 
+/* 移动端：工具栏更紧凑（缩字号/内边距），保证"适应窗口/关闭"一行放得下 */
+body.mobile .lightbox-toolbar {
+  bottom: calc(16px + env(safe-area-inset-bottom));
+  padding: 5px 8px;
+  gap: 2px;
+}
+body.mobile .lightbox-btn { font-size: 12.5px; padding: 0 9px; min-width: 32px; }
+body.mobile .lightbox-zoom { min-width: 42px; }
+
 /* 手动框选水印 */
 .mask-row {
   display: flex;
@@ -957,7 +1254,6 @@ body.mobile .log {
   flex-wrap: wrap;
 }
 .output-dir-row[hidden] { display: none; }
-body.mobile .output-dir-row { display: none; }
 #output-dir-path {
   flex: 1 1 160px;
   min-width: 0;
@@ -1001,6 +1297,13 @@ body.mobile .output-dir-row { display: none; }
 .advanced-options > summary:hover { color: var(--text); }
 .advanced-options > .checkbox { margin-top: 10px; }
 .advanced-options > .checkbox + .checkbox { margin-top: 6px; }
+/* 勾选框统一尺寸与主题色：默认尺寸太小，与文件列表里的大勾选框观感不一致 */
+.advanced-options .checkbox input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--primary);
+  flex-shrink: 0;
+}
 
 /* 精确模式：水印档案选择 / 学习 */
 .precise-hint {
@@ -1063,6 +1366,20 @@ body:not(.mobile) .run-buttons {
   background: #e9ebf3;
   border-radius: 999px;
   overflow: hidden;
+  position: relative;
+}
+/* 处理中：叠加流动高光——单图推理要几十秒且只有阶段级进度事件，
+   没有它进度条长时间停在 0%（实测），看不出"正在进行" */
+body[aria-busy='true'] .run-progress-track::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent 15%, rgba(255, 255, 255, 0.55) 50%, transparent 85%);
+  animation: run-sheen 1.2s linear infinite;
+}
+@keyframes run-sheen {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(100%); }
 }
 .run-progress-bar {
   height: 100%;
@@ -1108,6 +1425,10 @@ body:not(.mobile) .run-buttons {
   font-size: 13px;
   font-weight: 500;
 }
+/* 标题可换行占满剩余宽度，按钮绝不压缩/换行（窄屏下"取消"曾被挤成竖排两行） */
+.mask-head .btn,
+.mask-foot .btn { flex-shrink: 0; }
+.mask-head-title, #mask-head-title { flex: 1 1 auto; min-width: 0; }
 .mask-canvas-wrap {
   position: relative;
   overflow: hidden;
@@ -1218,4 +1539,44 @@ body:not(.mobile) .run-buttons {
   color: #333;
   font-size: 13px;
   box-shadow: 0 1px 6px rgba(0,0,0,0.4);
+}
+
+/* ===== 轻提示（Toast）：操作反馈 =====
+   移动端日志区默认折叠，导出/分享/导入的成败必须有可见反馈；避免遮挡底部
+   粘性操作栏（移动端抬高到栏上方），多条垂直堆叠，点击可关闭。 */
+.toast-root {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: calc(96px + env(safe-area-inset-bottom));
+  z-index: 1200;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: max-content;
+  max-width: min(90vw, 420px);
+  pointer-events: none;
+}
+body:not(.mobile) .toast-root { bottom: 30px; }
+.toast {
+  pointer-events: auto;
+  cursor: pointer;
+  max-width: 100%;
+  padding: 10px 16px;
+  border-radius: 12px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: #fff;
+  background: rgba(31, 36, 48, 0.94);
+  box-shadow: 0 6px 24px rgba(16, 24, 40, 0.3);
+  word-break: break-word;
+  text-align: center;
+}
+.toast-success { background: rgba(20, 128, 71, 0.96); }
+.toast-error { background: rgba(186, 42, 42, 0.96); }
+.toast-enter { animation: toast-in 0.18s ease-out; }
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
 }

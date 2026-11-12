@@ -91,7 +91,10 @@ def probe(rdw, path):
 def fixture_path(kind, name, manifest):
     """解析 fixture 文件：仓内 images/<kind>/ 优先；original 可回退本地 dist/。
     命中即校验 md5——**不符直接报错**，杜绝"换图"静默改变回归基线。"""
-    entry = manifest.get(kind, {}).get(name)
+    # 注意 kind='original' 对应 manifest 的 'originals'（复数）键：曾因单复数错位使
+    # entry 恒为 None、md5 校验被静默跳过（"换图"无告警，只报出误导性的分数不符）。
+    key = 'originals' if kind == 'original' else kind
+    entry = manifest.get(key, {}).get(name)
     fx = FIXTURE_IMAGES / kind / name
     fallback = (DIST / name) if kind == 'original' else None
     for p in (fx, fallback):
@@ -735,6 +738,30 @@ def run_verify_checks(rdw, only):
         rdw._retry_inpaint = saved_retry2
     rows.append(({**base, 'name': 'inverse result skips MAT retry'},
                  retry_calls == [], f'retry calls {len(retry_calls)}'))
+    # .layered（压字分层还原）结果跳过模板残留判据：它有意保留内容像素（文字/线条），
+    # 而该场景模板 gap-score 往往由文字驱动（8.png 实测：把文字涂成背景色后锚点分
+    # 48.9→0.0）——残留判据测到的是被保留的文字而非水印 → 假 FAIL。带侧车必须放行、
+    # 不带侧车仍须 FAIL（证明放行确实由侧车触发）。
+    work2 = tmp / 'work2'
+    for sub in ('source', 'masks', 'lama'):
+        (work2 / sub).mkdir(parents=True, exist_ok=True)
+    _sh.copy(dist2, work2 / 'source' / '2.png')
+    Image.fromarray(mask_arr).save(work2 / 'masks' / '2.png')
+    (work2 / 'masks' / '2.png.tpl').write_text('')
+    _sh.copy(dist2, work2 / 'lama' / '2.png')  # 结果未修复 → 模板残留（字数驱动）
+    saved3 = (rdw.SOURCE, rdw.MASKS, rdw.LAMA)
+    rdw.SOURCE, rdw.MASKS, rdw.LAMA = work2 / 'source', work2 / 'masks', work2 / 'lama'
+    try:
+        rep = rdw.verify_repaired('2.png', tmp)
+        fail_without = bool(rep and rep['verdict'] == 'FAIL')
+        (work2 / 'masks' / '2.png.layered').write_text('')
+        rep2 = rdw.verify_repaired('2.png', tmp)
+        skip_with = bool(rep2 and rep2['verdict'] != 'FAIL')
+    finally:
+        rdw.SOURCE, rdw.MASKS, rdw.LAMA = saved3
+    rows.append(({**base, 'name': 'layered result skips template residual'},
+                 fail_without and skip_with,
+                 f'without_sidecar_fail={fail_without} with_sidecar_pass={skip_with}'))
     rmtree(tmp, ignore_errors=True)
     return rows
 
@@ -1120,6 +1147,102 @@ def run_detect_floor_checks(rdw, only):
     return rows
 
 
+def run_overlap_text_checks(rdw, only):
+    """压字水印分层还原（--overlap-text，2026-10）：半透明浅色水印压在深色文字上时，
+    生成式修补会把文字当背景一并抹掉/糊成灰带，模板笔画 mask 也盖不住压字区灰带。
+    分层还原（内容原样保留 + 上下干净带重建背景）须满足：
+    ① 只改"重建的背景层"像素（rep 之外逐字节不变）；
+    ② 文字笔画保留（结果仍深色，未被背景替换掉）；
+    ③ 水印（提亮/压暗区）被背景重建清除；
+    ④ 采样带被橙色线条污染的列不得把橙色沿列涂抹进重建区（V21 事故的回归锁）。"""
+    import cv2
+    import numpy as np
+    if only and 'overlap-text' not in only:
+        return []
+    rng = np.random.default_rng(11)
+    H, W = 320, 720
+    cream = np.array([246.0, 244.0, 232.0], np.float32)
+    bg = np.tile(cream, (H, W, 1)) + rng.normal(0, 1.0, (H, W, 3)).astype(np.float32)
+    # 文字行：8 个"口"形笔画块（深色，y170..210）
+    text = np.zeros((H, W), bool)
+    x = 70
+    for _ in range(8):
+        text[170:176, x:x + 30] = True
+        text[204:210, x:x + 30] = True
+        text[170:210, x:x + 6] = True
+        text[170:210, x + 24:x + 30] = True
+        x += 46
+    # 橙色线条：横穿水印框上方采样带的中段（模拟 7.png 橙色边框穿进采样带）
+    line = np.zeros((H, W), bool)
+    line[84:106, 180:520] = True
+    clean = bg.copy()
+    clean[text] = (26, 26, 24)
+    clean[line] = (196, 140, 83)
+    # 半透明浅灰水印大字（比文字大、压在文字行上；α 平滑）
+    wm = np.zeros((H, W), np.float32)
+    for i in range(6):
+        wm[150:230, 130 + 84 * i:200 + 84 * i] = 1.0
+    wm = cv2.GaussianBlur(wm, (0, 0), 6.0)
+    alpha = (wm * 0.35)[..., None]
+    obs = clean * (1 - alpha) + np.array([206.0, 205.0, 200.0], np.float32) * alpha
+    obs8 = np.clip(obs, 0, 255).astype(np.uint8)
+    out, rep, info = rdw.layered_text_restore(obs8, wm > 0.03)
+    rows = []
+    if out is None:
+        rows.append(({'group': 'overlap-text', 'name': 'layered restore runs', 'expect': 'ok'},
+                     False, f'no output: {info}'))
+        return rows
+    diff = np.abs(out.astype(np.int16) - obs8.astype(np.int16)).max(axis=2)
+    rows.append(({'group': 'overlap-text', 'name': 'rep pixels only change', 'expect': 'ok'},
+                 int(diff[~rep].max()) == 0 and int(rep.sum()) > 2000,
+                 f'outside max diff {int(diff[~rep].max())}, rebuilt {int(rep.sum())}px'))
+    core = cv2.erode(text.astype(np.uint8) * 255, np.ones((3, 3), np.uint8)) > 0
+    core_out = float(out[core].mean())
+    rows.append(({'group': 'overlap-text', 'name': 'text strokes preserved', 'expect': 'ok'},
+                 core_out < 105.0,
+                 f'text core mean lum {core_out:.1f} (clean {float(clean[core].mean()):.1f}, '
+                 f'under watermark {float(obs8[core].mean()):.1f})'))
+    far = ~(cv2.dilate(text.astype(np.uint8) * 255, np.ones((9, 9), np.uint8)) > 0)
+    sample = rep & far
+    err = np.abs(out.astype(np.float32) - clean).mean(axis=2)[sample]
+    obs_err = np.abs(obs8.astype(np.float32) - clean).mean(axis=2)[sample]
+    rows.append(({'group': 'overlap-text', 'name': 'watermark rebuilt to background', 'expect': 'ok'},
+                 float(err.mean()) < 4.0,
+                 f'mean |out-clean| {float(err.mean()):.2f} (obs {float(obs_err.mean()):.2f}) '
+                 f'over {int(sample.sum())}px'))
+    sub = out[150:240, 200:500].astype(np.float32)
+    rb_mean = float((sub[:, :, 0] - sub[:, :, 2]).mean())
+    rows.append(({'group': 'overlap-text', 'name': 'no orange smear from contaminated band', 'expect': 'ok'},
+                 rb_mean < 30.0,
+                 f'mean R-B in rebuilt area {rb_mean:.1f} (orange core 113, clean bg 14)'))
+    # ⑤ 检测框（模板画布）大于笔画 mask：区域必须按检测框展开。8.png 实测模板 α 只盖
+    #    字形中部（254x79）而真实水印 307x102——区域按 mask bbox 取会漏掉字形上/下缘，
+    #    模板残留卡 45.1 不降。用大模糊水印模拟：mask 取高阈值核心（范围明显偏小），
+    #    region_box 取低阈值外缘框，断言重绘区扩展到了框的边界附近。
+    wm2 = np.zeros((H, W), np.float32)
+    for i in range(6):
+        wm2[150:230, 130 + 84 * i:200 + 84 * i] = 1.0
+    wm2 = cv2.GaussianBlur(wm2, (0, 0), 12.0)
+    alpha2 = (wm2 * 0.35)[..., None]
+    obs2 = np.clip(clean * (1 - alpha2) + np.array([206.0, 205.0, 200.0], np.float32) * alpha2,
+                   0, 255).astype(np.uint8)
+    ys2, xs2 = np.nonzero(wm2 > 0.03)
+    rbox = [int(xs2.min()), int(ys2.min()), int(xs2.max()) + 1, int(ys2.max()) + 1]
+    out2, rep2, info2 = rdw.layered_text_restore(obs2, wm2 > 0.9, region_box=rbox)
+    if out2 is None or rep2 is None:
+        rows.append(({'group': 'overlap-text', 'name': 'detection box widens region', 'expect': 'ok'},
+                     False, f'no output: {info2}'))
+    else:
+        rr = np.nonzero(rep2.any(axis=1))[0]
+        cc = np.nonzero(rep2.any(axis=0))[0]
+        expanded = (rr.min() <= rbox[1] + 6 and rr.max() >= rbox[3] - 7
+                    and cc.min() <= rbox[0] + 6 and cc.max() >= rbox[2] - 7)
+        rows.append(({'group': 'overlap-text', 'name': 'detection box widens region', 'expect': 'ok'},
+                     expanded,
+                     f'rep extent x[{cc.min()},{cc.max()}] y[{rr.min()},{rr.max()}] vs box {rbox}'))
+    return rows
+
+
 def run_fixture_checks(rdw, only):
     """固化 fixtures 完整性（CI 可跑、不依赖 dist/根目录）：入库的 original/processed
     fixture 必须与 manifest 的 md5 一致——任何"换图/改图"在此**显式红灯**，而不是让回归
@@ -1132,7 +1255,9 @@ def run_fixture_checks(rdw, only):
         return rows
     bad = []
     for kind in ('original', 'processed'):
-        for name, entry in sorted(manifest.get(kind, {}).items()):
+        # kind='original' 的 manifest 键是 'originals'（复数）；单复数错位曾让该校验静默失效
+        key = 'originals' if kind == 'original' else kind
+        for name, entry in sorted(manifest.get(key, {}).items()):
             fx = FIXTURE_IMAGES / kind / name
             if fx.exists() and entry.get('md5') and md5(fx) != entry['md5']:
                 bad.append(f'{kind}/{name}')
@@ -1143,6 +1268,31 @@ def run_fixture_checks(rdw, only):
                  ('mismatch: ' + ','.join(bad)) if bad
                  else f'committed originals={n_orig} processed={n_proc} '
                       f'(manifest originals={len(manifest["originals"])} processed={len(manifest["processed"])})'))
+    # 防回归自检：fixture_path 必须对"库内文件与 manifest md5 不符"报错（换图守卫）。
+    # 用临时目录 + 假 manifest 验证，不依赖真实 fixtures。
+    with tempfile.TemporaryDirectory() as td:
+        tdp = Path(td)
+        (tdp / 'original').mkdir()
+        probe_file = tdp / 'original' / 'x.png'
+        probe_file.write_bytes(b'fixture-guard-probe')
+        good_md5 = hashlib.md5(b'fixture-guard-probe').hexdigest()
+        saved_images = globals()['FIXTURE_IMAGES']
+        globals()['FIXTURE_IMAGES'] = tdp
+        try:
+            swapped_raised = False
+            try:
+                fixture_path('original', 'x.png', {'originals': {'x.png': {'md5': '0' * 32}}})
+            except SystemExit:
+                swapped_raised = True
+            matched_accepted = (
+                fixture_path('original', 'x.png', {'originals': {'x.png': {'md5': good_md5}}}) is not None
+            )
+        finally:
+            globals()['FIXTURE_IMAGES'] = saved_images
+    rows.append(({'group': 'fixtures', 'name': 'md5 guard rejects swapped library input', 'expect': 'ok'},
+                 swapped_raised and matched_accepted,
+                 f'reject_swapped={"Y" if swapped_raised else "N"} '
+                 f'accept_matched={"Y" if matched_accepted else "N"}'))
     return rows
 
 
@@ -1208,6 +1358,7 @@ def main():
     rows += run_anchor_checks(rdw, args.only)
     rows += run_sd_checks(rdw, args.only)
     rows += run_detect_floor_checks(rdw, args.only)
+    rows += run_overlap_text_checks(rdw, args.only)
 
     print(f'{"layer":5s} {"case":40s} {"expect":6s} {"mark":5s} detail')
     fails = 0

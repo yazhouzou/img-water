@@ -29,6 +29,7 @@ $P $S inpaint [文件]              # 默认**纯 MAT**；随后两轮自动兜�
 $P $S --inverse inpaint [文件]     # 额外启用 stamp 逆解（逐图标定 gain+墨色 C + 结果择优，可保真实纹理，半透明水印压在花丛/枝叶上时**优于 SD**，故默认关）
 $P $S --no-retry inpaint [文件]   # 关残留重试
 $P $S --sd inpaint [文件]         # 水印压在高频纹理（花丛/枝叶）上时用 SD 生成式修补（默认关：要下 ~4GB 模型、单图分钟级；按背景纹理自动路由，平滑图仍走 MAT）
+$P $S --overlap-text inpaint [文件]  # 水印压在文字/线条上：分层还原（保文字+只重建背景；区域用检测框 .lbox；prepare 提示深色占比≥2.5% 时改用；见 lessons §17）
 $P $S review-lama [文件]          # 候选复查图 + PASS/WARN/FAIL
 $P $S overwrite-review [文件]     # FAIL 拒绝覆盖
 $P $S --force overwrite-review [文件]
@@ -62,7 +63,7 @@ $P $S --root /path run            # 项目外目录
 - **残留重试（默认开、1 轮、`--no-retry` 关）**：残留判定 = 绝对分 ≥ `TEMPLATE_MIN_SCORE`(20) 或 相对分 ≥ 原分 `TEMPLATE_RESIDUAL_RATIO`(0.2) 且 ≥ `TEMPLATE_RESIDUAL_FLOOR`(8)——低对比残影达不到 20，靠相对判据兜底。命中即 mask 膨胀一级（`RETRY_DILATE=5x5`）隔离重跑；仍残留交 `overwrite-review` 拒绝。**逆解已生效的图跳过重试**——逆解是精确物理恢复，生成式 MAT 重试会把它重新糊掉（`.tpl`/`.wprof` 侧车标记者不入重试候选）。
 - **备份**：`original-watermark-backup/` 不存在才复制、不覆盖；通过后删备份与 `/tmp` 复查产物。
 - **覆盖安全（md5）**：prepare 记源 md5 到 `WORK/manifest.json`，`overwrite-review` 覆盖前校验，不一致/无 manifest 拒绝。**`--root` 不得指向 `dist/`**。
-- **回归**：`tools/watermark_regression.py`（L1 快；`--e2e --model lama` 慢）；**L1 已接入 CI**（`.github/workflows/watermark-regression.yml`，改 `tools/**`/`tests/**` 的推送/PR 必跑，含 dist 无关的合成泛化 + 墨色标定 + MAT 低频带偏用例）；改管线后先 `verify` 再回归。**输入已固化为 fixtures**：`tests/fixtures/manifest.json`（全量 md5+尺寸+模板分+掩码框金标准）+ `tests/fixtures/images/`（精选子集入库，CI 只跑这些）。回归**只读 fixtures**，`fixture_path` 命中即校验 md5、不符**直接报错**（杜绝"换图"静默改基线）；豆包正/负样本除"命中/不命中"外还**比对金标准分（±max(3,25%)）与掩码框 IoU≥0.5**。**输入有变按需 `--update-golden` 显式重算**（会拷入库子集+写 manifest，git diff 即审计）。
+- **回归**：`tools/watermark_regression.py`（L1 快；`--e2e --model lama` 慢）；**L1 已接入 CI**（`.github/workflows/watermark-regression.yml`，改 `tools/**`/`tests/**` 的推送/PR 必跑，含 dist 无关的合成泛化 + 墨色标定 + MAT 低频带偏用例）；改管线后先 `verify` 再回归。**输入已固化为 fixtures**：`tests/fixtures/manifest.json`（全量 md5+尺寸+模板分+掩码框金标准）+ `tests/fixtures/images/`（精选子集入库，CI 只跑这些）。回归**只读 fixtures**，`fixture_path` 命中即校验 md5、不符**直接报错**（杜绝"换图"静默改基线；**注意 kind='original' 对应 manifest 的 `originals` 复数键——单复数错位曾使 original 的 md5 校验整体静默失效/"换图不报错只报分数不符",已修，并有 L1 用例 `md5 guard rejects swapped library input` 兜底**）；豆包正/负样本除"命中/不命中"外还**比对金标准分（±max(3,25%)）与掩码框 IoU≥0.5**。**输入有变按需 `--update-golden` 显式重算**（会拷入库子集+写 manifest，git diff 即审计）。**库内无文件、dist 有同名文件的条目**（本地参测图）：dist 被换图时 `fixture_path` 会明确报错而非产出误导性 FAIL。
 - **新增功能不得影响老功能**：改 mask/检测/管线时，老路径（豆包模板命中、已去水印跳过）的默认行为必须逐字节不变；任何新能力须同时在 `watermark_regression.py` 增加防回归用例（尤其"暗描边/低对比残影"这类 gap-score 测不到的盲区），CI 不绿不许合并。
 - **质量标准**：① 无水印残留；② 背景纹理自然无矩形糊块；③ 不破坏主体/边缘/地面/水面；④ 回复前必须完成**落盘复查**。
 

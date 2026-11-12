@@ -61,7 +61,7 @@ cd desktop/src-tauri && cargo build --release --bin clean-cli
 
 ```bash
 cd desktop && pnpm install
-pnpm tauri dev            # 桌面调试
+pnpm dev                  # 桌面调试（dev.sh，自动屏蔽 ~/.zshrc 旧编译变量）
 pnpm tauri android dev    # Android 真机（需 NDK，见 tools/android-check.sh）
 ./tools/ui-preview.sh     # UI 浏览器联调（零 SDK，?mobile=1/0 ?nomodel=1）
 cd src-tauri && cargo test -- --include-ignored   # 单测 + LaMa E2E（需 .models/lama_fp32.onnx）
