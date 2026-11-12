@@ -755,6 +755,118 @@ function setComparePos(pct) {
   els.compareHandle.style.left = pos + '%';
 }
 
+// —— 移动端逐张前后对比（整图）——
+// 桌面端沿用「角落复查拼图」滑块（setupCompare）；移动端改为逐张结果图整图对比：
+// 处理前=批次内原图、处理后=输出图，多张时可左右切换、单张时隐藏导航。
+// 拼图对比在手机上是一张随张数变长的长条，无法放大细节、也不能只看某一张。
+const MCOMPARE_CACHE_MAX = 3;
+let mCompare = { pairs: [], index: 0, cache: new Map(), nav: null, loading: 0 };
+
+function ensureCompareNav() {
+  if (mCompare.nav) return mCompare.nav;
+  const nav = document.createElement('div');
+  nav.className = 'compare-nav';
+  nav.hidden = true;
+  const mkBtn = (cls, labelKey, glyph) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = cls;
+    btn.dataset.i18nAria = labelKey;
+    btn.setAttribute('aria-label', t(labelKey));
+    btn.textContent = glyph;
+    // 按钮上的指针事件不进入滑块拖动/点击跳转
+    btn.addEventListener('pointerdown', (ev) => ev.stopPropagation());
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      stepCompare(cls === 'compare-prev' ? -1 : 1);
+    });
+    return btn;
+  };
+  const prev = mkBtn('compare-prev', 'prevImage', '‹');
+  const next = mkBtn('compare-next', 'nextImage', '›');
+  const counter = document.createElement('span');
+  counter.className = 'compare-counter';
+  nav.append(prev, counter, next);
+  els.compareBox.appendChild(nav);
+  mCompare.nav = { el: nav, prev, next, counter };
+  return mCompare.nav;
+}
+
+function updateCompareNav() {
+  const nav = mCompare.nav;
+  if (!nav) return;
+  const n = mCompare.pairs.length;
+  nav.el.hidden = n <= 1;
+  nav.counter.textContent = n > 0 ? t('imageCounter')(mCompare.index + 1, n) : '';
+  nav.prev.disabled = n <= 1;
+  nav.next.disabled = n <= 1;
+}
+
+function stepCompare(delta) {
+  const n = mCompare.pairs.length;
+  if (n <= 1) return;
+  showMobileCompareAt(((mCompare.index + delta) % n + n) % n);
+}
+
+async function showMobileCompareAt(i) {
+  const pair = mCompare.pairs[i];
+  if (!pair) return;
+  mCompare.index = i;
+  updateCompareNav();
+  const cached = mCompare.cache.get(pair.source);
+  if (cached) {
+    applyCompareImages(cached[0], cached[1]);
+    return;
+  }
+  mCompare.loading += 1;
+  els.compareBox.classList.add('loading');
+  let fallbackIdx = -1;
+  try {
+    const [sourcePreview, finalPreview] = await Promise.all([
+      invoke('read_image_base64', { path: pair.source, lang: window.i18n.lang }),
+      invoke('read_image_base64', { path: pair.final, lang: window.i18n.lang }),
+    ]);
+    // LRU：只留最近 3 张，大图 base64 常驻多了内存吃紧
+    mCompare.cache.set(pair.source, [sourcePreview.data_url, finalPreview.data_url]);
+    while (mCompare.cache.size > MCOMPARE_CACHE_MAX) {
+      mCompare.cache.delete(mCompare.cache.keys().next().value);
+    }
+    if (mCompare.index === i) applyCompareImages(sourcePreview.data_url, finalPreview.data_url);
+  } catch (_) {
+    // 个别原图读不出（理论上副本模式必然存在）：剔除该张，退到就近一张
+    fallbackIdx = mCompare.pairs.indexOf(pair);
+    if (fallbackIdx >= 0) mCompare.pairs.splice(fallbackIdx, 1);
+  } finally {
+    mCompare.loading = Math.max(0, mCompare.loading - 1);
+    if (mCompare.loading === 0) els.compareBox.classList.remove('loading');
+  }
+  if (fallbackIdx >= 0) {
+    if (mCompare.pairs.length === 0) {
+      els.compareBox.hidden = true;
+      updateCompareNav();
+    } else {
+      showMobileCompareAt(Math.max(0, Math.min(fallbackIdx, mCompare.pairs.length - 1)));
+    }
+  }
+}
+
+function applyCompareImages(sourceUrl, finalUrl) {
+  els.compareSource.src = sourceUrl;
+  els.compareFinal.src = finalUrl;
+  els.compareBox.hidden = false;
+  setComparePos(50);
+}
+
+async function setupMobileCompare(pairs) {
+  mCompare.pairs = pairs.slice();
+  mCompare.index = 0;
+  mCompare.cache.clear();
+  mCompare.loading = 0;
+  ensureCompareNav();
+  updateCompareNav();
+  await showMobileCompareAt(0);
+}
+
 async function refreshEnv() {
   try {
     const status = await invoke('env_status');
@@ -895,10 +1007,28 @@ function renderFileGrid(names) {
       ev.preventDefault();
       ev.stopPropagation();
       if (running || importing) return;
+      // 局部移除：只摘掉这张卡片（不再 refreshFiles 整表重建——那会把
+      // 所有缩略图重新读取并重放渐入动画，删除一张的代价变成整页闪烁）
+      card.classList.add('removing');
       try {
-        await invoke('remove_import_file', { dir: targetRoot, name, lang: window.i18n.lang });
-        await refreshFiles();
+        await Promise.all([
+          invoke('remove_import_file', { dir: targetRoot, name, lang: window.i18n.lang }),
+          new Promise((r) => setTimeout(r, 180)), // 与 .removing 动画时长一致
+        ]);
+        // 缩略图队列里可能还有这张未发起的任务，摘掉省一次无效读取
+        for (let i = thumbQueue.length - 1; i >= 0; i--) {
+          if (thumbQueue[i].img === img) thumbQueue.splice(i, 1);
+        }
+        card.remove();
+        const remain = els.fileList.querySelectorAll('.m-file-card').length;
+        if (remain === 0) {
+          renderFiles([]); // 删空：走空态（同步 selectAll/btnRun 等全部状态）
+        } else {
+          els.fileCount.textContent = t('fileCount')(remain);
+          updateRunButton();
+        }
       } catch (err) {
+        card.classList.remove('removing');
         logLine(t('logError')(String(err)));
         showToast(t('removeImageFail')(String(err)), { type: 'error' });
       }
@@ -1200,8 +1330,13 @@ function clearReviews() {
 // 清空前后对比 slider：避免"恢复原图"后仍显示已失效的处理结果对比
 function clearCompare() {
   els.compareBox.hidden = true;
+  els.compareBox.classList.remove('loading');
   els.compareSource.removeAttribute('src');
   els.compareFinal.removeAttribute('src');
+  mCompare.pairs = [];
+  mCompare.cache.clear();
+  mCompare.loading = 0;
+  if (mCompare.nav) mCompare.nav.el.hidden = true;
 }
 
 function basename(p) {
@@ -1542,7 +1677,16 @@ function handleExit(payload) {
   const finalMatch = lastMatch(/final review: (.+)/g);
   if (sourceMatch) showReview(els.reviewCandidate, sourceMatch[1].trim());
   if (finalMatch) showReview(els.reviewFinal, finalMatch[1].trim());
-  if (sourceMatch && finalMatch) {
+  const mobilePairs = isMobile && payload.success && targetRoot
+    ? (payload.outputs || []).filter(Boolean).map((p) => ({
+        final: p,
+        // 移动端恒为副本模式：原图就在批次目录、与输出同名（输出在 watermark-cleaned/）
+        source: targetRoot.replace(/\/+$/, '') + '/' + basename(p),
+      }))
+    : [];
+  if (mobilePairs.length > 0) {
+    setupMobileCompare(mobilePairs);
+  } else if (sourceMatch && finalMatch) {
     setupCompare(sourceMatch[1].trim(), finalMatch[1].trim());
   }
   refreshEnv();
@@ -1595,22 +1739,39 @@ async function init() {
     if (!running) startModelDownload(false);
   });
 
-  let compareDragging = false;
+  // 对比滑块手势：单击跳转、横向拖动调分割线、纵向滑动交给页面滚动（touch-action: pan-y）。
+  // 旧实现整块 touch-action:none + pointerdown 立即跳位：手机上手指落在对比图上想继续
+  // 滚页面会被"钉住"，且一碰就跳位置。鼠标（桌面）不受方向判定限制，体验与旧版一致。
+  let compareDrag = null;
   const comparePct = (ev) => {
     const rect = els.compareBox.getBoundingClientRect();
     return ((ev.clientX - rect.left) / rect.width) * 100;
   };
   els.compareBox.addEventListener('pointerdown', (ev) => {
     if (els.compareBox.hidden) return;
-    compareDragging = true;
-    els.compareBox.setPointerCapture(ev.pointerId);
-    setComparePos(comparePct(ev));
+    if (ev.target.closest && ev.target.closest('.compare-nav')) return; // 导航按钮单独处理
+    compareDrag = { id: ev.pointerId, x0: ev.clientX, y0: ev.clientY, locked: false };
   });
   els.compareBox.addEventListener('pointermove', (ev) => {
-    if (compareDragging) setComparePos(comparePct(ev));
+    if (!compareDrag || ev.pointerId !== compareDrag.id) return;
+    const dx = ev.clientX - compareDrag.x0;
+    const dy = ev.clientY - compareDrag.y0;
+    if (!compareDrag.locked) {
+      const isMouse = ev.pointerType === 'mouse';
+      if (!isMouse && Math.abs(dx) < 5 && Math.abs(dy) < 5) return;
+      if (!isMouse && Math.abs(dx) <= Math.abs(dy)) { compareDrag = null; return; } // 纵向：让页面滚
+      compareDrag.locked = true;
+      try { els.compareBox.setPointerCapture(ev.pointerId); } catch (_) {}
+    }
+    setComparePos(comparePct(ev));
   });
-  els.compareBox.addEventListener('pointerup', () => { compareDragging = false; });
-  els.compareBox.addEventListener('pointercancel', () => { compareDragging = false; });
+  els.compareBox.addEventListener('pointerup', (ev) => {
+    if (!compareDrag || ev.pointerId !== compareDrag.id) return;
+    const moved = Math.abs(ev.clientX - compareDrag.x0) + Math.abs(ev.clientY - compareDrag.y0);
+    if (!compareDrag.locked && moved < 6) setComparePos(comparePct(ev)); // 单击：跳到点击处
+    compareDrag = null;
+  });
+  els.compareBox.addEventListener('pointercancel', () => { compareDrag = null; });
 
   listen('pipeline-log', (event) => logLine(event.payload));
   listen('pipeline-exit', (event) => handleExit(event.payload));
