@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "图片水印清理助手",
+        "title": "水印清理",
         "width": 1080,
         "height": 780,
         "minWidth": 860,

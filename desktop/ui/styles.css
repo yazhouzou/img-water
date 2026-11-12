@@ -1580,3 +1580,248 @@ body:not(.mobile) .toast-root { bottom: 30px; }
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* ================= v0.6.1 移动端视觉焕新 =================
+   仅 body.mobile 生效，桌面端样式与结构不受影响。
+   旧 WebView（color-mix / backdrop-filter 不支持）自动回退纯色背景。 */
+
+/* 顶栏：半透明毛玻璃 */
+body.mobile .topbar {
+  background: var(--panel);
+  background: color-mix(in srgb, var(--panel) 86%, transparent);
+  -webkit-backdrop-filter: blur(14px) saturate(1.6);
+  backdrop-filter: blur(14px) saturate(1.6);
+}
+body.mobile .logo { box-shadow: 0 4px 12px rgba(90, 61, 240, 0.26); }
+
+/* 主按钮：品牌渐变 + 柔光投影（成功徽章与已保存态见结果页段） */
+body.mobile .btn.primary {
+  background: linear-gradient(135deg, #7a5cff 0%, #5a3df0 100%);
+  border: none;
+  box-shadow: 0 6px 16px rgba(90, 61, 240, 0.30);
+}
+body.mobile .btn.primary:disabled { box-shadow: none; }
+html[data-theme='dark'] body.mobile .btn.primary {
+  background: linear-gradient(135deg, #8471ff 0%, #5f4bf6 100%);
+  box-shadow: 0 6px 16px rgba(95, 75, 246, 0.32);
+}
+
+/* 空态：图标浮动 + 三步使用引导卡 */
+body.mobile .empty-icon {
+  box-shadow: 0 14px 34px rgba(90, 61, 240, 0.18);
+  animation: empty-float 3.8s ease-in-out infinite;
+}
+@keyframes empty-float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-7px); }
+}
+body.mobile .empty-steps {
+  list-style: none;
+  margin: 2px 0 26px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(300px, 100%);
+  text-align: left;
+}
+body.mobile .empty-steps li {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 11px 14px;
+  box-shadow: var(--shadow);
+}
+body.mobile .empty-step-num {
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+/* 列表卡片：柔投影、勾选圈弹跳 + 渐变、缩略图渐入 */
+body.mobile .m-file-card { box-shadow: 0 2px 10px rgba(16, 24, 40, 0.05); }
+body.mobile .m-file-card.checked {
+  border-color: transparent;
+  box-shadow: 0 0 0 2px rgba(102, 77, 246, 0.55), 0 6px 16px rgba(90, 61, 240, 0.16);
+}
+body.mobile .m-file-card.checked .m-file-check {
+  background: linear-gradient(135deg, #7a5cff, #5a3df0);
+  border-color: transparent;
+  animation: check-pop 0.22s ease;
+}
+@keyframes check-pop {
+  0% { transform: scale(0.72); }
+  70% { transform: scale(1.12); }
+  100% { transform: scale(1); }
+}
+body.mobile .m-file-thumb img { opacity: 0; transition: opacity 0.28s ease; }
+body.mobile .m-file-thumb img[data-ready] { opacity: 1; }
+
+/* 底部操作栏：上圆角浮起卡片感 */
+body.mobile .run-area {
+  border: none;
+  border-radius: 22px 22px 0 0;
+  box-shadow: 0 -10px 34px rgba(16, 24, 40, 0.12);
+}
+body.mobile #btn-run { box-shadow: 0 6px 18px rgba(90, 61, 240, 0.32); }
+body.mobile #btn-run:disabled { box-shadow: none; }
+
+/* 视图切换淡入（元素从 display:none 恢复显示时动画自然重放） */
+@keyframes view-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+body.mobile.state-picked .files-panel { animation: view-in 0.26s ease; }
+body.mobile.state-done .right-panel { animation: view-in 0.26s ease; }
+body.mobile.state-running .m-run { animation: view-in 0.26s ease; }
+
+/* 处理中页：进度环渐变描边 + 光晕 + 「保持前台」提示 */
+.m-run-ring-fg { stroke: url(#m-run-grad); }
+body.mobile .m-run-ring { filter: drop-shadow(0 12px 32px rgba(90, 61, 240, 0.22)); }
+body.mobile .m-run-hint {
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+/* 结果页：成功横幅渐变底 + 绿色对钩徽章 */
+.banner-check { display: inline; }
+.banner-check::before { content: '✓ '; }
+body.mobile .banner-check {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #34d97b, #16a34a);
+  box-shadow: 0 6px 16px rgba(22, 163, 74, 0.32);
+  margin-bottom: 10px;
+}
+body.mobile .banner-check::before { content: '✓'; color: #fff; font-size: 19px; font-weight: 800; }
+body.mobile .result-banner.ok {
+  background:
+    radial-gradient(120% 100% at 100% 0%, rgba(52, 217, 123, 0.16), rgba(52, 217, 123, 0) 55%),
+    var(--panel);
+  border: 1px solid rgba(52, 217, 123, 0.35);
+  color: var(--text);
+  box-shadow: 0 10px 28px rgba(16, 24, 40, 0.06);
+}
+html[data-theme='dark'] body.mobile .result-banner.ok {
+  background:
+    radial-gradient(120% 100% at 100% 0%, rgba(52, 217, 123, 0.13), rgba(52, 217, 123, 0) 55%),
+    #1a2430;
+  border-color: rgba(52, 217, 123, 0.3);
+  color: var(--text);
+}
+body.mobile .result-thumb { transition: opacity 0.28s ease; }
+
+/* 保存/分享按钮层次：保存为主（渐变）、分享为次（浅紫）；保存成功短暂变绿 */
+body.mobile .banner-actions .btn.secondary {
+  background: var(--primary-soft);
+  color: var(--primary);
+  box-shadow: none;
+}
+body.mobile .banner-actions .btn.secondary:disabled { opacity: 0.5; }
+body.mobile .banner-actions .btn.saved {
+  background: linear-gradient(135deg, #34d97b, #16a34a) !important;
+  box-shadow: 0 6px 16px rgba(22, 163, 74, 0.3) !important;
+}
+
+/* 设置页分段控件过渡 */
+.segmented button { transition: color 0.18s, background 0.18s; }
+
+/* 首次启动引导层（移动端专用，disclaimer 同意后展示一次） */
+.intro-overlay { display: none; }
+body.mobile .intro-overlay:not([hidden]) {
+  display: flex;
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  background: rgba(12, 12, 16, 0.5);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.intro-card {
+  width: min(340px, 100%);
+  background: var(--panel);
+  border-radius: 24px;
+  padding: 28px 22px 22px;
+  box-shadow: 0 24px 60px rgba(16, 24, 40, 0.35);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  animation: intro-pop 0.32s cubic-bezier(0.2, 0.9, 0.3, 1.15);
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+}
+@keyframes intro-pop {
+  from { opacity: 0; transform: scale(0.92) translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+.intro-logo {
+  flex: none;
+  width: 76px;
+  height: 76px;
+  border-radius: 22px;
+  background: linear-gradient(150deg, #8a6bff, #5636e8);
+  display: grid;
+  place-items: center;
+  padding: 12px;
+  box-shadow: 0 14px 34px rgba(90, 61, 240, 0.35);
+  margin-bottom: 16px;
+}
+.intro-logo svg { width: 100%; height: 100%; }
+.intro-title { margin: 0 0 6px; font-size: 20px; font-weight: 700; color: var(--text); }
+.intro-body { margin: 0 0 18px; font-size: 13.5px; color: var(--muted); line-height: 1.6; }
+.intro-points {
+  list-style: none;
+  margin: 0 0 22px;
+  padding: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  text-align: left;
+}
+.intro-points li { display: flex; gap: 12px; align-items: flex-start; }
+.intro-point-icon {
+  flex: none;
+  width: 38px;
+  height: 38px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+.intro-point-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.intro-point-text strong { font-size: 14px; color: var(--text); font-weight: 600; }
+.intro-point-text small { font-size: 12.5px; color: var(--muted); line-height: 1.5; }
+body.mobile .intro-card .btn { width: 100%; min-height: 50px; font-size: 16px; font-weight: 600; border-radius: 14px; }
+
+/* 减弱动效偏好：关闭装饰性动画 */
+@media (prefers-reduced-motion: reduce) {
+  body.mobile .empty-icon { animation: none; }
+  body.mobile .m-file-card.checked .m-file-check { animation: none; }
+  body.mobile.state-picked .files-panel,
+  body.mobile.state-done .right-panel,
+  body.mobile.state-running .m-run,
+  .intro-card { animation: none; }
+}

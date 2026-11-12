@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>图片水印清理助手</title>
+  <title>水印清理</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -210,6 +210,12 @@
     <div class="m-run-inner">
       <div class="m-run-ring">
         <svg viewBox="0 0 120 120" aria-hidden="true">
+          <defs>
+            <linearGradient id="m-run-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stop-color="#8a6bff"/>
+              <stop offset="100%" stop-color="#5636e8"/>
+            </linearGradient>
+          </defs>
           <circle class="m-run-ring-bg" cx="60" cy="60" r="52"/>
           <circle id="m-run-ring-fg" class="m-run-ring-fg" cx="60" cy="60" r="52"/>
         </svg>
@@ -219,6 +225,7 @@
       </div>
       <div id="m-run-stage" class="m-run-stage" data-i18n="runPrep"></div>
       <div id="m-run-name" class="m-run-name"></div>
+      <p class="m-run-hint" data-i18n="runStayHint"></p>
       <button id="m-run-cancel" class="btn danger" type="button" data-i18n="cancel"></button>
     </div>
   </section>
@@ -273,6 +280,76 @@
         <span class="muted" data-i18n="disclaimerOnly"></span>
         <button id="btn-disclaimer-ok" class="btn primary small" type="button" data-i18n="disclaimerAgree"></button>
       </div>
+    </div>
+  </div>
+
+  <!-- 移动端专用：首次启动引导层（桌面端 CSS 隐藏；disclaimer 同意后展示一次） -->
+  <div id="intro-overlay" class="intro-overlay" hidden>
+    <div class="intro-card" role="dialog" aria-modal="true" aria-labelledby="intro-title">
+      <div class="intro-logo" aria-hidden="true">
+        <svg viewBox="192 192 640 640" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <linearGradient id="intro-logo-sky" x1="0" y1="0" x2="0.25" y2="1">
+              <stop offset="0" stop-color="#d7e0ff"/>
+              <stop offset="1" stop-color="#f4f5ff"/>
+            </linearGradient>
+            <clipPath id="intro-logo-card">
+              <rect x="380" y="406" width="264" height="200" rx="28"/>
+            </clipPath>
+            <mask id="intro-logo-card-mask">
+              <rect x="0" y="0" width="1024" height="1024" fill="#ffffff"/>
+              <path d="M 644 476 A 122 122 0 0 1 526 600 L 644 600 Z" fill="#000000"/>
+            </mask>
+          </defs>
+          <g transform="rotate(-8 512 512)" stroke-linecap="round">
+            <circle cx="512" cy="512" r="240" fill="none" stroke="#ffffff" stroke-opacity="0.22" stroke-width="30"/>
+            <circle cx="512" cy="512" r="240" fill="none" stroke="#ffffff" stroke-width="30"
+                    stroke-dasharray="1075 433" stroke-dashoffset="-235"/>
+          </g>
+          <g transform="rotate(-8 512 512)" mask="url(#intro-logo-card-mask)">
+            <g clip-path="url(#intro-logo-card)">
+              <rect x="380" y="406" width="264" height="200" fill="#ffffff"/>
+              <rect x="380" y="406" width="264" height="200" fill="url(#intro-logo-sky)"/>
+              <circle cx="584" cy="458" r="18" fill="#ffb020"/>
+              <path d="M 380 606 L 478 482 L 566 606 Z" fill="#5d6bff"/>
+              <path d="M 530 606 L 598 522 L 668 606 Z" fill="#9fb0ff"/>
+            </g>
+          </g>
+          <g transform="rotate(-8 512 512)">
+            <path d="M 644 476 A 122 122 0 0 1 526 600" stroke="#ffffff" stroke-opacity="0.7"
+                  stroke-width="8" fill="none" stroke-linecap="round"/>
+          </g>
+        </svg>
+      </div>
+      <h3 id="intro-title" class="intro-title" data-i18n="introTitle"></h3>
+      <p class="intro-body" data-i18n="introBody"></p>
+      <ul class="intro-points">
+        <li>
+          <span class="intro-point-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/>
+            </svg>
+          </span>
+          <span class="intro-point-text"><strong data-i18n="introPoint1"></strong><small data-i18n="introPoint1Sub"></small></span>
+        </li>
+        <li>
+          <span class="intro-point-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="8.5" y="8.5" width="12" height="12" rx="2.5"/><path d="M4 15V6.5A2.5 2.5 0 0 1 6.5 4H15"/>
+            </svg>
+          </span>
+          <span class="intro-point-text"><strong data-i18n="introPoint2"></strong><small data-i18n="introPoint2Sub"></small></span>
+        </li>
+        <li>
+          <span class="intro-point-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3l7 3v6c0 4.4-3 7.4-7 9-4-1.6-7-4.6-7-9V6z"/><path d="M9.2 12.2l2 2 3.6-3.6"/>
+            </svg>
+          </span>
+          <span class="intro-point-text"><strong data-i18n="introPoint3"></strong><small data-i18n="introPoint3Sub"></small></span>
+        </li>
+      </ul>
+      <button id="btn-intro-start" class="btn primary" type="button" data-i18n="introStart"></button>
     </div>
   </div>
 

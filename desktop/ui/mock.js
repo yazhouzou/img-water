@@ -4,10 +4,17 @@
 (function () {
   if (window.__TAURI__) return;
 
-  // 联调便利：?nodisclaimer=1 跳过使用须知弹窗，方便截图/自动化
+  // 联调便利：?nodisclaimer=1 跳过使用须知弹窗；?nointro=1 跳过首次启动引导层；
+  // ?mockbatch=1 直接恢复一批 mock 图片（进列表态），方便截图/自动化
   const bootParams = new URLSearchParams(location.search);
   if (bootParams.get('nodisclaimer') === '1') {
     try { localStorage.setItem('wm-disclaimer-ok', '1'); } catch (_) {}
+  }
+  if (bootParams.get('nointro') === '1') {
+    try { localStorage.setItem('wm-intro-ok', '1'); } catch (_) {}
+  }
+  if (bootParams.get('mockbatch') === '1') {
+    try { localStorage.setItem('wm-mobile-batch', '/mock/import/import-1'); } catch (_) {}
   }
 
   const handlers = {};
@@ -174,6 +181,10 @@
         return Promise.resolve();
       case 'cancel_pipeline':
         return Promise.resolve();
+      case 'export_results':
+        return new Promise((resolve) => setTimeout(() => resolve(((args && args.paths) || []).length), 600));
+      case 'share_results':
+        return new Promise((resolve) => setTimeout(() => resolve(((args && args.paths) || []).length), 600));
       case 'open_path':
         console.log('[mock] open_path:', args && args.path);
         return Promise.resolve();

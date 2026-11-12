@@ -98,6 +98,8 @@ const els = {
   mThemeSeg: document.getElementById('m-theme-seg'),
   mLangSeg: document.getElementById('m-lang-seg'),
   mClearBatch: document.getElementById('m-clear-batch'),
+  introOverlay: document.getElementById('intro-overlay'),
+  btnIntroStart: document.getElementById('btn-intro-start'),
 };
 
 let targetRoot = null;
@@ -804,11 +806,15 @@ function renderEmptyState(messageKey) {
   lastEmptyKey = messageKey || (isMobile ? 'emptyMobile' : 'emptyDesktop');
   const title = t(lastEmptyKey);
   if (isMobile) {
+    // 小白引导：把"怎么用"直接写在空态里（选图 → 开始 → 存相册）
+    const steps = [t('emptyStep1'), t('emptyStep2'), t('emptyStep3')]
+      .map((text, i) => '<li><span class="empty-step-num">' + (i + 1) + '</span><span>' + text + '</span></li>')
+      .join('');
     els.fileList.innerHTML =
       '<div class="empty-state">' +
       '<div class="empty-icon">' + PICK_ICON + '</div>' +
       '<p class="empty-title">' + title + '</p>' +
-      '<p class="empty-sub">' + t('emptyMobileSub') + '</p>' +
+      '<ul class="empty-steps">' + steps + '</ul>' +
       '<button class="btn primary" data-action="pick" type="button">' + t('pickPhotos') + '</button>' +
       '</div>';
   } else {
@@ -1352,10 +1358,17 @@ function renderExitBanner(payload) {
     const noWm = Array.isArray(payload.noWatermark) ? payload.noWatermark : [];
     const title = document.createElement('div');
     title.className = 'banner-title';
+    // ✓ 拆成独立徽章：移动端渲染成绿色圆徽章（桌面端 CSS 退化为原「✓ 」前缀）
+    const check = document.createElement('span');
+    check.className = 'banner-check';
+    check.setAttribute('aria-hidden', 'true');
+    title.appendChild(check);
+    const titleText = document.createElement('span');
     // 全部图都没有水印（passthrough）时"处理完成"会让人误会真的做了什么：直接说清
-    title.textContent = noWm.length > 0 && noWm.length >= written
-      ? `✓ ${t('noWatermarkBanner')(written)}`
-      : `✓ ${t('doneBanner')} · ${t('fileCount')(written)}`;
+    titleText.textContent = noWm.length > 0 && noWm.length >= written
+      ? t('noWatermarkBanner')(written)
+      : `${t('doneBanner')} · ${t('fileCount')(written)}`;
+    title.appendChild(titleText);
     const sub = document.createElement('div');
     sub.className = 'banner-sub';
     // 移动端处理的是应用内副本、输出走「保存到相册/分享」，显示 watermark-cleaned
@@ -1393,9 +1406,9 @@ function renderExitBanner(payload) {
       const paths = payload.outputs || [];
       const wrap = document.createElement('div');
       wrap.className = 'banner-actions';
-      const mk = (label, cmd, doneText, failText, noneText) => {
+      const mk = (label, cmd, doneText, failText, noneText, savedLabel, variant) => {
         const btn = document.createElement('button');
-        btn.className = 'btn small primary';
+        btn.className = 'btn small ' + (variant || 'primary');
         btn.type = 'button';
         btn.textContent = label;
         btn.disabled = paths.length === 0;
@@ -1406,6 +1419,15 @@ function renderExitBanner(payload) {
             if (n > 0) {
               logLine(doneText(n));
               showToast(doneText(n), { type: 'success' });
+              // 保存类按钮成功后短暂显示「已保存 ✓」——小白用户需要明确的完成反馈
+              if (savedLabel) {
+                btn.textContent = savedLabel;
+                btn.classList.add('saved');
+                setTimeout(() => {
+                  btn.textContent = label;
+                  btn.classList.remove('saved');
+                }, 4000);
+              }
             } else {
               logLine(noneText);
               showToast(noneText, { type: 'error' });
@@ -1419,8 +1441,8 @@ function renderExitBanner(payload) {
         });
         return btn;
       };
-      wrap.appendChild(mk(t('exportGallery'), 'export_results', t('exportDone'), t('exportFailed'), t('exportNone')));
-      wrap.appendChild(mk(t('shareResults'), 'share_results', t('shareDone'), t('shareFailed'), t('shareNone')));
+      wrap.appendChild(mk(t('exportGallery'), 'export_results', t('exportDone'), t('exportFailed'), t('exportNone'), t('exportSaved'), 'primary'));
+      wrap.appendChild(mk(t('shareResults'), 'share_results', t('shareDone'), t('shareFailed'), t('shareNone'), null, 'secondary'));
       els.resultBanner.appendChild(wrap);
     }
     // 覆盖模式：备份保留在 original-watermark-backup/，给一个"后悔药"。
@@ -1526,6 +1548,13 @@ function handleExit(payload) {
   refreshEnv();
 }
 
+// 首次启动引导层：仅在移动端、disclaimer 同意后展示一次（localStorage 记 wm-intro-ok）
+function maybeShowIntro() {
+  if (!isMobile) return;
+  if (localStorage.getItem('wm-intro-ok')) return;
+  els.introOverlay.hidden = false;
+}
+
 async function init() {
   applySettings();
   const ready = await refreshEnv();
@@ -1551,10 +1580,17 @@ async function init() {
   els.btnDisclaimerOk.addEventListener('click', () => {
     localStorage.setItem('wm-disclaimer-ok', '1');
     els.disclaimerOverlay.hidden = true;
+    maybeShowIntro();
   });
   if (!localStorage.getItem('wm-disclaimer-ok')) {
     els.disclaimerOverlay.hidden = false;
+  } else {
+    maybeShowIntro();
   }
+  els.btnIntroStart.addEventListener('click', () => {
+    try { localStorage.setItem('wm-intro-ok', '1'); } catch (_) {}
+    els.introOverlay.hidden = true;
+  });
   els.btnSetupInline.addEventListener('click', () => {
     if (!running) startModelDownload(false);
   });
