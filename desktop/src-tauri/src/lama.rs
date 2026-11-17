@@ -67,7 +67,7 @@ fn mask_components(mask: &image::GrayImage) -> Vec<BBox> {
 
 impl Lama {
     pub fn load(path: &Path) -> Result<Self, String> {
-        let session = Session::builder()
+        let session = Session::builder(crate::ort_env())
             .map_err(|e| e.to_string())?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| e.to_string())?

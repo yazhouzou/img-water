@@ -15,6 +15,17 @@ pub mod watermark_profiles;
 
 pub use app::run_tauri_app;
 
+/// ONNX Runtime 全局环境（ort rc.15 起必须显式传给 `Session::builder`；
+/// 进程内只允许一个环境，故用全局单例——dbnet 与 lama 会话共享）。
+pub fn ort_env() -> &'static ort::environment::Environment {
+    static ENV: OnceLock<ort::environment::Environment> = OnceLock::new();
+    ENV.get_or_init(|| {
+        ort::environment::init()
+            .build()
+            .expect("初始化 ONNX Runtime 环境失败")
+    })
+}
+
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
