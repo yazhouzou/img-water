@@ -29,14 +29,19 @@ PROJECT_ROOT = TOOLS.parent
 DIST = PROJECT_ROOT / 'dist'
 OUT = PROJECT_ROOT / '.synthetic-wm-test'
 FONT_CANDIDATES = [
+    # 入库字体（DejaVu 2.37，自由许可）：本地/CI 统一用它，避免依赖系统字体——
+    # 曾经 CI(Ubuntu) 无 mac Arial/Helvetica 时退化成 load_default() 位图小字，
+    # 合成水印字形不可检测，L1 的合成/学习用例在 CI 上全面失败（#11/#12/#14）。
+    str(TOOLS / 'fonts' / 'DejaVuSans-Bold.ttf'),
     '/System/Library/Fonts/Supplemental/Arial Bold.ttf',
     '/System/Library/Fonts/Helvetica.ttc',
-    # Linux/CI（ubuntu-latest 预装 DejaVu）：缺可用字体会退化成 load_default() 位图小字，
-    # 合成水印字形不可检测，L1 的合成/学习用例在 CI 上全面失败。
-    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
 ]
 
-TEXTS = ['SAMPLE TEXT', '测试水印ABC']
+# 合成文本：需在 Arial/DejaVu 下都聚成 ≥4 个字符块（检测器文字性判据要求
+# 字符行 ≥4 段）且检测框稳定贴合（IoU>0.4，判据 0.3）。'SAMPLE TEXT' 在
+# DejaVu Bold 下 5x5 膨胀后仅 3 块、CI 曾因此全挂；'TEST WM' 半透明时
+# 3 块也挂。'WATERMARK TXT' 双字体 α0.5 块数 4/5、α1.0 IoU 0.48+。
+TEXTS = ['WATERMARK TXT', '测试水印ABC']
 
 
 def font(size):
