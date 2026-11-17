@@ -65,6 +65,95 @@ pub fn set_system_bar_appearance(window: &tauri::WebviewWindow, dark: bool) -> R
     })
 }
 
+/// 处理/下载期间启动前台服务 + PartialWakeLock：切后台/锁屏不冻结、不被系统回收。
+/// 文本由调用方本地化（通知内容按 App 语言显示）。失败只降级（处理照常跑）。
+#[cfg(target_os = "android")]
+pub fn set_processing_service(
+    window: &tauri::WebviewWindow,
+    start: bool,
+    text: &str,
+) -> Result<(), String> {
+    let text = text.to_string();
+    on_activity(window, move |env, activity| {
+        let method = if start {
+            "startProcessingService"
+        } else {
+            "stopProcessingService"
+        };
+        if start {
+            let jt = env.new_string(&text).map_err(|e| e.to_string())?;
+            env.call_method(
+                activity,
+                method,
+                "(Ljava/lang/String;)V",
+                &[jni::objects::JValue::Object(&jt)],
+            )
+            .map_err(|e| e.to_string())?;
+        } else {
+            env.call_method(activity, method, "()V", &[])
+                .map_err(|e| e.to_string())?;
+        }
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+            return Err("设置前台服务失败".to_string());
+        }
+        Ok(())
+    })
+}
+
+/// 把文本写到 `<cache>/share-log/<时间戳>/<name>` 后调起系统分享（与图片分享同一
+/// FileProvider 通路）。Android 没有"保存文件对话框"，日志导出走分享。
+#[cfg(target_os = "android")]
+pub fn share_text_file(
+    window: &tauri::WebviewWindow,
+    cache_dir: &Path,
+    name: &str,
+    content: &str,
+) -> Result<usize, String> {
+    let share_root = cache_dir.join("share-log");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis();
+    let dir = share_root.join(stamp.to_string());
+    // 清掉上一轮暂存，避免缓存累积（每次导出日志都换新目录）
+    if let Ok(entries) = std::fs::read_dir(&share_root) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dest = dir.join(name);
+    std::fs::write(&dest, content).map_err(|e| format!("写入日志文件失败: {}", e))?;
+    let staged = dest.to_string_lossy().to_string();
+    on_activity(window, move |env, activity| {
+        let arr = env
+            .new_object_array(1, "java/lang/String", jni::objects::JObject::null())
+            .map_err(|e| e.to_string())?;
+        let js = env.new_string(&staged).map_err(|e| e.to_string())?;
+        env.set_object_array_element(&arr, 0, &js)
+            .map_err(|e| e.to_string())?;
+        let jm = env
+            .new_string("text/plain")
+            .map_err(|e| e.to_string())?;
+        env.call_method(
+            activity,
+            "shareFiles",
+            "([Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                jni::objects::JValue::Object(&arr),
+                jni::objects::JValue::Object(&jm),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+            return Err("调起分享失败".to_string());
+        }
+        Ok(1)
+    })
+}
+
 /// 逐张写入系统相册，返回成功的张数。
 #[cfg(target_os = "android")]
 pub fn export_to_gallery(window: &tauri::WebviewWindow, paths: &[String]) -> Result<usize, String> {

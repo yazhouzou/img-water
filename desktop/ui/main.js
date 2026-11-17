@@ -7,7 +7,9 @@ const els = {
   envBadge: document.getElementById('env-badge'),
   btnSetup: document.getElementById('btn-setup'),
   btnPick: document.getElementById('btn-pick'),
+  btnPickImages: document.getElementById('btn-pick-images'),
   btnRefresh: document.getElementById('btn-refresh'),
+  fileSearch: document.getElementById('file-search'),
   btnSelectAll: document.getElementById('btn-select-all'),
   btnSelectNone: document.getElementById('btn-select-none'),
   btnRun: document.getElementById('btn-run'),
@@ -33,6 +35,7 @@ const els = {
   modelProgressText: document.getElementById('model-progress-text'),
   logBox: document.getElementById('log-box'),
   resultBanner: document.getElementById('result-banner'),
+  backupBanner: document.getElementById('backup-banner'),
   outputDirRow: document.getElementById('output-dir-row'),
   btnOutputDir: document.getElementById('btn-output-dir'),
   outputDirPath: document.getElementById('output-dir-path'),
@@ -80,6 +83,29 @@ const els = {
   lightboxPrev: document.getElementById('lightbox-prev'),
   lightboxNext: document.getElementById('lightbox-next'),
   lightboxCounter: document.getElementById('lightbox-counter'),
+  lightboxCopy: document.getElementById('lightbox-copy'),
+  lightboxReveal: document.getElementById('lightbox-reveal'),
+  resultCompare: document.getElementById('result-compare'),
+  rcStage: document.getElementById('rc-stage'),
+  rcFinal: document.getElementById('rc-final'),
+  rcSource: document.getElementById('rc-source'),
+  rcHandle: document.getElementById('rc-handle'),
+  rcLoading: document.getElementById('rc-loading'),
+  rcFrame: document.getElementById('rc-frame'),
+  rcPrev: document.getElementById('rc-prev'),
+  rcNext: document.getElementById('rc-next'),
+  rcCounter: document.getElementById('rc-counter'),
+  rcReveal: document.getElementById('rc-reveal'),
+  rcClose: document.getElementById('rc-close'),
+  dSettings: document.getElementById('d-settings'),
+  dSettingsClose: document.getElementById('d-settings-close'),
+  dThemeSeg: document.getElementById('d-theme-seg'),
+  dLangSeg: document.getElementById('d-lang-seg'),
+  dModelStatus: document.getElementById('d-model-status'),
+  dModelDownload: document.getElementById('d-model-download'),
+  dBackupStatus: document.getElementById('d-backup-status'),
+  dBackupRestore: document.getElementById('d-backup-restore'),
+  dVersion: document.getElementById('d-version'),
   toastRoot: document.getElementById('toast-root'),
   // 移动端 App 化界面（v0.6）
   btnSettings: document.getElementById('btn-settings'),
@@ -91,6 +117,8 @@ const els = {
   mRunCount: document.getElementById('m-run-count'),
   mRunStage: document.getElementById('m-run-stage'),
   mRunName: document.getElementById('m-run-name'),
+  mRunEta: document.getElementById('m-run-eta'),
+  mRunHint: document.getElementById('m-run-hint'),
   mRunCancel: document.getElementById('m-run-cancel'),
   mSettings: document.getElementById('m-settings'),
   mSettingsBack: document.getElementById('m-settings-back'),
@@ -98,40 +126,77 @@ const els = {
   mThemeSeg: document.getElementById('m-theme-seg'),
   mLangSeg: document.getElementById('m-lang-seg'),
   mClearBatch: document.getElementById('m-clear-batch'),
+  mAboutVersion: document.getElementById('m-about-version'),
+  mViewIntro: document.getElementById('m-view-intro'),
   introOverlay: document.getElementById('intro-overlay'),
   btnIntroStart: document.getElementById('btn-intro-start'),
+  lightboxSave: document.getElementById('lightbox-save'),
 };
 
 let targetRoot = null;
 let running = false;
 let importing = false;
+let learning = false; // 学习水印档案（重 CPU 任务）：期间禁掉开始处理/导入/框选
 let taskKind = null;
+// 移动端模型下载：下载前所处的视图（empty/picked），下载结束/取消后恢复
+let preSetupState = null;
+// 环境检查（env_status）是否已完成：没完成前不自动下载模型（避免与 init 的视图切换打架）
+let envChecked = false;
 let lastRunCount = 0;
 let lastModelPath = null;
 let manualMask = null; // 相对右下角偏移 { dx1, dy1, dx2, dy2 }
 let profiles = []; // 精确模式：可用水印档案
 let selectedProfileId = null; // null = 自动识别
+let runStartedAt = 0; // 本次处理开始时间（剩余时间估算）
+let lastProgressName = ''; // 进度事件里正在处理的文件（用于列表状态）
+// 桌面文件列表：文件名 → 卡片 DOM，处理进度/结果要逐张回写状态
+let fileCards = new Map();
+// 结果区：当前结果的逐张状态（done/skipped/nowm）与处理前源图目录
+let resultStatus = new Map();
+let resultSourceDir = null;
+let resultMeta = new Map(); // basename → { state, reason }
+// 覆盖模式备份（当前文件夹）信息，设置页与右侧提示共用
+let backupState = { count: 0, dir: '' };
+let appVersion = '';
 const mobileParam = new URLSearchParams(location.search).get('mobile');
 const isMobile =
   mobileParam === '1' ? true :
   mobileParam === '0' ? false :
   /android|iphone|ipad|ipod/i.test(navigator.userAgent);
+const isMac = /mac/i.test(navigator.platform || navigator.userAgent);
 
 function setState(state) {
   document.body.classList.remove('state-empty', 'state-picked', 'state-running', 'state-done');
   document.body.classList.add('state-' + state);
+  // 全页滚动的视图切换：回到顶部，否则从列表中部切到结果页会看不到顶部横幅
+  if (isMobile) window.scrollTo(0, 0);
   // 移动端结果页顶栏的「返回列表」只在结果页出现（桌面端始终隐藏）
   els.btnBackList.hidden = !(isMobile && state === 'done');
 }
 
+// 进度页副文案随任务类型切换（模型下载 / 去水印处理）；语言切换时由 applyDynamicLabels 重调
+function setRunHint() {
+  if (!els.mRunHint) return;
+  const key = taskKind === 'model' ? 'downloadStayHint' : 'runStayHint';
+  els.mRunHint.dataset.i18n = key;
+  els.mRunHint.textContent = t(key);
+}
+
 function setRunning(value) {
   running = value;
+  if (value) {
+    runStartedAt = Date.now();
+    lastProgressName = '';
+  }
   document.body.setAttribute('aria-busy', value ? 'true' : 'false');
   els.btnRun.disabled = value || !targetRoot;
   els.btnRun.hidden = value;
   els.btnCancel.hidden = !value;
   els.btnPick.disabled = value;
+  if (els.btnPickImages) els.btnPickImages.disabled = value || importing;
+  if (els.fileSearch) els.fileSearch.disabled = value;
   els.btnSetup.disabled = value;
+  if (els.dModelDownload) els.dModelDownload.disabled = value;
   els.btnRefresh.disabled = value || !targetRoot;
   els.btnMask.disabled = value || !targetRoot;
   els.btnLearn.disabled = value;
@@ -143,6 +208,8 @@ function setRunning(value) {
   checkboxes.forEach((el) => { el.disabled = value; });
   els.btnSelectAll.disabled = value || checkboxes.length === 0;
   els.btnSelectNone.disabled = value || checkboxes.length === 0;
+  renderBackupUi();
+  setRunHint();
   if (!value) {
     els.runProgressBar.style.width = '0%';
     els.runProgressText.textContent = '';
@@ -152,6 +219,7 @@ function setRunning(value) {
     els.mRunCount.textContent = '0/0';
     els.mRunStage.textContent = t('runPrep');
     els.mRunName.textContent = '';
+    els.mRunEta.textContent = '';
   }
 }
 
@@ -161,6 +229,13 @@ function overwriteMode() {
   if (isMobile) return false;
   const checked = els.outputRow.querySelector('input[name=output-mode]:checked');
   return checked && checked.value === 'overwrite';
+}
+
+// 切换处理目录时回到最安全的「保存副本」模式（覆盖原图只应是一次显式选择）
+function resetOutputModeForNewRoot() {
+  const radio = els.outputRow.querySelector('input[name=output-mode][value=save]');
+  if (radio) radio.checked = true;
+  renderOutputHint();
 }
 
 function renderOutputHint() {
@@ -196,17 +271,14 @@ function readSettings() {
 
 function applySettings() {
   const s = readSettings();
-  if (s.outputMode === 'overwrite' && !isMobile) {
-    const radio = els.outputRow.querySelector('input[name=output-mode][value=overwrite]');
-    if (radio) radio.checked = true;
-  }
+  // 安全默认：每次启动都回到「保存副本」，不记忆「替换原图」——避免用户隔天打开
+  // App、点一下开始就把原图覆盖掉。输出目录也只在本次会话有效（见 renderOutputDir）。
   if (typeof s.anyPosition === 'boolean') els.anyPosition.checked = s.anyPosition;
   if (typeof s.refine === 'boolean') els.refine.checked = s.refine;
   if (typeof s.inverse === 'boolean') els.inverse.checked = s.inverse;
   if (typeof s.keepWork === 'boolean') els.keepWork.checked = s.keepWork;
   // 档案 id 待 refreshProfiles() 后校验；已被删除的会在 renderProfiles 里回落成自动
   if (s.profileId) selectedProfileId = s.profileId;
-  if (s.outputDir) outputDirOverride = s.outputDir;
   renderOutputHint();
   renderOutputDir();
 }
@@ -214,13 +286,11 @@ function applySettings() {
 function persistSettings() {
   try {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify({
-      outputMode: overwriteMode() ? 'overwrite' : 'save',
       anyPosition: els.anyPosition.checked,
       refine: els.refine.checked,
       inverse: els.inverse.checked,
       keepWork: els.keepWork.checked,
       profileId: selectedProfileId || '',
-      outputDir: outputDirOverride || '',
     }));
   } catch (_) { /* 隐私模式等禁用存储时忽略 */ }
 }
@@ -247,6 +317,9 @@ async function restoreLastFolder() {
       clearMaskSelection();
       renderFolderPath();
       renderFiles(names);
+      // 上次处理的结果还在（watermark-cleaned/）：直接进结果视图，用户可继续保存/分享；
+      // 没有结果则停在列表页。
+      await maybeRestoreMobileResults(batchDir);
     } catch (_) {
       try { localStorage.removeItem(MOBILE_BATCH_KEY); } catch (_) {}
     }
@@ -261,6 +334,7 @@ async function restoreLastFolder() {
     clearMaskSelection();
     renderFolderPath();
     renderFiles(names);
+    await refreshBackupInfo();
   } catch (_) {
     try { localStorage.removeItem(LAST_ROOT_KEY); } catch (_) {}
   }
@@ -268,22 +342,78 @@ async function restoreLastFolder() {
 
 const STAGE_LABEL = () => ({ prepare: t('stagePrepare'), inpaint: t('stageInpaint'), save: t('stageSave') });
 
+// 重启/页面重建（rebuild_webview）后恢复"上次处理结果"：输出目录里还有图就进结果
+// 视图，用户能继续保存到相册/分享，不必重跑管线。banner 用「上次处理结果」文案，
+// 不冒充"刚刚处理完成"；没有结果则停留在列表页。
+async function maybeRestoreMobileResults(batchDir) {
+  const base = batchDir.replace(/\/+$/, '');
+  let outNames = [];
+  try {
+    outNames = await invoke('list_pngs', { root: base + '/watermark-cleaned', lang: window.i18n.lang });
+  } catch (_) {
+    return;
+  }
+  if (!outNames.length) return;
+  const outputs = outNames.map((n) => `${base}/watermark-cleaned/${n}`);
+  const statusMap = new Map();
+  outNames.forEach((n) => statusMap.set(n, { state: 'done' }));
+  lastExitPayload = {
+    success: true,
+    restored: true,
+    outputs,
+    processed: outputs.length,
+    outputDir: `${base}/watermark-cleaned`,
+    noWatermark: [],
+    skipped: [],
+  };
+  resultSourceDir = base; // 移动端恒副本模式：对比源图在批次目录、与输出同名
+  renderExitBanner(lastExitPayload);
+  renderResultList(outputs, statusMap);
+  setState('done');
+  const pairs = outputs.map((p) => ({ final: p, source: `${base}/${basename(p)}` }));
+  if (pairs.length) setupMobileCompare(pairs);
+}
+
 // 移动端进度环：周长 2πr（r=52）
 const RUN_RING_LEN = 2 * Math.PI * 52;
 
+// 阶段权重：进度条单调前进（旧实现每个阶段各自 0→100%，保存阶段会让进度条"倒退"）
+const STAGE_WEIGHT = { prepare: [0.02, 0.15], inpaint: [0.15, 0.9], save: [0.9, 1] };
+
+function formatRemain(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '';
+  const sec = Math.round(ms / 1000);
+  if (sec < 60) return `${sec}s`;
+  const min = Math.round(sec / 60);
+  if (min < 60) return `${min}m`;
+  const h = Math.floor(min / 60);
+  return `${h}h ${min % 60}m`;
+}
+
 function setRunProgress(stage, done, total, name) {
-  const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-  els.runProgressBar.style.width = pct + '%';
   const labels = STAGE_LABEL();
   const stageText = labels[stage] || stage;
-  els.runProgressText.textContent = t('progressLine')(stageText, done, total, name);
+  const frac = total > 0 ? Math.min(1, done / total) : 0;
+  const [lo, hi] = STAGE_WEIGHT[stage] || [0, 1];
+  const overall = Math.min(1, lo + (hi - lo) * frac);
+  els.runProgressBar.style.width = Math.round(overall * 100) + '%';
+  // 剩余时间：至少跑过 3 秒、进度 > 2% 才有参考价值
+  let eta = '';
+  const elapsed = Date.now() - runStartedAt;
+  if (runStartedAt && elapsed > 3000 && overall > 0.02 && overall < 0.995) {
+    eta = formatRemain((elapsed / overall) * (1 - overall));
+  }
+  els.runProgressText.textContent =
+    t('progressLine')(stageText, done, total, name) + (eta ? t('progressEta')(eta) : '');
   if (isMobile) {
-    // 全屏进度页：环 + 张数 + 当前文件
-    const frac = total > 0 ? Math.min(1, done / total) : 0;
-    els.mRunRingFg.style.strokeDashoffset = String(RUN_RING_LEN * (1 - frac));
+    // 全屏进度页：环 + 张数 + 当前文件 + 剩余时间（长任务让用户有预期）
+    els.mRunRingFg.style.strokeDashoffset = String(RUN_RING_LEN * (1 - overall));
     els.mRunCount.textContent = `${done}/${total}`;
     els.mRunStage.textContent = stageText;
     els.mRunName.textContent = name || '';
+    els.mRunEta.textContent = eta ? t('runEta')(eta) : '';
+  } else if (name) {
+    markRunningFile(name);
   }
 }
 
@@ -365,9 +495,14 @@ let lbIndex = -1;
 
 function updateLightboxNav() {
   const has = resultPaths.length > 1 && lbIndex >= 0;
+  const onResult = lbIndex >= 0;
   els.lightboxPrev.hidden = !has;
   els.lightboxNext.hidden = !has;
   els.lightboxCounter.hidden = !has;
+  if (els.lightboxCopy) els.lightboxCopy.hidden = !(onResult && isMac);
+  if (els.lightboxReveal) els.lightboxReveal.hidden = !(onResult && !isMobile);
+  // 移动端灯箱单张「保存到相册」（结果是应用内副本，随手存某一张是高频需求）
+  if (els.lightboxSave) els.lightboxSave.hidden = !(onResult && isMobile);
   if (has) els.lightboxCounter.textContent = t('imageCounter')(lbIndex + 1, resultPaths.length);
 }
 
@@ -439,6 +574,7 @@ function closeLightbox() {
   els.lightboxStage.classList.remove('grabbing');
   lbNatural = { w: 0, h: 0 };
   lbIndex = -1;
+  updateLightboxNav();
 }
 
 // 以屏幕坐标点为锚缩放：该点下的图像像素保持不动（缩放体验自然）
@@ -573,6 +709,38 @@ function bindLightbox() {
   els.lightboxClose.addEventListener('click', closeLightbox);
   els.lightboxPrev.addEventListener('click', () => lightboxStep(-1));
   els.lightboxNext.addEventListener('click', () => lightboxStep(1));
+  els.lightboxCopy.addEventListener('click', async () => {
+    const path = resultPaths[lbIndex];
+    if (!path) return;
+    try {
+      await invoke('copy_image_to_clipboard', { path, lang: window.i18n.lang });
+      showToast(t('copyDone'), { type: 'success' });
+    } catch (err) {
+      logLine(t('logError')(String(err)));
+      showToast(String(err), { type: 'error' });
+    }
+  });
+  els.lightboxReveal.addEventListener('click', () => {
+    const path = resultPaths[lbIndex];
+    if (!path) return;
+    invoke('reveal_path', { path, lang: window.i18n.lang })
+      .catch((err) => logLine(t('logError')(String(err))));
+  });
+  els.lightboxSave.addEventListener('click', async () => {
+    const path = resultPaths[lbIndex];
+    if (!path) return;
+    els.lightboxSave.disabled = true;
+    try {
+      const n = await invoke('export_results', { paths: [path], lang: window.i18n.lang });
+      if (n > 0) showToast(t('exportDone')(n), { type: 'success' });
+      else showToast(t('exportNone'), { type: 'error' });
+    } catch (err) {
+      logLine(t('logError')(String(err)));
+      showToast(t('exportFailed')(String(err)), { type: 'error' });
+    } finally {
+      els.lightboxSave.disabled = false;
+    }
+  });
   window.addEventListener('resize', () => {
     if (els.lightbox.classList.contains('open') && !els.lightboxImg.hidden) resetLightboxView();
   });
@@ -631,6 +799,14 @@ window.__onAndroidPickResult = (uris) => {
   if (resolve) resolve(Array.isArray(uris) ? uris.filter(Boolean) : []);
 };
 
+// Kotlin 侧开始拷贝相册文件时调用：拷贝可能持续数秒~十几秒且发生在 Rust 导入之前，
+// 不给提示用户会以为"选了图没反应"（尤其是慢机/大图批次）。
+window.__onAndroidPickCopyStart = (count) => {
+  const n = Number(count) || 0;
+  if (n <= 0) return;
+  showToast(t('importPreparing')(n), { key: 'import', sticky: true });
+};
+
 function pickImagesAndroid() {
   return new Promise((resolve, reject) => {
     pendingPickResolve = resolve;
@@ -644,6 +820,8 @@ function pickImagesAndroid() {
 function openSettings() {
   if (!isMobile) return;
   syncSettingsUi();
+  // 「关于」区版本号（init 已缓存，失败为空字符串）
+  if (els.mAboutVersion) els.mAboutVersion.textContent = appVersion ? t('dVersion')(appVersion) : '';
   document.body.classList.add('m-settings-open');
 }
 
@@ -660,6 +838,9 @@ function setupMobileLayout() {
   if (runButtons && els.btnPick) {
     runButtons.insertBefore(els.btnPick, runButtons.firstChild);
   }
+  // 移动端"导出日志"改为"分享日志"：save 保存对话框是桌面语义，Android 上没有
+  // （点击后的行为由 btn-export-log 的 click handler 按平台分流）
+  els.btnExportLog.dataset.i18n = 'shareLog';
   if (els.mSettingsOptions) {
     document.querySelectorAll('.run-area > .advanced-options').forEach((d) => {
       els.mSettingsOptions.appendChild(d);
@@ -725,6 +906,11 @@ function bindMobileSettings() {
   });
   els.mRunCancel.addEventListener('click', () => els.btnCancel.click());
   els.btnBackList.addEventListener('click', () => setState('picked'));
+  // 「关于」区：回看首次启动引导（不重置 wm-intro-ok，仅再展示一次）
+  els.mViewIntro.addEventListener('click', () => {
+    closeSettings();
+    els.introOverlay.hidden = false;
+  });
 }
 
 function escapeHtml(text) {
@@ -867,15 +1053,20 @@ async function setupMobileCompare(pairs) {
   await showMobileCompareAt(0);
 }
 
+let envReady = false;
+
 async function refreshEnv() {
   try {
     const status = await invoke('env_status');
+    envChecked = true;
+    envReady = status.ready;
     // Keep data-i18n in sync so a later applyI18n() (e.g. language toggle)
     // preserves the real state instead of resetting to "检查环境中…".
     els.envBadge.dataset.i18n = status.ready ? 'envReady' : 'envNotReady';
     els.envBadge.textContent = t(status.ready ? 'envReady' : 'envNotReady');
     els.envBadge.className = 'badge ' + (status.ready ? 'ok' : 'bad');
-    els.envBadge.hidden = isMobile && status.ready;
+    // 就绪徽章只作为"缺模型"的告警，不要长期占着顶栏
+    els.envBadge.hidden = status.ready;
     els.setupHint.hidden = status.ready;
     els.btnSetup.hidden = status.ready;
     els.btnSetupInline.hidden = status.ready;
@@ -887,6 +1078,8 @@ async function refreshEnv() {
     }
     return status.ready;
   } catch (err) {
+    envChecked = true;
+    envReady = false;
     els.envBadge.dataset.i18n = 'envFailed';
     els.envBadge.textContent = t('envFailed');
     els.envBadge.className = 'badge bad';
@@ -896,14 +1089,124 @@ async function refreshEnv() {
   }
 }
 
-async function refreshFiles() {
+// 桌面端：把"选中的图片文件"变成"其所在文件夹 + 只勾选这些文件"。
+// 关键：绝不再走移动端的 import_files（复制到应用私有目录）——桌面用户要的是原地处理，
+// 覆盖模式也必须作用于真实原图，而不是用户看不见的副本。
+function parentDir(path) {
+  const s = String(path || '').replace(/[\\/]+$/, '');
+  const i = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
+  return i > 0 ? s.slice(0, i) : '';
+}
+
+async function openImagesFromPaths(paths) {
+  if (running || importing) return;
+  const all = Array.isArray(paths) ? paths.filter(Boolean) : [];
+  const images = all.filter((p) => /\.(png|jpe?g|webp)$/i.test(p));
+  const heic = all.some((p) => /\.(heic|heif)$/i.test(p));
+  if (images.length === 0) {
+    showToast(heic ? t('dragHeic') : t('dropNoImage'), { type: 'error', timeout: 5000 });
+    return;
+  }
+  const dirs = [...new Set(images.map(parentDir))];
+  if (dirs.length > 1 || !dirs[0]) {
+    showToast(t('dragSameFolder'), { type: 'error', timeout: 5000 });
+    return;
+  }
+  targetRoot = dirs[0];
+  rememberRoot(targetRoot);
+  els.btnRefresh.disabled = false;
+  clearReviews();
+  clearMaskSelection();
+  outputDirOverride = null; // 输出目录不跨文件夹沿用，避免结果写到上次的目录
+  renderOutputDir();
+  resetOutputModeForNewRoot();
+  if (els.fileSearch) els.fileSearch.value = '';
+  await refreshFiles(images.map((p) => basename(p)));
+  if (heic) showToast(t('dragHeic'), { type: 'info', timeout: 6000 });
+}
+
+async function refreshFiles(selectedNames) {
   if (!targetRoot) return;
   renderFolderPath();
   try {
     const names = await invoke('list_pngs', { root: targetRoot, lang: window.i18n.lang });
-    renderFiles(names);
+    renderFiles(names, selectedNames);
   } catch (err) {
     els.fileList.innerHTML = `<div class="placeholder">${escapeHtml(t('readFailed')(String(err)))}</div>`;
+  }
+  await refreshBackupInfo();
+}
+
+// —— 原图备份（覆盖模式可撤销）——
+async function refreshBackupInfo() {
+  if (!targetRoot) {
+    backupState = { count: 0, dir: '' };
+    renderBackupUi();
+    return;
+  }
+  try {
+    backupState = await invoke('backup_info', { root: targetRoot });
+  } catch (_) {
+    backupState = { count: 0, dir: '' };
+  }
+  renderBackupUi();
+}
+
+function renderBackupUi() {
+  const count = backupState.count || 0;
+  if (els.dBackupStatus) {
+    els.dBackupStatus.textContent = count > 0 && targetRoot
+      ? `${t('dBackupFound')(count)} ${t('dBackupHint')}`
+      : t('dBackupNone');
+    els.dBackupRestore.disabled = !(count > 0) || running;
+  }
+  if (!els.backupBanner) return;
+  const show = !isMobile && count > 0 && els.resultBanner.hidden && !running;
+  if (!show) {
+    els.backupBanner.hidden = true;
+    return;
+  }
+  els.backupBanner.hidden = false;
+  els.backupBanner.className = 'result-banner warn';
+  els.backupBanner.innerHTML = '';
+  const text = document.createElement('div');
+  text.className = 'banner-main';
+  text.textContent = t('backupFoundBanner')(count);
+  els.backupBanner.appendChild(text);
+  const btn = document.createElement('button');
+  btn.className = 'btn small';
+  btn.type = 'button';
+  btn.textContent = t('restoreNow');
+  btn.addEventListener('click', restoreOriginals);
+  els.backupBanner.appendChild(btn);
+}
+
+// 「恢复原图」统一入口：本次结果横幅 / 备份提示 / 设置页共用
+async function restoreOriginals() {
+  if (!targetRoot || running) return;
+  const ok = await confirm(t('restoreConfirm'), {
+    title: t('restoreOriginal'),
+    kind: 'warning',
+    okLabel: t('ok'),
+    cancelLabel: t('cancel'),
+  }).catch(() => false);
+  if (!ok) return;
+  try {
+    const n = await invoke('restore_backup', { root: targetRoot, lang: window.i18n.lang });
+    logLine(t('restoreDone')(n));
+    showToast(t('restoreDone')(n), { type: 'success' });
+    clearReviews();
+    els.resultBanner.hidden = false;
+    els.resultBanner.className = 'result-banner ok';
+    els.resultBanner.innerHTML = '';
+    const box = document.createElement('div');
+    box.className = 'banner-main';
+    box.textContent = `✓ ${t('restoreDone')(n)}`;
+    els.resultBanner.appendChild(box);
+    await refreshFiles();
+  } catch (err) {
+    logLine(t('restoreFailed')(String(err)));
+    showToast(t('restoreFailed')(String(err)), { type: 'error' });
   }
 }
 
@@ -930,12 +1233,81 @@ function renderEmptyState(messageKey) {
       '<button class="btn primary" data-action="pick" type="button">' + t('pickPhotos') + '</button>' +
       '</div>';
   } else {
-    els.fileList.innerHTML = '<div class="placeholder">' + title + '</div>';
+    // 桌面左栏高度有限（下面还有框选/保存方式/高级选项）：操作按钮必须第一屏可见，
+    // 三张竖向步骤卡在 860x600 下会被裁掉，改为紧凑提示 + 两个入口按钮。
+    els.fileList.innerHTML =
+      '<div class="empty-state">' +
+      '<div class="empty-icon">' + PICK_ICON + '</div>' +
+      '<p class="empty-title">' + title + '</p>' +
+      '<p class="empty-hint">' + t('emptyStep1Desk') + ' → ' + t('emptyStep2Desk') + '</p>' +
+      '<div class="empty-actions">' +
+      '<button class="btn primary" data-action="pick" type="button">' + t('pickFolder') + '</button>' +
+      '<button class="btn" data-action="pick-images" type="button">' + t('pickImages') + '</button>' +
+      '</div>' +
+      '<p class="empty-note">' + t('emptyDesktopNote') + ' ' + t('emptyUnsupportedNote') + '</p>' +
+      '</div>';
   }
 }
 
-function renderFiles(names) {
+// —— 桌面文件列表：缩略图行 / 逐张状态 / 搜索 ——
+function fileStateText(state) {
+  return {
+    running: t('fileStateRunning'),
+    done: t('fileStateDone'),
+    skipped: t('fileStateSkipped'),
+    nowm: t('fileStateNoWatermark'),
+  }[state] || '';
+}
+
+function setFileState(name, state, reason) {
+  const entry = fileCards.get(name);
+  if (!entry || !entry.stateEl) return;
+  const el = entry.stateEl;
+  if (!state) {
+    el.textContent = '';
+    delete el.dataset.state;
+    el.removeAttribute('title');
+    return;
+  }
+  el.textContent = fileStateText(state);
+  el.dataset.state = state;
+  if (reason) el.title = reason;
+  else el.removeAttribute('title');
+}
+
+function clearFileStates() {
+  for (const name of fileCards.keys()) setFileState(name, '');
+  lastProgressName = '';
+}
+
+function markRunningFile(name) {
+  if (lastProgressName && lastProgressName !== name) setFileState(lastProgressName, '');
+  lastProgressName = name || '';
+  if (name) setFileState(name, 'running');
+}
+
+function applyFileSearch() {
+  if (isMobile || !els.fileSearch) return;
+  const q = (els.fileSearch.value || '').trim().toLowerCase();
+  let visible = 0;
+  els.fileList.querySelectorAll('.file-item').forEach((item) => {
+    const show = !q || (item.dataset.name || '').toLowerCase().includes(q);
+    item.classList.toggle('hidden-by-search', !show);
+    if (show) visible += 1;
+  });
+  let empty = els.fileList.querySelector('.file-search-empty');
+  if (!empty) {
+    empty = document.createElement('div');
+    empty.className = 'placeholder file-search-empty';
+    els.fileList.appendChild(empty);
+  }
+  empty.textContent = t('searchEmpty');
+  empty.hidden = !(q && visible === 0);
+}
+
+function renderFiles(names, selectedNames) {
   els.fileList.innerHTML = '';
+  fileCards.clear();
   thumbQueue.length = 0; // 列表重渲染：取消遗留的缩略图任务（img 已脱离 DOM）
   setState(names.length > 0 ? 'picked' : 'empty');
   els.fileCount.textContent = t('fileCount')(names.length);
@@ -949,23 +1321,49 @@ function renderFiles(names) {
   }
   if (isMobile) {
     renderFileGrid(names);
-  } else {
-    for (const name of names) {
-      const item = document.createElement('label');
-      item.className = 'file-item';
-      const checkbox = document.createElement('input');
-      checkbox.type = 'checkbox';
-      checkbox.value = name;
-      checkbox.checked = true;
-      checkbox.disabled = running || importing;
-      checkbox.addEventListener('change', updateRunButton);
-      item.appendChild(checkbox);
-      const label = document.createElement('span');
-      label.textContent = name;
-      item.appendChild(label);
-      els.fileList.appendChild(item);
-    }
+    updateRunButton();
+    return;
   }
+  // 拖拽/选择图片时只勾选用户点名的那些；打开文件夹/恢复上次目录时默认全选
+  const selectedSet = selectedNames ? new Set(selectedNames) : null;
+  for (const name of names) {
+    const item = document.createElement('label');
+    item.className = 'file-item';
+    item.dataset.name = name;
+
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.value = name;
+    checkbox.checked = selectedSet ? selectedSet.has(name) : true;
+    checkbox.disabled = running || importing;
+    checkbox.addEventListener('change', updateRunButton);
+    item.appendChild(checkbox);
+
+    const thumb = document.createElement('img');
+    thumb.className = 'file-thumb';
+    thumb.alt = '';
+    thumb.loading = 'lazy';
+    thumbQueue.push({
+      path: targetRoot.replace(/\/+$/, '') + '/' + name,
+      img: thumb,
+    });
+    pumpThumbQueue();
+    item.appendChild(thumb);
+
+    const label = document.createElement('span');
+    label.className = 'file-name';
+    label.textContent = name;
+    label.title = name;
+    item.appendChild(label);
+
+    const stateEl = document.createElement('span');
+    stateEl.className = 'file-state';
+    item.appendChild(stateEl);
+
+    els.fileList.appendChild(item);
+    fileCards.set(name, { card: item, thumb, stateEl });
+  }
+  applyFileSearch();
   updateRunButton();
 }
 
@@ -1058,8 +1456,9 @@ function updateRunButton() {
     if (card) card.classList.toggle('checked', el.checked);
   });
   els.btnRun.textContent = count > 0 ? `${t('run')}（${count}）` : t('run');
-  els.btnRun.disabled = running || importing || !targetRoot || count === 0;
-  els.btnMask.disabled = running || importing || !targetRoot || count === 0;
+  els.btnRun.disabled = running || importing || learning || !targetRoot || count === 0;
+  if (els.btnPickImages) els.btnPickImages.disabled = running || importing || learning;
+  els.btnMask.disabled = running || importing || learning || !targetRoot || count === 0;
   updateMaskUi();
 }
 
@@ -1086,6 +1485,8 @@ function applyDynamicLabels() {
   renderOutputHint();
   renderOutputDir();
   renderProfileOptions();
+  setRunHint();
+  if (els.lightboxSave) els.lightboxSave.textContent = t('lightboxSave');
   els.profileLabel.placeholder = t('profileLabelPlaceholder');
   els.fileCount.textContent = t('fileCount')(els.fileList.querySelectorAll('input[type=checkbox]').length);
   if (lastModelPath) els.setupHintPath.textContent = t('modelSavePath')(lastModelPath);
@@ -1136,15 +1537,76 @@ function applyLang() {
 
 // 设置页分段按钮的选中态（主题/语言）：在主题或语言变化后同步
 function syncSettingsUi() {
-  if (!isMobile || !els.mThemeSeg || !els.mLangSeg) return;
   const mode = themeMode();
-  els.mThemeSeg.querySelectorAll('button').forEach((b) => {
-    b.classList.toggle('active', b.dataset.mode === mode);
-  });
   const lang = window.i18n.lang;
-  els.mLangSeg.querySelectorAll('button').forEach((b) => {
-    b.classList.toggle('active', b.dataset.lang === lang);
+  for (const seg of [els.mThemeSeg, els.dThemeSeg]) {
+    if (!seg) continue;
+    seg.querySelectorAll('button[data-mode]').forEach((b) => {
+      b.classList.toggle('active', b.dataset.mode === mode);
+    });
+  }
+  for (const seg of [els.mLangSeg, els.dLangSeg]) {
+    if (!seg) continue;
+    seg.querySelectorAll('button[data-lang]').forEach((b) => {
+      b.classList.toggle('active', b.dataset.lang === lang);
+    });
+  }
+}
+
+// —— 桌面设置面板（Cmd+, / 菜单「设置…」）——
+function openDesktopSettings() {
+  if (isMobile) return;
+  syncSettingsUi();
+  refreshSettingsInfo();
+  els.dSettings.hidden = false;
+}
+
+function closeDesktopSettings() {
+  els.dSettings.hidden = true;
+}
+
+async function refreshSettingsInfo() {
+  try {
+    if (!appVersion) appVersion = await invoke('app_version');
+    els.dVersion.textContent = appVersion ? t('dVersion')(appVersion) : '';
+  } catch (_) {
+    els.dVersion.textContent = '';
+  }
+  try {
+    const status = await invoke('env_status');
+    els.dModelStatus.textContent = status.ready
+      ? `${t('modelReadyText')} · ${t('modelPathLabel')(status.model_path)}`
+      : t('modelMissingText');
+    els.dModelDownload.hidden = !!status.ready;
+    els.dModelDownload.textContent = t('setupModel');
+  } catch (err) {
+    els.dModelStatus.textContent = String(err);
+    els.dModelDownload.hidden = false;
+  }
+  renderBackupUi();
+}
+
+function bindDesktopSettings() {
+  if (!els.dSettings) return;
+  els.dSettingsClose.addEventListener('click', closeDesktopSettings);
+  els.dSettings.addEventListener('click', (ev) => {
+    if (ev.target === els.dSettings) closeDesktopSettings();
   });
+  els.dThemeSeg.querySelectorAll('button').forEach((b) => {
+    b.addEventListener('click', () => setThemeMode(b.dataset.mode));
+  });
+  els.dLangSeg.querySelectorAll('button').forEach((b) => {
+    b.addEventListener('click', () => {
+      if (b.dataset.lang !== window.i18n.lang) {
+        window.i18n.setLang(b.dataset.lang);
+        applyLang();
+      }
+    });
+  });
+  els.dModelDownload.addEventListener('click', () => {
+    if (!running) startModelDownload(false);
+  });
+  els.dBackupRestore.addEventListener('click', restoreOriginals);
 }
 
 // —— 精确模式：水印档案（学习/选择/删除）——
@@ -1180,18 +1642,35 @@ async function refreshProfiles() {
   renderProfileOptions();
 }
 
+// 学习水印档案期间锁住会串状态的操作：学习是重 CPU 同步命令（数秒~数十秒），
+// 与处理/导入并发会互相拖慢，也让"开始处理（N）"与任务对不上。
+function setLearning(value) {
+  learning = value;
+  const busy = value || running || importing;
+  els.btnLearn.disabled = busy;
+  els.btnProfileDelete.disabled = busy;
+  els.btnPick.disabled = busy;
+  els.btnRefresh.disabled = busy || !targetRoot;
+  if (els.fileSearch) els.fileSearch.disabled = busy;
+  els.fileList.querySelectorAll('input[type=checkbox]').forEach((el) => { el.disabled = busy; });
+  const count = els.fileList.querySelectorAll('input[type=checkbox]').length;
+  els.btnSelectAll.disabled = busy || count === 0;
+  els.btnSelectNone.disabled = busy || count === 0;
+  updateRunButton();
+}
+
 async function learnProfile() {
   const files = selectedFiles();
   if (!targetRoot) {
     els.learnStatus.textContent = t('learnNeedRoot');
     return;
   }
-  if (files.length < 2) {
+  if (files.length < 3) {
     els.learnStatus.textContent = t('learnNeedFiles');
     return;
   }
   const paths = files.map((name) => `${targetRoot}/${name}`);
-  els.btnLearn.disabled = true;
+  setLearning(true);
   els.learnStatus.textContent = t('learnRunning');
   try {
     const res = await invoke('learn_watermark', {
@@ -1207,7 +1686,7 @@ async function learnProfile() {
   } catch (err) {
     els.learnStatus.textContent = String(err);
   } finally {
-    els.btnLearn.disabled = running;
+    setLearning(false);
   }
 }
 
@@ -1227,6 +1706,24 @@ function updateMaskUi() {
 let maskSel = null;
 // 预览可能被缩小（大图），框选坐标要按它映射回原图尺寸
 let maskOrigin = null; // 原图像素坐标 { x1, y1, x2, y2 }
+// 移动端框选双指缩放：img 与 maskRect 共用同一变换（transform-origin: 0 0）。
+// maskImgPoint 用 getBoundingClientRect（含变换）映射到原图坐标；renderMaskRect 用
+// offsetWidth（布局尺寸、不含变换）换算内容坐标，缩放后框与图仍对齐。
+let maskZoom = { s: 1, tx: 0, ty: 0 };
+
+function applyMaskZoom() {
+  const z = maskZoom;
+  const tr = (z.s === 1 && z.tx === 0 && z.ty === 0)
+    ? ''
+    : `translate(${z.tx}px, ${z.ty}px) scale(${z.s})`;
+  els.maskImg.style.transform = tr;
+  els.maskRect.style.transform = tr;
+}
+
+function resetMaskZoom() {
+  maskZoom = { s: 1, tx: 0, ty: 0 };
+  applyMaskZoom();
+}
 
 function maskImgPoint(ev) {
   const img = els.maskImg;
@@ -1246,8 +1743,9 @@ function renderMaskRect() {
     return;
   }
   const img = els.maskImg;
-  const rect = img.getBoundingClientRect();
-  const scale = rect.width / img.naturalWidth;
+  // 用布局宽度（offsetWidth，不含 transform）：框选指示层与 img 同受 maskZoom 变换，
+  // 指示层坐标必须写在"内容坐标"里，否则缩放后框会二次缩放、与图片错位
+  const scale = img.offsetWidth / img.naturalWidth;
   els.maskRect.hidden = false;
   els.maskRect.style.left = `${Math.min(maskSel.x1, maskSel.x2) * scale}px`;
   els.maskRect.style.top = `${Math.min(maskSel.y1, maskSel.y2) * scale}px`;
@@ -1275,6 +1773,7 @@ async function openMaskEditor() {
   els.maskRect.hidden = true;
   maskSel = null;
   maskOrigin = null;
+  resetMaskZoom();
   setMaskButtons();
   els.maskImg.src = '';
   els.maskOverlay.hidden = false;
@@ -1292,6 +1791,7 @@ async function openMaskEditor() {
 function closeMaskEditor() {
   els.maskOverlay.hidden = true;
   els.maskImg.src = '';
+  resetMaskZoom();
 }
 
 function confirmMaskSelection() {
@@ -1409,41 +1909,80 @@ function pumpThumbQueue() {
   }
 }
 
-/// 结果列表：逐张缩略图（点击大图预览，桌面端可定位文件）。
-function renderResultList(paths) {
+/// 结果列表：逐张缩略图（点击大图预览；桌面端可逐张对比/定位文件）。
+function renderResultList(paths, statusMap) {
   clearResultList();
   const list = (paths || []).filter(Boolean);
   if (list.length === 0) return;
   resultPaths = list;
+  resultStatus = statusMap instanceof Map ? statusMap : new Map();
+  resultMeta = new Map();
   els.resultList.hidden = false;
   els.resultListCount.textContent = t('resultListCount')(list.length);
   list.forEach((path) => {
+    const name = basename(path);
+    const meta = resultStatus.get(name) || { state: 'done' };
+    resultMeta.set(name, meta);
     const item = document.createElement('div');
     item.className = 'result-item';
+    item.dataset.name = name;
+    item.tabIndex = 0;
+    item.setAttribute('role', 'button');
+    item.setAttribute('aria-label', `${name} · ${t('viewLarge')}`);
+
+    const open = () => openLightboxPath(path);
+    item.addEventListener('click', open);
+    item.addEventListener('keydown', (ev) => {
+      if (ev.target !== item) return;
+      if (ev.key === 'Enter' || ev.key === ' ') {
+        ev.preventDefault();
+        open();
+      }
+    });
 
     const img = document.createElement('img');
     img.className = 'result-thumb pending';
-    img.alt = basename(path);
+    img.alt = name;
     img.title = t('viewLarge');
-    img.addEventListener('click', () => openLightboxPath(path));
     item.appendChild(img);
     thumbQueue.push({ path, img });
     pumpThumbQueue();
 
-    const name = document.createElement('div');
-    name.className = 'result-item-name';
-    name.textContent = basename(path);
-    name.title = path;
-    item.appendChild(name);
+    const nameEl = document.createElement('div');
+    nameEl.className = 'result-item-name';
+    nameEl.textContent = name;
+    nameEl.title = path;
+    item.appendChild(nameEl);
+
+    const stateEl = document.createElement('div');
+    stateEl.className = 'result-item-state';
+    stateEl.dataset.state = meta.state;
+    stateEl.textContent = fileStateText(meta.state);
+    if (meta.reason) stateEl.title = meta.reason;
+    item.appendChild(stateEl);
 
     if (!isMobile) {
       const actions = document.createElement('div');
       actions.className = 'result-item-actions';
+      if (resultSourceDir) {
+        const compare = document.createElement('button');
+        compare.className = 'result-item-btn compare';
+        compare.type = 'button';
+        compare.textContent = t('compareOpen');
+        compare.disabled = meta.state !== 'done';
+        if (compare.disabled) compare.title = t('compareUnavailable');
+        compare.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          openResultCompare(resultPaths.indexOf(path));
+        });
+        actions.appendChild(compare);
+      }
       const reveal = document.createElement('button');
       reveal.className = 'result-item-btn';
       reveal.type = 'button';
       reveal.textContent = t('viewInFolder');
-      reveal.addEventListener('click', () => {
+      reveal.addEventListener('click', (ev) => {
+        ev.stopPropagation();
         invoke('reveal_path', { path, lang: window.i18n.lang })
           .catch((err) => logLine(t('logError')(String(err))));
       });
@@ -1451,6 +1990,125 @@ function renderResultList(paths) {
       item.appendChild(actions);
     }
     els.resultListGrid.appendChild(item);
+  });
+}
+
+// 语言切换后更新结果卡片状态文案与按钮文案（不重载缩略图）
+function refreshResultLabels() {
+  if (!els.resultListGrid) return;
+  els.resultListGrid.querySelectorAll('.result-item').forEach((item) => {
+    const name = item.dataset.name || '';
+    const state = item.querySelector('.result-item-state');
+    const meta = resultMeta.get(name);
+    if (state && meta) state.textContent = fileStateText(meta.state);
+    const compare = item.querySelector('.result-item-btn.compare');
+    if (compare) compare.textContent = t('compareOpen');
+    const reveal = item.querySelector('.result-item-btn:not(.compare)');
+    if (reveal) reveal.textContent = t('viewInFolder');
+  });
+  updateRcNav();
+}
+
+// —— 桌面逐张前后对比（结果图 vs 源图，滑块）——
+let rcIndex = -1;
+
+function setRcPos(pct) {
+  const pos = Math.max(0, Math.min(100, pct));
+  els.rcSource.style.clipPath = `inset(0 ${100 - pos}% 0 0)`;
+  els.rcHandle.style.left = pos + '%';
+}
+
+function updateRcNav() {
+  const n = resultPaths.length;
+  const show = rcIndex >= 0 && n > 1;
+  els.rcPrev.hidden = !show;
+  els.rcNext.hidden = !show;
+  els.rcCounter.hidden = !show;
+  if (show) els.rcCounter.textContent = t('imageCounter')(rcIndex + 1, n);
+}
+
+async function openResultCompare(index) {
+  if (index < 0 || index >= resultPaths.length || !resultSourceDir) return;
+  const final = resultPaths[index];
+  const source = resultSourceDir.replace(/\/+$/, '') + '/' + basename(final);
+  rcIndex = index;
+  els.resultCompare.hidden = false;
+  els.rcFrame.hidden = true;
+  els.rcFinal.removeAttribute('src');
+  els.rcSource.removeAttribute('src');
+  els.rcLoading.hidden = false;
+  updateRcNav();
+  try {
+    const [after, before] = await Promise.all([
+      invoke('read_image_base64', { path: final, lang: window.i18n.lang }),
+      invoke('read_image_base64', { path: source, lang: window.i18n.lang }),
+    ]);
+    if (els.resultCompare.hidden) return; // 加载期间已关闭
+    els.rcFinal.src = after.data_url;
+    els.rcSource.src = before.data_url;
+    els.rcFrame.hidden = false;
+    els.rcLoading.hidden = true;
+    setRcPos(50);
+  } catch (err) {
+    els.resultCompare.hidden = true;
+    els.rcLoading.hidden = true;
+    showToast(t('compareSourceMissing'), { type: 'error' });
+    logLine(t('logError')(String(err)));
+  }
+}
+
+function closeResultCompare() {
+  els.resultCompare.hidden = true;
+  els.rcFrame.hidden = true;
+  els.rcFinal.removeAttribute('src');
+  els.rcSource.removeAttribute('src');
+  rcIndex = -1;
+}
+
+function stepResultCompare(delta) {
+  const n = resultPaths.length;
+  if (n <= 1 || rcIndex < 0) return;
+  openResultCompare(((rcIndex + delta) % n + n) % n);
+}
+
+function bindResultCompare() {
+  if (!els.resultCompare) return;
+  let drag = null;
+  const pct = (ev) => {
+    const rect = els.rcStage.getBoundingClientRect();
+    return ((ev.clientX - rect.left) / rect.width) * 100;
+  };
+  els.rcStage.addEventListener('pointerdown', (ev) => {
+    drag = { id: ev.pointerId, x: ev.clientX, moved: false };
+    try { els.rcStage.setPointerCapture(ev.pointerId); } catch (_) {}
+  });
+  els.rcStage.addEventListener('pointermove', (ev) => {
+    if (!drag || ev.pointerId !== drag.id) return;
+    if (Math.abs(ev.clientX - drag.x) > 4) drag.moved = true;
+    if (drag.moved) setRcPos(pct(ev));
+  });
+  const end = (ev) => {
+    if (!drag || ev.pointerId !== drag.id) return;
+    const moved = drag.moved || Math.abs(ev.clientX - drag.x) > 4;
+    drag = null;
+    if (moved) return;
+    // 图片本身 pointer-events:none，事件目标恒为 stage；用图片矩形区分"点图跳位"和"点空白关闭"
+    const rect = els.rcFinal.getBoundingClientRect();
+    const inImage = ev.clientX >= rect.left && ev.clientX <= rect.right
+      && ev.clientY >= rect.top && ev.clientY <= rect.bottom;
+    if (inImage) setRcPos(pct(ev));
+    else closeResultCompare();
+  };
+  els.rcStage.addEventListener('pointerup', end);
+  els.rcStage.addEventListener('pointercancel', () => { drag = null; });
+  els.rcPrev.addEventListener('click', () => stepResultCompare(-1));
+  els.rcNext.addEventListener('click', () => stepResultCompare(1));
+  els.rcClose.addEventListener('click', closeResultCompare);
+  els.rcReveal.addEventListener('click', () => {
+    const path = resultPaths[rcIndex];
+    if (!path) return;
+    invoke('reveal_path', { path, lang: window.i18n.lang })
+      .catch((err) => logLine(t('logError')(String(err))));
   });
 }
 
@@ -1462,19 +2120,66 @@ function setModelProgress(done, total) {
   els.modelProgressText.textContent = total > 0
     ? `${(done / mb).toFixed(1)} / ${(total / mb).toFixed(1)} MB（${percent}%）`
     : `${(done / mb).toFixed(1)} MB`;
+  // 移动端全屏下载视图：进度环 + 百分比 + MB 明细（环复用处理页的 326.7 周长）
+  if (isMobile && taskKind === 'model') {
+    els.mRunStage.textContent = t('downloadStage');
+    els.mRunRingFg.style.strokeDashoffset = String(RUN_RING_LEN * (1 - (total > 0 ? Math.min(1, done / total) : 0)));
+    els.mRunCount.textContent = total > 0 ? `${percent}%` : '';
+    els.mRunName.textContent = total > 0
+      ? `${(done / mb).toFixed(1)} / ${(total / mb).toFixed(1)} MB`
+      : `${(done / mb).toFixed(1)} MB`;
+  }
+}
+
+// 当前移动端视图（下载结束/取消后恢复回这里）
+function currentMobileState() {
+  for (const s of ['empty', 'picked', 'done']) {
+    if (document.body.classList.contains('state-' + s)) return s;
+  }
+  return 'empty';
 }
 
 function startModelDownload(auto) {
   if (running) return;
-  setRunning(true);
   taskKind = 'model';
+  if (isMobile) {
+    // 全屏下载视图：空态下 run-area 被整体隐藏，取消按钮（在 m-run 里）必须可见。
+    // 下载前的视图记下来，结束/取消后恢复（否则停在"处理中"全屏页）。
+    preSetupState = currentMobileState();
+    setState('running');
+  }
+  setRunning(true);
+  if (isMobile) {
+    els.mRunStage.textContent = t('downloadStage');
+    els.mRunCount.textContent = '0%';
+    els.btnSetup.textContent = t('setupDownloading');
+  }
   logLine(auto ? t('logModelAuto') : t('logModelStart'));
+  logLine(t('downloadCancelHint'));
   invoke('setup_model', { lang: window.i18n.lang }).catch((err) => {
     logLine(t('logError')(String(err)));
     taskKind = null;
     els.modelProgress.hidden = true;
+    if (isMobile) {
+      els.btnSetup.textContent = t('setupModel');
+      if (preSetupState) {
+        setState(preSetupState);
+        preSetupState = null;
+      }
+    }
     setRunning(false);
   });
+}
+
+// 首次启动不强行下载 200MB：先说明并等用户同意「使用须知」；取消/失败后可从
+// 顶部提示或设置页重新开始（已下载部分自动续传）。
+function maybeAutoDownloadModel() {
+  // env_status 未返回前不启动（用户可能先点掉了免责声明）：否则 init 后续的
+  // setState/restoreLastFolder 会把"下载中"的全屏视图覆盖掉。init 末尾会兜底再调。
+  if (!envChecked) return;
+  if (envReady || running || taskKind) return;
+  if (!localStorage.getItem('wm-disclaimer-ok')) return;
+  startModelDownload(true);
 }
 
 let lastExitPayload = null;
@@ -1499,25 +2204,33 @@ function renderExitBanner(payload) {
     check.setAttribute('aria-hidden', 'true');
     title.appendChild(check);
     const titleText = document.createElement('span');
-    // 全部图都没有水印（passthrough）时"处理完成"会让人误会真的做了什么：直接说清
-    titleText.textContent = noWm.length > 0 && noWm.length >= written
-      ? t('noWatermarkBanner')(written)
-      : `${t('doneBanner')} · ${t('fileCount')(written)}`;
+    // 恢复的旧结果不冒充"刚完成"；全部图都没有水印（passthrough）时"处理完成"也会
+    // 让人误会真的做了什么：两种都直接说清楚
+    titleText.textContent = payload.restored
+      ? t('restoredTitle')(written)
+      : noWm.length > 0 && noWm.length >= written
+        ? t('noWatermarkBanner')(written)
+        : `${t('doneBanner')} · ${t('fileCount')(written)}`;
     title.appendChild(titleText);
     const sub = document.createElement('div');
     sub.className = 'banner-sub';
     // 移动端处理的是应用内副本、输出走「保存到相册/分享」，显示 watermark-cleaned
     // 目录路径没有意义（用户在系统文件管理里也看不到应用私有目录）
-    sub.textContent = payload.overwritten
-      ? t('doneSubOverwrite')
-      : (isMobile ? t('doneSubSaveMobile') : t('doneSubSave')(dir));
+    sub.textContent = payload.restored
+      ? t('restoredSub')
+      : payload.overwritten
+        ? t('doneSubOverwrite')
+        : (isMobile ? t('doneSubSaveMobile') : t('doneSubSave')(dir));
     main.appendChild(title);
     main.appendChild(sub);
     // 部分图未检测到水印：它们是原样输出，用户需要知道"这几张没改"
     if (noWm.length > 0 && noWm.length < written) {
       const note = document.createElement('div');
       note.className = 'banner-sub';
-      note.textContent = t('noWatermarkNote')(noWm.length);
+      // 数量少就直接点名，用户能对上具体文件；多了才退回只报数量（结果卡有角标）
+      note.textContent = noWm.length <= 4
+        ? t('noWatermarkNames')(noWm.join('、'))
+        : t('noWatermarkNote')(noWm.length);
       main.appendChild(note);
     }
     // 未过自检的图不写坏结果：明确告诉用户"这几张还是带水印的原图"
@@ -1588,39 +2301,22 @@ function renderExitBanner(payload) {
       restore.type = 'button';
       restore.textContent = t('restoreOriginal');
       restore.title = t('restoreHint');
-      restore.addEventListener('click', async () => {
-        const ok = await confirm(t('restoreConfirm'), {
-          title: t('restoreOriginal'),
-          kind: 'warning',
-          okLabel: t('ok'),
-          cancelLabel: t('cancel'),
-        });
-        if (!ok) return;
-        try {
-          const n = await invoke('restore_backup', { root: targetRoot, lang: window.i18n.lang });
-          logLine(t('restoreDone')(n));
-          showToast(t('restoreDone')(n), { type: 'success' });
-          // 原图已还原：清掉结果列表、前后对比与两张复查预览，避免残留"已处理"假象
-          clearReviews();
-          els.resultBanner.hidden = false;
-          els.resultBanner.className = 'result-banner ok';
-          els.resultBanner.innerHTML = '';
-          const box = document.createElement('div');
-          box.className = 'banner-main';
-          box.textContent = `✓ ${t('restoreDone')(n)}`;
-          els.resultBanner.appendChild(box);
-          await refreshFiles();
-        } catch (err) {
-          logLine(t('restoreFailed')(String(err)));
-          showToast(t('restoreFailed')(String(err)), { type: 'error' });
-        }
-      });
+      restore.addEventListener('click', restoreOriginals);
       els.resultBanner.appendChild(restore);
     }
   } else if (payload.cancelled) {
     els.resultBanner.textContent = t('cancelledBanner');
   } else {
-    els.resultBanner.textContent = `${t('failedBanner')}：${payload.error || 'exit ' + payload.code}`;
+    const box = document.createElement('div');
+    box.className = 'banner-main';
+    const title = document.createElement('div');
+    title.className = 'banner-title';
+    title.textContent = `${t('failedBanner')}：${payload.error || 'exit ' + payload.code}`;
+    const help = document.createElement('div');
+    help.className = 'banner-sub warn';
+    help.textContent = t('failedHelp');
+    box.append(title, help);
+    els.resultBanner.appendChild(box);
   }
 }
 
@@ -1630,31 +2326,66 @@ function handleExit(payload) {
   els.modelProgress.hidden = true;
   setRunning(false);
   if (kind === 'model') {
+    // 移动端全屏下载视图收尾：恢复顶栏按钮文案与下载前的视图（成功/取消/失败都恢复）
+    if (isMobile) {
+      els.btnSetup.textContent = t('setupModel');
+      if (preSetupState) {
+        setState(preSetupState);
+        preSetupState = null;
+      }
+    }
     if (payload.success) {
       logLine(t('logModelDone'));
+      notifyDone(t('notifyModelDoneTitle'), t('notifyModelDoneBody'));
+      if (isMobile) showToast(t('notifyModelDoneTitle'), { type: 'success', timeout: 3200 });
+    } else if (payload.cancelled) {
+      logLine(t('downloadCancelled'));
+      showToast(t('downloadCancelled'), { type: 'info' });
     } else {
       logLine(t('logModelFailed')(payload.error || ''));
-    }
-    notifyDone(
-      payload.success ? t('notifyModelDoneTitle') : t('notifyModelFailTitle'),
-      payload.success ? t('notifyModelDoneBody') : (payload.error || '')
-    );
-    // 移动端系统通知只在切后台后可见；用户正看着 App 时补浮层提示（下载进度条
-    // 消失后状态只在折叠的日志里）
-    if (isMobile) {
-      showToast(payload.success ? t('notifyModelDoneTitle') : t('notifyModelFailTitle'), {
-        type: payload.success ? 'success' : 'error',
-        timeout: payload.success ? 3200 : 6000,
-      });
+      notifyDone(t('notifyModelFailTitle'), payload.error || '');
+      if (isMobile) {
+        showToast(t('notifyModelFailTitle'), { type: 'error', timeout: 6000 });
+      }
     }
     refreshEnv();
+    if (!els.dSettings.hidden) refreshSettingsInfo();
     return;
   }
   logLine(payload.success ? t('logRunDone') : t('logRunFailed')(payload.code));
   if (!payload.success) els.logBox.open = true;
+  markRunningFile('');
   lastExitPayload = payload;
+
+  // 逐张状态：outputs 里是真正写出的图（含"未检测到水印"的透传图），
+  // skipped 是自检未过被保留原图的。结果网格与左侧文件列表都标出来，
+  // 用户不必从日志里找"哪张没处理"。
+  const statusMap = new Map();
+  const skipped = payload.success ? (payload.skipped || []) : [];
+  const noWm = payload.success && Array.isArray(payload.noWatermark) ? payload.noWatermark : [];
+  for (const entry of skipped) {
+    const name = entry.name || entry;
+    statusMap.set(name, { state: 'skipped', reason: t('skippedReasonHint') });
+    setFileState(name, 'skipped', t('skippedReasonHint'));
+  }
+  for (const name of noWm) {
+    statusMap.set(name, { state: 'nowm', reason: t('nowmReasonHint') });
+    setFileState(name, 'nowm', t('nowmReasonHint'));
+  }
+  if (payload.success) {
+    for (const path of payload.outputs || []) {
+      const name = basename(path);
+      if (!statusMap.has(name)) statusMap.set(name, { state: 'done' });
+      setFileState(name, statusMap.get(name).state);
+    }
+  }
+  resultSourceDir = payload.success && targetRoot
+    ? (payload.overwritten
+        ? targetRoot.replace(/\/+$/, '') + '/original-watermark-backup'
+        : targetRoot.replace(/\/+$/, ''))
+    : null;
   renderExitBanner(payload);
-  renderResultList(payload.success ? payload.outputs : []);
+  renderResultList(payload.success ? payload.outputs : [], statusMap);
   setState('done');
   if (!payload.cancelled) {
     notifyDone(
@@ -1690,6 +2421,7 @@ function handleExit(payload) {
     setupCompare(sourceMatch[1].trim(), finalMatch[1].trim());
   }
   refreshEnv();
+  refreshBackupInfo();
 }
 
 // 首次启动引导层：仅在移动端、disclaimer 同意后展示一次（localStorage 记 wm-intro-ok）
@@ -1703,6 +2435,8 @@ async function init() {
   applySettings();
   const ready = await refreshEnv();
   await refreshProfiles();
+  // 版本号：桌面设置页与移动端「关于」区共用（失败不显示，不影响功能）
+  if (!appVersion) appVersion = await invoke('app_version').catch(() => '');
 
   // 主题 / 语言（实现见模块级 applyTheme/applyLang，设置页与顶栏按钮共用）
   applyTheme(themeMode());
@@ -1725,6 +2459,7 @@ async function init() {
     localStorage.setItem('wm-disclaimer-ok', '1');
     els.disclaimerOverlay.hidden = true;
     maybeShowIntro();
+    maybeAutoDownloadModel();
   });
   if (!localStorage.getItem('wm-disclaimer-ok')) {
     els.disclaimerOverlay.hidden = false;
@@ -1785,6 +2520,7 @@ async function init() {
   listen('quit-blocked', () => {
     els.logBox.open = true;
     logLine(t('quitBlockedLog'));
+    showToast(t('quitBlockedToast'), { type: 'error', timeout: 5000 });
   });
   initNotifications();
   listen('model-progress', (event) => setModelProgress(event.payload.done, event.payload.total));
@@ -1796,36 +2532,72 @@ async function init() {
   // 逻辑只实现一次，「处理中禁止开始/选图」等守卫都在按钮的 disabled 上。
   listen('menu-action', (event) => {
     const id = event.payload;
+    const busyHint = () => showToast(running ? t('menuBusy') : t('menuNeedSource'), { type: 'info' });
     if (id === 'menu-pick') {
       if (!running && !els.btnPick.disabled) els.btnPick.click();
+      else busyHint();
+    } else if (id === 'menu-pick-images') {
+      if (!running && !importing && els.btnPickImages) els.btnPickImages.click();
+      else busyHint();
     } else if (id === 'menu-start') {
       if (!els.btnRun.hidden && !els.btnRun.disabled) els.btnRun.click();
+      else busyHint();
     } else if (id === 'menu-export-log') {
       if (!els.btnExportLog.disabled) els.btnExportLog.click();
+    } else if (id === 'menu-settings') {
+      openDesktopSettings();
     }
   });
 
   if (isMobile) {
     setPickLabel();
   } else {
-    els.logBox.open = true;
+    // 桌面默认收起日志：主界面应该突出"图片 + 结果"，日志只在出错/排障时需要
+    els.logBox.open = false;
   }
 
   els.fileList.addEventListener('click', (e) => {
-    const btn = e.target.closest('[data-action="pick"]');
-    if (btn) els.btnPick.click();
+    if (e.target.closest('[data-action="pick"]')) els.btnPick.click();
+    else if (e.target.closest('[data-action="pick-images"]')) els.btnPickImages.click();
   });
+  if (els.fileSearch) els.fileSearch.addEventListener('input', applyFileSearch);
+  if (els.btnPickImages) {
+    els.btnPickImages.addEventListener('click', async () => {
+      if (running || importing) return;
+      try {
+        const picked = await open({
+          multiple: true,
+          filters: [{ name: t('imageFilter'), extensions: ['png', 'jpg', 'jpeg', 'webp'] }],
+          title: t('selectImagesTitle'),
+        });
+        if (!picked) return;
+        await openImagesFromPaths(Array.isArray(picked) ? picked : [picked]);
+      } catch (err) {
+        logLine(t('logError')(String(err)));
+        showToast(t('logError')(String(err)), { type: 'error' });
+      }
+    });
+  }
 
   bindLightbox();
+  bindResultCompare();
+  if (!isMobile) bindDesktopSettings();
   // 长按/右键图片不弹系统菜单：WebView 的"保存图片/复制图片"会把预览当原图导出，误导用户
   document.addEventListener('contextmenu', (ev) => {
     if (ev.target && ev.target.tagName === 'IMG') ev.preventDefault();
   });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
+      if (!els.resultCompare.hidden) { closeResultCompare(); return; }
+      if (!els.dSettings.hidden) { closeDesktopSettings(); return; }
       closeLightbox();
       if (!els.maskOverlay.hidden) closeMaskEditor();
       return;
+    }
+    // 逐张前后对比打开时支持左右翻页
+    if (!els.resultCompare.hidden) {
+      if (e.key === 'ArrowLeft') { e.preventDefault(); stepResultCompare(-1); return; }
+      if (e.key === 'ArrowRight') { e.preventDefault(); stepResultCompare(1); return; }
     }
     // 灯箱打开时用 ←/→ 在结果列表里翻页
     if (els.lightbox.classList.contains('open') && lbIndex >= 0) {
@@ -1834,6 +2606,12 @@ async function init() {
     }
     const mod = e.metaKey || e.ctrlKey;
     if (!mod) return;
+    // 设置窗口是 macOS 惯例（Cmd+,），菜单项未设加速键，必须由前端接住
+    if (e.key === ',') {
+      e.preventDefault();
+      openDesktopSettings();
+      return;
+    }
     // 桌面端装了系统菜单时，带快捷键的菜单项会先消费按键 → 这里跳过，避免弹两次对话框。
     // 浏览器预览（ui-preview.sh）没有菜单，仍由这里兜底。
     if (window.__WM_HAS_MENU) return;
@@ -1859,23 +2637,71 @@ async function init() {
   els.btnMaskCancel.addEventListener('click', closeMaskEditor);
   els.btnMaskReset.addEventListener('click', () => {
     maskSel = null;
+    resetMaskZoom();
     renderMaskRect();
     setMaskButtons();
   });
   els.btnMaskOk.addEventListener('click', confirmMaskSelection);
 
   let maskDragging = false;
+  const maskPointers = new Map(); // pointerId → {x, y}（client 坐标）
+  let maskPinch = null; // 双指缩放会话 { s0, tx0, ty0, dist0, mid0x, mid0y }
+  const pinchMetrics = () => {
+    const pts = [...maskPointers.values()];
+    if (pts.length < 2) return null;
+    const [a, b] = pts;
+    return {
+      dist: Math.hypot(a.x - b.x, a.y - b.y),
+      midX: (a.x + b.x) / 2,
+      midY: (a.y + b.y) / 2,
+    };
+  };
   els.maskCanvasWrap.addEventListener('pointerdown', (ev) => {
     if (els.maskOverlay.hidden || !els.maskImg.naturalWidth) return;
     ev.preventDefault();
+    maskPointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    try { els.maskCanvasWrap.setPointerCapture(ev.pointerId); } catch (_) {}
+    // 移动端双指：进入缩放（终止画框，保留已有框选；三指及以上忽略）
+    if (isMobile && maskPointers.size === 2) {
+      maskDragging = false;
+      const st = pinchMetrics();
+      const wrap = els.maskCanvasWrap.getBoundingClientRect();
+      if (st && st.dist > 0) {
+        maskPinch = {
+          s0: maskZoom.s, tx0: maskZoom.tx, ty0: maskZoom.ty,
+          dist0: st.dist,
+          mid0x: st.midX - wrap.left,
+          mid0y: st.midY - wrap.top,
+        };
+      }
+      return;
+    }
+    if (maskPointers.size > 1) return;
     maskDragging = true;
-    els.maskCanvasWrap.setPointerCapture(ev.pointerId);
     const p = maskImgPoint(ev);
     maskSel = { x1: p.x, y1: p.y, x2: p.x, y2: p.y };
     renderMaskRect();
     setMaskButtons();
   });
   els.maskCanvasWrap.addEventListener('pointermove', (ev) => {
+    if (!maskPointers.has(ev.pointerId)) return;
+    maskPointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+    if (maskPinch) {
+      const st = pinchMetrics();
+      if (!st || st.dist <= 0) return;
+      const wrap = els.maskCanvasWrap.getBoundingClientRect();
+      const midX = st.midX - wrap.left;
+      const midY = st.midY - wrap.top;
+      const s = Math.max(1, Math.min(6, maskPinch.s0 * (st.dist / maskPinch.dist0)));
+      // 以两指中点为锚：锚点下的内容（图片）坐标在缩放前后保持不动
+      const k = s / maskPinch.s0;
+      let tx = midX - k * (maskPinch.mid0x - maskPinch.tx0);
+      let ty = midY - k * (maskPinch.mid0y - maskPinch.ty0);
+      if (s <= 1.001) { tx = 0; ty = 0; } // 回到 1x：回原点，避免"虚位"
+      maskZoom = { s, tx, ty };
+      applyMaskZoom();
+      return;
+    }
     if (!maskDragging) return;
     const p = maskImgPoint(ev);
     maskSel.x2 = p.x;
@@ -1883,11 +2709,13 @@ async function init() {
     renderMaskRect();
     setMaskButtons();
   });
-  const endMaskDrag = () => {
-    maskDragging = false;
+  const endMaskPointer = (ev) => {
+    maskPointers.delete(ev.pointerId);
+    if (maskPointers.size < 2) maskPinch = null;
+    if (maskPointers.size === 0) maskDragging = false;
   };
-  els.maskCanvasWrap.addEventListener('pointerup', endMaskDrag);
-  els.maskCanvasWrap.addEventListener('pointercancel', endMaskDrag);
+  els.maskCanvasWrap.addEventListener('pointerup', endMaskPointer);
+  els.maskCanvasWrap.addEventListener('pointercancel', endMaskPointer);
 
   els.btnClearLog.addEventListener('click', (e) => {
     e.preventDefault();
@@ -1899,7 +2727,24 @@ async function init() {
     e.preventDefault();
     e.stopPropagation();
     const text = els.log.textContent || '';
-    if (!text.trim()) return;
+    if (!text.trim()) {
+      // 冷启动日志区为空：原来静默 return，用户点了没反应像坏了
+      if (isMobile) showToast(t('logEmpty'), { type: 'info' });
+      return;
+    }
+    if (isMobile) {
+      // Android 上没有"保存文件对话框"（save 是桌面语义）：导出日志走系统分享，
+      // 用户可发给微信/邮件/笔记，同样能反馈问题。
+      try {
+        await invoke('share_log', { content: text, lang: window.i18n.lang });
+        logLine(`[${t('shareLog')}]`);
+        showToast(t('shareLogDone'), { type: 'success' });
+      } catch (err) {
+        logLine(t('logError')(String(err)));
+        showToast(t('logError')(String(err)), { type: 'error' });
+      }
+      return;
+    }
     try {
       const path = await save({
         title: t('exportLogTitle'),
@@ -2004,6 +2849,10 @@ async function init() {
     els.btnRefresh.disabled = false;
     clearReviews();
     clearMaskSelection();
+    outputDirOverride = null;
+    renderOutputDir();
+    resetOutputModeForNewRoot();
+    if (els.fileSearch) els.fileSearch.value = '';
     await refreshFiles();
   });
 
@@ -2044,11 +2893,18 @@ async function init() {
             els.btnRefresh.disabled = false;
             clearReviews();
             clearMaskSelection();
+            outputDirOverride = null;
+            renderOutputDir();
+            resetOutputModeForNewRoot();
+            if (els.fileSearch) els.fileSearch.value = '';
             await refreshFiles();
           } else if (images.length > 0) {
-            importPaths(images);
+            // 桌面端拖入图片：以图片所在文件夹为处理目录、只勾选这些图（原地处理）。
+            // 不能走 import_files——那会把图片复制进应用私有目录，导致"覆盖原图"假覆盖。
+            await openImagesFromPaths(images);
           } else if (all.length > 0) {
-            logLine(t('dropNoImage'));
+            const heic = all.some((p) => /\.(heic|heif)$/i.test(p));
+            showToast(heic ? t('dragHeic') : t('dropNoImage'), { type: 'error', timeout: 5000 });
           }
         }
       });
@@ -2138,6 +2994,12 @@ async function init() {
     }
     lastRunCount = files.length;
     persistSettings();
+    closeDesktopSettings();
+    lastExitPayload = null;
+    els.resultBanner.hidden = true;
+    els.backupBanner.hidden = true;
+    clearResultList();
+    clearFileStates();
     setRunning(true);
     setState('running');
     resetReviews();
@@ -2181,7 +3043,7 @@ async function init() {
       return;
     }
     els.btnCancel.disabled = true;
-    logLine(t('cancelLog'));
+    logLine(taskKind === 'model' ? t('downloadCancelRequested') : t('cancelLog'));
     try {
       await invoke('cancel_pipeline');
     } catch (err) {
@@ -2191,12 +3053,19 @@ async function init() {
     }
   });
 
-  if (!ready) {
-    startModelDownload(true);
-  }
+  // 只有已同意免责声明才自动下载模型；首次启动等用户点「同意」后再开始。
+  // 放在 restoreLastFolder 之后：下载走全屏视图，先恢复批次再启动，避免视图被覆盖。
   setState('empty');
   renderEmptyState();
   await restoreLastFolder();
+  maybeAutoDownloadModel();
+  // 联调便利：?settings=1 直接打开设置；?autorun=1 自动点开始（仅桌面）
+  if (!isMobile && new URLSearchParams(location.search).get('settings') === '1') {
+    openDesktopSettings();
+  }
+  if (!isMobile && new URLSearchParams(location.search).get('autorun') === '1') {
+    setTimeout(() => els.btnRun.click(), 400);
+  }
 }
 
 // 移动端布局在 init 之前同步完成（DOM 已解析）：避免首帧闪现桌面双栏结构

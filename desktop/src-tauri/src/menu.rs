@@ -13,13 +13,15 @@ use tauri::{AppHandle, Emitter, Runtime};
 pub const EVENT_MENU_ACTION: &str = "menu-action";
 
 pub const ID_PICK: &str = "menu-pick";
+pub const ID_PICK_IMAGES: &str = "menu-pick-images";
 pub const ID_START: &str = "menu-start";
 pub const ID_EXPORT_LOG: &str = "menu-export-log";
+pub const ID_SETTINGS: &str = "menu-settings";
 pub const ID_HELP_GUIDE: &str = "menu-help-guide";
 pub const ID_HELP_ISSUE: &str = "menu-help-issue";
 
 /// 需要转发给前端的动作（其余为系统预定义项，由系统原生处理）。
-const FORWARDED: &[&str] = &[ID_PICK, ID_START, ID_EXPORT_LOG];
+const FORWARDED: &[&str] = &[ID_PICK, ID_PICK_IMAGES, ID_START, ID_EXPORT_LOG, ID_SETTINGS];
 
 const GUIDE_URL: &str = "https://github.com/yazhouzou/img-water#readme";
 const ISSUE_URL: &str = "https://github.com/yazhouzou/img-water/issues/new";
@@ -32,6 +34,7 @@ const ISSUE_URL: &str = "https://github.com/yazhouzou/img-water/issues/new";
 /// （实测 `CmdOrCtrl+Return` 就是这么废掉的）。故用 `ENTER`，并由
 /// `accelerator_strings_use_known_modifiers_and_keys` 拦住同类拼写错误。
 pub const ACCEL_PICK: &str = "CmdOrCtrl+O";
+pub const ACCEL_PICK_IMAGES: &str = "CmdOrCtrl+SHIFT+O";
 pub const ACCEL_START: &str = "CmdOrCtrl+ENTER";
 
 fn t(lang: &str, zh: &str, en: &str) -> String {
@@ -50,6 +53,10 @@ pub fn build<R: Runtime>(app: &AppHandle<R>, lang: &str) -> tauri::Result<Menu<R
             ..Default::default()
         }))
         .separator()
+        .item(
+            &MenuItemBuilder::with_id(ID_SETTINGS, t(lang, "设置…", "Settings…")).build(app)?,
+        )
+        .separator()
         .services()
         .separator()
         .hide()
@@ -63,6 +70,11 @@ pub fn build<R: Runtime>(app: &AppHandle<R>, lang: &str) -> tauri::Result<Menu<R
         .item(
             &MenuItemBuilder::with_id(ID_PICK, t(lang, "选择文件夹…", "Open Folder…"))
                 .accelerator(ACCEL_PICK)
+                .build(app)?,
+        )
+        .item(
+            &MenuItemBuilder::with_id(ID_PICK_IMAGES, t(lang, "选择图片…", "Open Images…"))
+                .accelerator(ACCEL_PICK_IMAGES)
                 .build(app)?,
         )
         .item(
@@ -155,8 +167,10 @@ mod tests {
     #[test]
     fn forwarded_ids_are_distinct_and_cover_actions() {
         assert!(FORWARDED.contains(&ID_PICK));
+        assert!(FORWARDED.contains(&ID_PICK_IMAGES));
         assert!(FORWARDED.contains(&ID_START));
         assert!(FORWARDED.contains(&ID_EXPORT_LOG));
+        assert!(FORWARDED.contains(&ID_SETTINGS));
         // 帮助项在 Rust 侧直接打开链接，不进转发列表
         assert!(!FORWARDED.contains(&ID_HELP_GUIDE));
         assert!(!FORWARDED.contains(&ID_HELP_ISSUE));
@@ -182,7 +196,7 @@ mod tests {
             "HOME", "END", "PAGEUP", "PAGEDOWN", "INSERT", "PRINTSCREEN",
             "UP", "DOWN", "LEFT", "RIGHT", "ARROWUP", "ARROWDOWN", "ARROWLEFT", "ARROWRIGHT",
         ];
-        for accel in [ACCEL_PICK, ACCEL_START] {
+        for accel in [ACCEL_PICK, ACCEL_PICK_IMAGES, ACCEL_START] {
             let (mods, key) = accel.rsplit_once('+').expect("加速键需含 '+'");
             assert!(!key.is_empty(), "{} 缺少主键", accel);
             for m in mods.split('+') {

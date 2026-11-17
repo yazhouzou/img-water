@@ -92,19 +92,32 @@ fn prune_temps(dest: &Path) {
     }
 }
 
+/// 用户取消下载的错误标记（App 层据此返回"已取消"而不是"下载失败"）。
+pub const CANCELLED: &str = "__model_download_cancelled__";
+
 /// 依次尝试 urls 列表中的下载源，任一成功即返回。
 /// 进度回调返回 (已下载字节, 总字节)，总字节未知时为 0。
+/// `cancel` 返回 true 时立即停止（**保留已下载分段**，下次继续）。
 ///
 /// **失败不清理分段**：下次重试（含重启 App / 换回同一源）从断点继续；只有"无法确认是
 /// 同一个远端文件"时才丢弃（见 `meta_compatible`）。
-pub fn download_model(dest: &Path, urls: &[String], progress: &(dyn Fn(u64, u64) + Sync)) -> Result<(), String> {
+pub fn download_model(
+    dest: &Path,
+    urls: &[String],
+    progress: &(dyn Fn(u64, u64) + Sync),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let mut errors: Vec<String> = Vec::new();
     for url in urls {
-        match download_from(dest, url, progress) {
+        if cancel() {
+            return Err(CANCELLED.to_string());
+        }
+        match download_from(dest, url, progress, cancel) {
             Ok(()) => return Ok(()),
+            Err(err) if err == CANCELLED => return Err(err),
             Err(err) => errors.push(format!("{}: {}", url, err)),
         }
     }
@@ -114,8 +127,13 @@ pub fn download_model(dest: &Path, urls: &[String], progress: &(dyn Fn(u64, u64)
     ))
 }
 
-fn download_from(dest: &Path, url: &str, progress: &(dyn Fn(u64, u64) + Sync)) -> Result<(), String> {
-    download_from_with(dest, url, progress, PARALLEL_MIN_SIZE)
+fn download_from(
+    dest: &Path,
+    url: &str,
+    progress: &(dyn Fn(u64, u64) + Sync),
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    download_from_with(dest, url, progress, PARALLEL_MIN_SIZE, cancel)
 }
 
 fn download_from_with(
@@ -123,7 +141,11 @@ fn download_from_with(
     url: &str,
     progress: &(dyn Fn(u64, u64) + Sync),
     parallel_min: u64,
+    cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
+    if cancel() {
+        return Err(CANCELLED.to_string());
+    }
     let agent = agent();
     // 先用 HEAD 探测大小与是否支持 Range
     let probe = agent
@@ -155,9 +177,9 @@ fn download_from_with(
     write_meta(dest, &meta);
 
     let result = if total > 0 && accept_ranges && total >= parallel_min {
-        download_parallel(&agent, url, dest, total, progress)
+        download_parallel(&agent, url, dest, total, progress, cancel)
     } else {
-        download_stream(&agent, url, dest, total, accept_ranges, progress)
+        download_stream(&agent, url, dest, total, accept_ranges, progress, cancel)
     };
     if result.is_ok() {
         prune_temps(dest);
@@ -172,6 +194,7 @@ fn download_stream(
     total: u64,
     accept_ranges: bool,
     progress: &(dyn Fn(u64, u64) + Sync),
+    cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
     let tmp = dest.with_extension("part");
     let mut existing = fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
@@ -221,6 +244,10 @@ fn download_stream(
     let mut buffer = vec![0u8; CHUNK];
     let mut downloaded: u64 = existing;
     loop {
+        if cancel() {
+            file.flush().ok();
+            return Err(CANCELLED.to_string());
+        }
         let read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
         if read == 0 {
             break;
@@ -247,6 +274,7 @@ fn download_parallel(
     dest: &Path,
     total: u64,
     progress: &(dyn Fn(u64, u64) + Sync),
+    cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
     let seg_size = total.div_ceil(SEGMENTS);
     let seg_count = total.div_ceil(seg_size);
@@ -270,6 +298,9 @@ fn download_parallel(
         s.spawn(move || {
             while !reporter_stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(300));
+                if cancel() {
+                    break;
+                }
                 progress(reporter_done.load(Ordering::Relaxed), total);
             }
         });
@@ -284,12 +315,16 @@ fn download_parallel(
             let done = done.clone();
             let failed = failed.clone();
             let part: PathBuf = dest.with_extension(format!("part{}", i));
+            let cancel = cancel;
             handles.push(s.spawn(move || -> Result<(), String> {
                 for attempt in 0..SEGMENT_RETRIES {
+                    if cancel() {
+                        return Err(CANCELLED.to_string());
+                    }
                     if failed.load(Ordering::Relaxed) {
                         return Err("其它分段失败，提前终止".into());
                     }
-                    match fetch_range(&agent, &url, seg_start, seg_end, &part, &done) {
+                    match fetch_range(&agent, &url, seg_start, seg_end, &part, &done, cancel) {
                         Ok(()) => return Ok(()),
                         Err(err) => {
                             if attempt == SEGMENT_RETRIES - 1 {
@@ -313,6 +348,9 @@ fn download_parallel(
     });
     progress(done.load(Ordering::Relaxed), total);
 
+    if join_errs.iter().any(|e| e == CANCELLED) {
+        return Err(CANCELLED.to_string());
+    }
     if !join_errs.is_empty() {
         return Err(format!("分段下载失败（已保留断点，下次续传）：{}", join_errs.join("；")));
     }
@@ -339,7 +377,15 @@ fn download_parallel(
     Ok(())
 }
 
-fn fetch_range(agent: &ureq::Agent, url: &str, seg_start: u64, seg_end: u64, part: &Path, done: &AtomicU64) -> Result<(), String> {
+fn fetch_range(
+    agent: &ureq::Agent,
+    url: &str,
+    seg_start: u64,
+    seg_end: u64,
+    part: &Path,
+    done: &AtomicU64,
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
     let seg_total = seg_end - seg_start + 1;
     let existing = if part.exists() {
         fs::metadata(part).map(|m| m.len()).unwrap_or(0)
@@ -366,6 +412,10 @@ fn fetch_range(agent: &ureq::Agent, url: &str, seg_start: u64, seg_end: u64, par
         .map_err(|e| e.to_string())?;
     let mut buffer = vec![0u8; CHUNK];
     loop {
+        if cancel() {
+            file.flush().ok();
+            return Err(CANCELLED.to_string());
+        }
         let read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
         if read == 0 {
             break;
@@ -514,7 +564,7 @@ mod tests {
         let dir = tmp_dir("stream");
         let dest = dir.join("lama_fp32.onnx");
 
-        let err = download_from(&dest, &url, &|_, _| {}).unwrap_err();
+        let err = download_from(&dest, &url, &|_, _| {}, &|| false).unwrap_err();
         assert!(err.contains("不完整"), "应报下载不完整，实际: {}", err);
         let tmp = dest.with_extension("part");
         assert_eq!(fs::metadata(&tmp).unwrap().len(), 60_000, "断点应被保留");
@@ -524,7 +574,7 @@ mod tests {
         let seen = AtomicU64::new(0);
         download_from(&dest, &url2, &|done, _total| {
             seen.store(done, Ordering::Relaxed);
-        })
+        }, &|| false)
         .unwrap();
         assert_eq!(fs::read(&dest).unwrap(), body, "续传后内容必须逐字节正确");
         assert_eq!(seen.load(Ordering::Relaxed), 200_000, "进度应接着断点走到 100%");
@@ -547,7 +597,7 @@ mod tests {
 
         let body = payload(200_000);
         let url = spawn_server(body.clone(), "W/\"new\"", None);
-        download_from(&dest, &url, &|_, _| {}).unwrap();
+        download_from(&dest, &url, &|_, _| {}, &|| false).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), body);
         assert!(!tmp.exists());
         let _ = fs::remove_dir_all(&dir);
@@ -561,7 +611,7 @@ mod tests {
         let dir = tmp_dir("parallel");
         let dest = dir.join("lama_fp32.onnx");
         // parallel_min=1 → 强制多连接
-        download_from_with(&dest, &url, &|_, _| {}, 1).unwrap();
+        download_from_with(&dest, &url, &|_, _| {}, 1, &|| false).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), body);
         for i in 0..6 {
             assert!(!dest.with_extension(format!("part{}", i)).exists(), "分段 {} 应被清理", i);
@@ -579,7 +629,7 @@ mod tests {
         let url = spawn_server(body.clone(), "W/\"trunc\"", Some(50_000));
         let dir = tmp_dir("trunc");
         let dest = dir.join("lama_fp32.onnx");
-        assert!(download_from(&dest, &url, &|_, _| {}).is_err());
+        assert!(download_from(&dest, &url, &|_, _| {}, &|| false).is_err());
         assert!(!dest.exists(), "半截文件绝不能落盘");
         let _ = fs::remove_dir_all(&dir);
     }

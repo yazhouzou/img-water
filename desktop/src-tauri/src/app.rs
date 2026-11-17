@@ -7,6 +7,43 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+/// 批量处理可能持续几十分钟：macOS 上用 `caffeinate` 阻止系统休眠/App Nap，
+/// 否则合盖/空闲会让推理停滞或大幅降速。任务结束（含 panic/取消）随 Drop 退出。
+#[cfg(target_os = "macos")]
+struct SleepGuard(Option<std::process::Child>);
+
+#[cfg(target_os = "macos")]
+impl SleepGuard {
+    fn new() -> Self {
+        Self(
+            std::process::Command::new("caffeinate")
+                .args(["-dimsu"])
+                .spawn()
+                .ok(),
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SleepGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+struct SleepGuard;
+
+#[cfg(not(target_os = "macos"))]
+impl SleepGuard {
+    fn new() -> Self {
+        Self
+    }
+}
+
 const EVENT_LOG: &str = "pipeline-log";
 const EVENT_EXIT: &str = "pipeline-exit";
 const EVENT_MODEL_PROGRESS: &str = "model-progress";
@@ -20,11 +57,17 @@ const EVENT_QUIT_BLOCKED: &str = "quit-blocked";
 use crate::i18n::{load as lang_of, tr};
 
 #[derive(Default)]
-struct AppStorage {
+pub(crate) struct AppStorage {
     target_root: std::sync::Mutex<Option<PathBuf>>,
     last_files: std::sync::Mutex<Vec<String>>,
     running: AtomicBool,
     cancel: AtomicBool,
+}
+
+impl AppStorage {
+    pub(crate) fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
 }
 
 fn finish(app: &AppHandle, payload: serde_json::Value) {
@@ -33,7 +76,38 @@ fn finish(app: &AppHandle, payload: serde_json::Value) {
         state.running.store(false, Ordering::SeqCst);
     }
     clear_dock_progress(app);
+    // 移动端：任务结束统一收掉前台服务（成功/失败/取消/panic 各路径都会走到 finish）
+    stop_processing_service(app);
 }
+
+/// 处理/下载期间启动前台服务 + PartialWakeLock（移动端保活：切后台/锁屏不被冻结）。
+/// 经由主线程派发（`with_webview` 要求主线程；调用方可能在后台线程）。失败只降级，
+/// 处理照常运行、只失去保活。
+#[cfg(target_os = "android")]
+fn start_processing_service(app: &AppHandle, text: &str) {
+    let Some(window) = app.get_webview_window("main") else { return };
+    let text = text.to_string();
+    let app2 = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Err(err) = crate::android_export::set_processing_service(&window, true, &text) {
+            let _ = app2.emit(EVENT_LOG, format!("[Service] {err}"));
+        }
+    });
+}
+
+#[cfg(not(target_os = "android"))]
+fn start_processing_service(_app: &AppHandle, _text: &str) {}
+
+#[cfg(target_os = "android")]
+fn stop_processing_service(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else { return };
+    let _ = app.run_on_main_thread(move || {
+        let _ = crate::android_export::set_processing_service(&window, false, "");
+    });
+}
+
+#[cfg(not(target_os = "android"))]
+fn stop_processing_service(_app: &AppHandle) {}
 
 /// 清除 Dock/任务栏进度条（macOS 上进度条是应用级，任务结束必须显式收回）。
 #[cfg(desktop)]
@@ -163,6 +237,7 @@ fn setup_model(app: AppHandle, storage: State<'_, AppStorage>, lang: Option<Stri
     if storage.running.swap(true, Ordering::SeqCst) {
         return Err(tr(&lang, "已有任务在运行中，请等待完成", "A task is already running, please wait"));
     }
+    storage.cancel.store(false, Ordering::SeqCst);
     let dest = crate::model_path();
     if dest.exists() {
         finish(&app, serde_json::json!({ "code": 0, "success": true }));
@@ -173,11 +248,26 @@ fn setup_model(app: AppHandle, storage: State<'_, AppStorage>, lang: Option<Stri
         Err(_) => MODEL_URLS.iter().map(|s| s.to_string()).collect(),
     };
     let app_handle = app.clone();
+    let cancel_flag = app.clone();
+    let is_cancelled = move || {
+        cancel_flag
+            .try_state::<AppStorage>()
+            .map(|s| s.cancel.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    };
+    // 下载 ~200MB 期间用户可能切走：同样以前台服务保活（结束/取消由 finish 统一收掉）
+    start_processing_service(
+        &app,
+        &tr(&lang, "正在下载修复模型…", "Downloading the model…"),
+    );
     spawn_guarded(app.clone(), lang.clone(), move || {
         let log = |line: &str| {
             let _ = app_handle.emit(EVENT_LOG, line);
         };
-        log(&format!("[Model] Downloading ({} sources, multi-connection)", urls.len()));
+        log(&format!(
+            "[Model] Downloading ~200MB ({} sources, multi-connection); you can cancel anytime and resume later",
+            urls.len()
+        ));
         let app_progress = app_handle.clone();
         // 每 10% 记一条日志，避免刷屏
         let last_milestone = std::sync::atomic::AtomicU64::new(0);
@@ -202,13 +292,20 @@ fn setup_model(app: AppHandle, storage: State<'_, AppStorage>, lang: Option<Stri
                     );
                 }
             }
-        });
+        }, &is_cancelled);
         match result {
             Ok(()) => {
                 log(&format!("[Model] Download complete: {}", dest.display()));
                 finish(
                     &app_handle,
                     serde_json::json!({ "code": 0, "success": true }),
+                );
+            }
+            Err(err) if err == fetch::CANCELLED => {
+                log("[Model] Download cancelled; downloaded bytes kept for resume");
+                finish(
+                    &app_handle,
+                    serde_json::json!({ "code": 2, "success": false, "cancelled": true }),
                 );
             }
             Err(err) => {
@@ -284,11 +381,11 @@ fn learn_watermark_impl(
     lang: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let lang = lang_of(lang);
-    if files.len() < 2 {
+    if files.len() < 3 {
         return Err(tr(
             &lang,
-            "请至少选中 2 张含同一款水印的图片",
-            "Select at least 2 images with the same watermark",
+            "请至少选中 3 张含同一款水印的图片",
+            "Select at least 3 images with the same watermark",
         ));
     }
     let label = if label.trim().is_empty() {
@@ -427,8 +524,15 @@ fn run_pipeline(
             .replace(PathBuf::from(&root));
     }
 
+    // 处理可能持续数分钟（每张 ~10s）：移动端启动前台服务 + 唤醒锁，切后台/锁屏不被冻结
+    start_processing_service(
+        &app,
+        &tr(&lang, "正在处理图片，请稍候…", "Processing images…"),
+    );
+
     let app_handle = app.clone();
     spawn_guarded(app.clone(), lang.clone(), move || {
+        let _sleep_guard = SleepGuard::new();
         let mask = mask_box.and_then(|b| {
             (b.len() == 4).then(|| pipeline::MaskBox {
                 x1: b[0],
@@ -497,7 +601,7 @@ fn run_pipeline(
                 );
             }
             Err(err) if err == pipeline::CANCELLED => {
-                let _ = app_handle.emit(EVENT_LOG, "[Cancel] Task cancelled; already-processed images remain valid");
+                let _ = app_handle.emit(EVENT_LOG, "[Cancel] Task cancelled; nothing was written (originals/outputs untouched)");
                 finish(
                     &app_handle,
                     serde_json::json!({ "code": 2, "success": false, "cancelled": true }),
@@ -592,6 +696,34 @@ fn share_results(
     do_share(&window, &cache, &paths)
 }
 
+/// Android：把日志文本写入缓存后经系统分享导出（移动端没有"保存文件对话框"）。
+/// 桌面端导出日志仍走 save dialog + write_text_file，不走本命令。
+#[tauri::command]
+#[allow(unused_variables)]
+fn share_log(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    content: String,
+    lang: Option<String>,
+) -> Result<usize, String> {
+    let lang = lang_of(lang);
+    if content.trim().is_empty() {
+        return Err(tr(&lang, "日志为空，暂无可分享内容", "Log is empty; nothing to share"));
+    }
+    #[cfg(target_os = "android")]
+    {
+        let cache = app.path().app_cache_dir().map_err(|e| e.to_string())?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let name = format!("watermark-cleaner-log-{}.txt", stamp);
+        return crate::android_export::share_text_file(&window, &cache, &name, &content);
+    }
+    #[cfg(not(target_os = "android"))]
+    Err(tr(&lang, "当前平台暂不支持日志分享", "Log sharing is not supported on this platform"))
+}
+
 #[cfg(target_os = "android")]
 fn do_share(
     window: &tauri::WebviewWindow,
@@ -608,6 +740,97 @@ fn do_share(
     _paths: &[String],
 ) -> Result<usize, String> {
     Err("Sharing is only available on Android".to_string())
+}
+
+/// 当前版本号（设置/关于页显示）。
+#[tauri::command]
+fn app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[derive(Serialize)]
+struct BackupInfo {
+    count: usize,
+    dir: String,
+}
+
+/// 检测某目录下是否留有 `original-watermark-backup/`（覆盖模式撤销依据）。
+/// 重启 App、重新选同一文件夹后仍能提示"可恢复"，不必依赖上一次的结果横幅。
+#[tauri::command]
+fn backup_info(root: String) -> Result<BackupInfo, String> {
+    let dir = PathBuf::from(&root).join("original-watermark-backup");
+    let count = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path().is_file()
+                        && pipeline::is_supported_image(&e.file_name().to_string_lossy())
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    Ok(BackupInfo {
+        count,
+        dir: dir.display().to_string(),
+    })
+}
+
+/// 复制图片到系统剪贴板（macOS 用 osascript 调 NSPasteboard，零新增依赖）。
+/// webp 剪贴板表示不稳定，直接报错让用户先转 PNG/JPEG。
+#[tauri::command]
+fn copy_image_to_clipboard(path: String, lang: Option<String>) -> Result<(), String> {
+    let lang = lang_of(lang);
+    let file = PathBuf::from(&path);
+    if !file.is_file() {
+        return Err(tr(&lang, &format!("文件不存在: {}", path), &format!("File not found: {}", path)));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let ext = file
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let class = match ext.as_str() {
+            "png" => "«class PNGf»",
+            "jpg" | "jpeg" => "«class JPEG»",
+            _ => {
+                return Err(tr(
+                    &lang,
+                    "只有 PNG/JPEG 可直接复制到剪贴板，请先在结果文件夹中转换",
+                    "Only PNG/JPEG can be copied to the clipboard; convert the file first",
+                ))
+            }
+        };
+        let script = format!(
+            "on run argv\nset the clipboard to (read (POSIX file (item 1 of argv)) as {})\nend run",
+            class
+        );
+        let output = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .arg(&path)
+            .output()
+            .map_err(|e| tr(&lang, &format!("调用系统剪贴板失败: {}", e), &format!("Clipboard failed: {}", e)))?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(tr(
+                &lang,
+                &format!("复制到剪贴板失败: {}", detail),
+                &format!("Copy to clipboard failed: {}", detail),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        Err(tr(
+            &lang,
+            "当前平台暂不支持复制图片到剪贴板",
+            "Copying images to the clipboard is not supported on this platform",
+        ))
+    }
 }
 
 /// 撤销「替换原图」：把 original-watermark-backup/ 里的原图恢复回 root。
@@ -719,6 +942,9 @@ fn import_files(
         .app_data_dir()
         .map_err(|e| e.to_string())?
         .join("imports");
+    // 原生 picker 的文件先由 Kotlin 拷到 cache/import-pick（见 MainActivity）再进这里；
+    // 导入成功后机会性删源，避免这批副本驻留到下次选图才清理
+    let pick_staging = app.path().app_cache_dir().ok().map(|c| c.join("import-pick"));
     // 追加模式：dir 必须是 base 下的合法批次目录，否则按未指定处理（新建批次）
     let append_dir = dir.as_deref().and_then(|d| resolve_append_dir(&base, d));
     let append = append_dir.is_some();
@@ -746,6 +972,13 @@ fn import_files(
             Ok(name) => {
                 existing.push(name.clone());
                 names.push(name);
+                // 拷贝成功才删源（失败/跳过的留给下次选图时整体清空，不半途破坏）
+                if let Some(staging) = pick_staging.as_deref() {
+                    let src = std::path::Path::new(raw);
+                    if src.starts_with(staging) {
+                        let _ = std::fs::remove_file(src);
+                    }
+                }
             }
             Err(err) => {
                 // 单张失败（HEIC/权限/超限）只跳过这一张，不拖垮整批——一次误选
@@ -1219,9 +1452,12 @@ pub fn run_tauri_app() {
         })
         .invoke_handler(tauri::generate_handler![
             env_status,
+            app_version,
             setup_model,
             set_menu_lang,
             list_pngs,
+            backup_info,
+            copy_image_to_clipboard,
             import_files,
             pick_images,
             rebuild_webview,
@@ -1238,6 +1474,7 @@ pub fn run_tauri_app() {
             set_system_bars,
             export_results,
             share_results,
+            share_log,
             read_image_base64,
             read_thumbnail_base64,
             is_directory,
@@ -1302,6 +1539,25 @@ pub fn run_tauri_app() {
         .run(|app, event| {
             let _ = app;
             match event {
+                // 处理中禁止退出（Cmd+Q / 菜单「退出」/ Dock 退出都走这里）：
+                // 只拦 CloseRequested 不够——菜单退出不会触发窗口关闭事件，会让用户
+                // 绕过"处理中不许关窗"的保护直接杀进程。
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    let running = app
+                        .try_state::<AppStorage>()
+                        .map(|s| s.is_running())
+                        .unwrap_or(false);
+                    if running {
+                        api.prevent_exit();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            #[cfg(desktop)]
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                        }
+                        let _ = app.emit(EVENT_QUIT_BLOCKED, ());
+                    }
+                }
                 // 退出前清理保留的临时复查产物（/tmp/doubao-watermark-review）
                 tauri::RunEvent::Exit { .. } => {
                     let _ = pipeline::cleanup_preserved();

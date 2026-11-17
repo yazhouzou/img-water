@@ -19,3 +19,9 @@
   - **picker 返回后触摸卡死 → rebuild（v0.6.0 真机修复）**：ColorOS 上从 picker 返回后 WebView 输入分发整体卡死（轻量 `onResume`/解冻均无效），导入完成（或追加导入完成）后 JS `invoke('rebuild_webview')` → `android_pick.rs` JNI → `MainActivity.rebuildWebView()`（`recreate()`，28ms）重建 Activity/WebView；重建后由 `localStorage['wm-mobile-batch']`（导入成功时写、清批时删）恢复已导入批次——冷启动进程重启同靠它。Ace 2 实测全链路（picker→直拷→copy→rebuild→恢复）2.5 秒；页面重建后前几秒可能仍显示空态（页面加载中），>8 秒属异常慢待评估。
   - **处理中全屏进度页**：进度环（SVG `stroke-dashoffset`，JS `setRunProgress` 同步 `pipeline-progress` 事件）+ 张数 + 当前文件名 + 取消按钮。
   - **视觉焕新 + 交互（v0.6.1）**：App 显示名改 4 字「水印清理」（strings.xml `app_name`/`main_activity_title` + tauri 窗口 title + 网页 title）；主按钮品牌渐变、顶栏毛玻璃、卡片动效、进度环渐变、成功绿徽章、保存按钮「已保存 ✓」态、首次启动引导层（`wm-intro-ok`）+ 空态 3 步引导、「清空」→「取消全选」等小白化文案；细节见 desktop/AGENTS.md v0.6.1 段。
+- **体验补强（v0.6.2）**：
+  - **前台服务保活**：新建 `WatermarkService.kt`（`foregroundServiceType="dataSync"` + `PartialWakeLock` 60 分钟上限 + 渠道 `watermark-processing`/ID 1001/`stat_sys_download` 图标）；Manifest 加 `FOREGROUND_SERVICE`/`FOREGROUND_SERVICE_DATA_SYNC`/`WAKE_LOCK`；`MainActivity.startProcessingService/stopProcessingService`（`startForegroundService`，SDK<26 用 `startService`）由 Rust `set_processing_service` JNI 驱动——`run_pipeline`/`setup_model` spawn 前启动、`finish` 各路径统一停；失败只降级（无保活、处理照常）。
+  - **picker 拷贝进度**：`__onAndroidPickCopyStart(count)`（`evaluateJavascript` 全局回调）→ 前端「正在导入 N 张…」全屏提示（Kotlin 直拷长时无反馈的体验问题）。
+  - **rebuild 收窄**：`rebuildWebView` 加 `SDK_INT >= 33` 跳过——Android 13+ 走系统 Photo Picker，无 ColorOS 触摸卡死问题。
+  - **导出日志走分享**：`share_log` → `android_export.rs::share_text_file` 写 `cache/share-log/<ts>/` 后 `shareFiles`（Android 无系统保存对话框）。
+  - **结果断点恢复**：`restoreLastFolder` 恢复批次后探测 `watermark-cleaned/<batch>` → 直接进结果页（`renderExitBanner` restored 分支）。

@@ -5,6 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>水印清理</title>
   <link rel="stylesheet" href="styles.css" />
+  <!-- 首帧前应用主题（深色用户冷启动不再闪白底）；与 main.js applyTheme 的判定口径一致 -->
+  <script>
+    (function () {
+      try {
+        var mode = localStorage.getItem('wm-theme') || 'auto';
+        var dark = mode === 'dark'
+          || (mode !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+      } catch (e) {}
+    })();
+  </script>
 </head>
 <body>
   <header class="topbar">
@@ -75,6 +86,7 @@
         <h2 data-i18n="filesTitle"></h2>
         <div class="actions">
           <button id="btn-pick" class="btn">选择文件夹</button>
+          <button id="btn-pick-images" class="btn" data-i18n="pickImages"></button>
           <button id="btn-refresh" class="btn ghost" disabled data-i18n="refresh"></button>
         </div>
       </div>
@@ -91,6 +103,7 @@
       <div class="list-actions">
         <button id="btn-select-all" class="btn small ghost" disabled data-i18n="selectAll"></button>
         <button id="btn-select-none" class="btn small ghost" disabled data-i18n="selectNone"></button>
+        <input id="file-search" class="file-search" type="search" autocomplete="off" data-i18n-placeholder="searchFiles" />
         <span id="file-count" class="muted">0 张</span>
       </div>
       <div id="file-list" class="file-list" role="group" data-i18n-aria="filesTitle">
@@ -170,6 +183,7 @@
         <h2 data-i18n="resultTitle"></h2>
       </div>
       <div id="result-banner" class="result-banner" hidden></div>
+      <div id="backup-banner" class="result-banner warn" hidden></div>
       <div id="result-list" class="result-list" hidden>
         <div class="result-list-head">
           <span data-i18n="resultListTitle"></span>
@@ -180,8 +194,8 @@
       <div id="compare-box" class="compare-box" hidden>
         <img id="compare-final" class="compare-final" alt="处理后" draggable="false" />
         <img id="compare-source" class="compare-source" alt="处理前" draggable="false" />
-        <span class="compare-tag compare-tag-l" data-i18n="tagAfter"></span>
-        <span class="compare-tag compare-tag-r" data-i18n="tagBefore"></span>
+        <span class="compare-tag compare-tag-l" data-i18n="tagBefore"></span>
+        <span class="compare-tag compare-tag-r" data-i18n="tagAfter"></span>
         <div id="compare-handle" class="compare-handle"></div>
       </div>
       <div class="review-grid">
@@ -225,7 +239,8 @@
       </div>
       <div id="m-run-stage" class="m-run-stage" data-i18n="runPrep"></div>
       <div id="m-run-name" class="m-run-name"></div>
-      <p class="m-run-hint" data-i18n="runStayHint"></p>
+      <div id="m-run-eta" class="m-run-eta"></div>
+      <p id="m-run-hint" class="m-run-hint" data-i18n="runStayHint"></p>
       <button id="m-run-cancel" class="btn danger" type="button" data-i18n="cancel"></button>
     </div>
   </section>
@@ -250,16 +265,27 @@
             <button type="button" data-mode="dark" data-i18n="themeModeDark"></button>
           </div>
         </div>
-        <div class="m-settings-row">
-          <span class="m-settings-label" data-i18n="languageLabel"></span>
-          <div class="segmented" id="m-lang-seg">
-            <button type="button" data-lang="zh">中文</button>
-            <button type="button" data-lang="en">English</button>
-          </div>
+      <div class="m-settings-row">
+        <span class="m-settings-label" data-i18n="languageLabel"></span>
+        <div class="segmented" id="m-lang-seg">
+          <button type="button" data-lang="zh">中文</button>
+          <button type="button" data-lang="en">English</button>
         </div>
+      </div>
       </section>
       <!-- 高级选项 / 精确模式：移动端由 JS 把主界面的 details 搬进来 -->
       <div id="m-settings-options" class="m-settings-group m-settings-group-flat"></div>
+      <section class="m-settings-group">
+        <div class="m-settings-row">
+          <span class="m-settings-label" data-i18n="aboutSection"></span>
+          <span id="m-about-version" class="muted"></span>
+        </div>
+        <p class="m-settings-privacy" data-i18n="privacyLine1"></p>
+        <p class="m-settings-privacy" data-i18n="privacyLine2"></p>
+        <div class="m-settings-about-actions">
+          <button id="m-view-intro" class="btn small ghost" type="button" data-i18n="viewIntro"></button>
+        </div>
+      </section>
       <section class="m-settings-group">
         <button id="m-clear-batch" class="m-settings-danger" type="button">
           <span data-i18n="clearBatch"></span>
@@ -382,11 +408,80 @@
     <button id="lightbox-next" class="lightbox-nav lightbox-nav-next" type="button" hidden data-i18n-title="nextImage" data-i18n-aria="nextImage"><span aria-hidden="true">›</span></button>
     <div class="lightbox-toolbar" role="toolbar">
       <span id="lightbox-counter" class="lightbox-counter" hidden></span>
+      <button id="lightbox-save" class="lightbox-btn" type="button" hidden></button>
       <button id="lightbox-zoom-out" class="lightbox-btn" type="button" data-i18n-title="zoomOut" data-i18n-aria="zoomOut"><span aria-hidden="true">−</span></button>
       <span id="lightbox-zoom-label" class="lightbox-zoom">100%</span>
       <button id="lightbox-zoom-in" class="lightbox-btn" type="button" data-i18n-title="zoomIn" data-i18n-aria="zoomIn"><span aria-hidden="true">＋</span></button>
       <button id="lightbox-reset" class="lightbox-btn" type="button" data-i18n="resetZoom"></button>
+      <button id="lightbox-copy" class="lightbox-btn" type="button" data-i18n="copyImage" hidden></button>
+      <button id="lightbox-reveal" class="lightbox-btn" type="button" data-i18n="viewInFolder" hidden></button>
       <button id="lightbox-close" class="lightbox-btn" type="button" data-i18n="closePreview"></button>
+    </div>
+  </div>
+
+  <!-- 桌面端逐张前后对比（结果缩略图点「对比」打开；左=处理前，右=处理后） -->
+  <div id="result-compare" class="result-compare" hidden>
+    <div id="rc-stage" class="rc-stage">
+      <div id="rc-frame" class="rc-frame" hidden>
+        <img id="rc-final" class="rc-final" alt="处理后" draggable="false" />
+        <img id="rc-source" class="rc-source" alt="处理前" draggable="false" />
+        <span class="compare-tag compare-tag-l" data-i18n="tagBefore"></span>
+        <span class="compare-tag compare-tag-r" data-i18n="tagAfter"></span>
+        <div id="rc-handle" class="compare-handle"></div>
+      </div>
+      <div id="rc-loading" class="lightbox-loading" hidden><span class="spinner"></span><span data-i18n="previewLoading"></span></div>
+    </div>
+    <div class="rc-toolbar">
+      <button id="rc-prev" class="lightbox-btn" type="button" data-i18n-aria="prevImage" hidden>‹</button>
+      <span id="rc-counter" class="lightbox-counter" hidden></span>
+      <button id="rc-next" class="lightbox-btn" type="button" data-i18n-aria="nextImage" hidden>›</button>
+      <button id="rc-reveal" class="lightbox-btn" type="button" data-i18n="viewInFolder"></button>
+      <button id="rc-close" class="lightbox-btn" type="button" data-i18n="closePreview"></button>
+    </div>
+  </div>
+
+  <!-- 桌面端设置（Cmd+, 或菜单「设置…」）：外观/语言/模型/备份/版本 -->
+  <div id="d-settings" class="mask-overlay" hidden>
+    <div class="mask-dialog d-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="d-settings-title">
+      <div class="mask-head">
+        <span id="d-settings-title" data-i18n="settings"></span>
+        <button id="d-settings-close" class="btn small ghost" type="button" data-i18n="closePreview"></button>
+      </div>
+      <div class="d-settings-body">
+        <div class="d-settings-row">
+          <span class="d-settings-label" data-i18n="themeLabel"></span>
+          <div class="segmented" id="d-theme-seg">
+            <button type="button" data-mode="auto" data-i18n="themeModeAuto"></button>
+            <button type="button" data-mode="light" data-i18n="themeModeLight"></button>
+            <button type="button" data-mode="dark" data-i18n="themeModeDark"></button>
+          </div>
+        </div>
+        <div class="d-settings-row">
+          <span class="d-settings-label" data-i18n="languageLabel"></span>
+          <div class="segmented" id="d-lang-seg">
+            <button type="button" data-lang="zh">中文</button>
+            <button type="button" data-lang="en">English</button>
+          </div>
+        </div>
+        <section class="d-settings-group">
+          <h3 data-i18n="dSettingsModel"></h3>
+          <div id="d-model-status" class="muted"></div>
+          <div class="d-settings-actions">
+            <button id="d-model-download" class="btn small" type="button" data-i18n="setupModel"></button>
+          </div>
+        </section>
+        <section class="d-settings-group">
+          <h3 data-i18n="dSettingsBackup"></h3>
+          <div id="d-backup-status" class="muted"></div>
+          <div class="d-settings-actions">
+            <button id="d-backup-restore" class="btn small danger ghost" type="button" data-i18n="restoreOriginal"></button>
+          </div>
+        </section>
+        <section class="d-settings-group d-settings-about">
+          <div id="d-version" class="muted"></div>
+          <div class="muted" data-i18n="dAboutLicense"></div>
+        </section>
+      </div>
     </div>
   </div>
 

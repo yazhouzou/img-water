@@ -96,6 +96,12 @@ class MainActivity : TauriActivity() {
       )
       return@registerForActivityResult
     }
+    // 拷贝在后台线程进行（见下），可能持续数秒~十几秒；先通知前端"正在导入"，
+    // 否则回到 App 后界面毫无动静，用户以为选了图没反应。
+    webViewRef?.evaluateJavascript(
+      "window.__onAndroidPickCopyStart && window.__onAndroidPickCopyStart(${uris.size})",
+      null
+    )
     // 拷贝放后台线程：content:// 交给 ContentResolver 直读（Android 标准路径，不给
     // WebView 主线程/跨 JNI 管道增负担），完成后才回调 JS；回调传的是本地路径，
     // Rust 侧 copy_one 走 fs::copy 快分支（不再经 content:// JNI 拷贝链路）。
@@ -233,12 +239,46 @@ class MainActivity : TauriActivity() {
    * picker 内发生过触摸后返回，WebView 输入分发会整体卡死（轻量信号 onResume/
    * requestFocus/ACTION_CANCEL 均无法恢复，只有等价冷启动的 WebView 重建有效）。
    * 由前端在系统 picker/文件对话框的导入流程完成后经 Rust 命令调用（取消返回不触发）。
+   *
+   * Android 13+（API 33）未复现该问题（系统 Photo Picker + 新版 WebView），而 recreate
+   * 有可见代价（闪屏、页面重载回空态数秒），故不再作为常规路径；若新系统复现再放宽。
    */
   fun rebuildWebView() {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      if (BuildConfig.DEBUG) android.util.Log.i(TAG, "rebuildWebView skipped (SDK >= 33)")
+      return
+    }
     runOnUiThread {
       if (isFinishing || isDestroyed) return@runOnUiThread
       if (BuildConfig.DEBUG) android.util.Log.i(TAG, "rebuildWebView")
       recreate()
+    }
+  }
+
+  /**
+   * 处理/模型下载期间的前台服务 + 唤醒锁（WatermarkService）：切后台/锁屏时系统不
+   * 冻结、不回收本进程（处理单张 ~10s、整批可达数分钟）。文案由 Rust 侧按 App 语言
+   * 传入。Android 12+ 在 App 处于后台时不允许启动前台服务，前端只在用户点「开始/
+   * 下载」（App 前台）时调用，失败仅记录日志、处理照常。
+   */
+  fun startProcessingService(text: String) {
+    try {
+      val intent = Intent(this, WatermarkService::class.java).putExtra(WatermarkService.EXTRA_TEXT, text)
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        startForegroundService(intent)
+      } else {
+        startService(intent)
+      }
+    } catch (t: Throwable) {
+      android.util.Log.w(TAG, "startProcessingService failed", t)
+    }
+  }
+
+  fun stopProcessingService() {
+    try {
+      stopService(Intent(this, WatermarkService::class.java))
+    } catch (t: Throwable) {
+      android.util.Log.w(TAG, "stopProcessingService failed", t)
     }
   }
 

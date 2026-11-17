@@ -16,6 +16,9 @@
   if (bootParams.get('mockbatch') === '1') {
     try { localStorage.setItem('wm-mobile-batch', '/mock/import/import-1'); } catch (_) {}
   }
+  if (bootParams.get('mockroot') === '1') {
+    try { localStorage.setItem('wm-last-root', '/mock/Pictures/watermark'); } catch (_) {}
+  }
 
   const handlers = {};
   const FAKE_PNGS = ['1.png', '2.png', '3.png', '4.png', '5.png'];
@@ -59,6 +62,8 @@
       overwritten: false,
       outputDir: '/mock/Pictures/watermark/watermark-cleaned',
       outputs: names.map((n) => '/mock/Pictures/watermark/watermark-cleaned/' + n),
+      noWatermark: names.slice(0, 1),
+      skipped: [],
     });
   }
 
@@ -78,7 +83,22 @@
           model_path: '/mock/lama_fp32.onnx',
           hint: noModel ? '(mock) inpainting model not downloaded' : '',
         });
+      case 'app_version':
+        return Promise.resolve('0.5.6');
+      case 'backup_info':
+        return Promise.resolve({
+          count: new URLSearchParams(location.search).get('backup') === '1' ? 3 : 0,
+          dir: '/mock/Pictures/watermark/original-watermark-backup',
+        });
+      case 'copy_image_to_clipboard':
+        console.log('[mock] copy_image_to_clipboard:', args && args.path);
+        return Promise.resolve();
       case 'list_pngs':
+        // 结果恢复探测（watermark-cleaned 目录）：默认空（真实端目录不存在会报错）；
+        // ?mockresults=1 模拟"上次处理结果还在"，用于验证恢复视图
+        if (String((args && args.root) || '').includes('watermark-cleaned')) {
+          return Promise.resolve(/mockresults=1/.test(location.search) ? mockNames.slice() : []);
+        }
         return Promise.resolve(mockNames.slice());
       case 'pick_images':
         // Android 相册 Picker：真实端为 fire-and-forget，结果经全局回调异步回传
@@ -158,10 +178,10 @@
       case 'learn_watermark':
         return new Promise((resolve, reject) =>
           setTimeout(() => {
-            if (args && args.files && args.files.length >= 2) {
+            if (args && args.files && args.files.length >= 3) {
               resolve({ id: 'mock', label: args.label || 'learned', path: '/mock/profiles/mock', mean_score: 0.62 });
             } else {
-              reject('mock: need >= 2 images');
+              reject('mock: need >= 3 images');
             }
           }, 600)
         );
@@ -185,6 +205,9 @@
         return new Promise((resolve) => setTimeout(() => resolve(((args && args.paths) || []).length), 600));
       case 'share_results':
         return new Promise((resolve) => setTimeout(() => resolve(((args && args.paths) || []).length), 600));
+      case 'share_log':
+        console.log('[mock] share_log:', ((args && args.content) || '').length, 'chars');
+        return new Promise((resolve) => setTimeout(() => resolve(1), 200));
       case 'open_path':
         console.log('[mock] open_path:', args && args.path);
         return Promise.resolve();
