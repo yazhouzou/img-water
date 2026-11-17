@@ -47,4 +47,5 @@ jobs:
       # 用于在拿不到 runner 日志的场合定位失败用例。
       - name: L1 failure summary
         if: failure()
-        run: tail -100 l1.log | sed 's/::/: :/g' | while IFS= read -r line; do echo "::error::$line"; done
+        run: |
+          tail -100 l1.log | sed 's/::/: :/g' | while IFS= read -r line; do echo "::error::$line"; done
