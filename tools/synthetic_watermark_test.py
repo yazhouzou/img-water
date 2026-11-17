@@ -31,6 +31,9 @@ OUT = PROJECT_ROOT / '.synthetic-wm-test'
 FONT_CANDIDATES = [
     '/System/Library/Fonts/Supplemental/Arial Bold.ttf',
     '/System/Library/Fonts/Helvetica.ttc',
+    # Linux/CI（ubuntu-latest 预装 DejaVu）：缺可用字体会退化成 load_default() 位图小字，
+    # 合成水印字形不可检测，L1 的合成/学习用例在 CI 上全面失败。
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
 ]
 
 TEXTS = ['SAMPLE TEXT', '测试水印ABC']
