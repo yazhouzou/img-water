@@ -7,6 +7,7 @@
 !tools/doubao-wm-stamp-color.png
 !tools/watermarks/**/*.png
 !tests/fixtures/images/**/*.png
+!desktop/src-tauri/tests/fixtures/*.png
 .img-inpaint-venv/
 original-watermark-backup/
 __pycache__/

@@ -30,10 +30,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      # L1 只依赖 Pillow / numpy / OpenCV（不加载 torch / iopaint / 模型权重）；
+      # L1 依赖 Pillow / numpy / scipy / OpenCV / onnxruntime（不加载 torch / iopaint / 模型权重）；
       # headless 版避免 CI 上需要 X 库。
+      # scipy：全图白字/多阈值检测（_detect_full_white 等）必需——缺失会静默降级成
+      #        "无此检测"，曾使"照片背景合成水印"用例在 CI 恒挂（本地有 scipy 而 CI 没装）。
+      # onnxruntime：--any-position 用例的 DBNet 推理（模型 tools/models/ch_pp-ocrv4_det.onnx 已入库）。
       - name: Install deps
-        run: pip install --quiet pillow numpy opencv-python-headless
+        run: pip install --quiet pillow numpy scipy opencv-python-headless onnxruntime
 
       - name: L1 regression (no model)
         run: python tools/watermark_regression.py

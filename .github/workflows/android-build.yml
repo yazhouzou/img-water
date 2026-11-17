@@ -23,7 +23,8 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - uses: android-actions/setup-android@v3
+      # v4：Node24 运行时迁移（v3 在 GitHub 强制 Node24 后即挂，#90+ 全红）
+      - uses: android-actions/setup-android@v4
 
       - name: Install NDK
         run: sdkmanager --install "ndk;26.3.11579264"
@@ -63,7 +64,7 @@ jobs:
         working-directory: desktop
         shell: bash
         run: |
-          (cat icon.log 2>/dev/null; cat init.log 2>/dev/null) | tail -20 | sed 's/::/: :/g' | while IFS= read -r line; do echo "::error::$line"; done
+          (cat icon.log 2>/dev/null || true; cat init.log 2>/dev/null || true) | tail -20 | sed 's/::/: :/g' | while IFS= read -r line; do echo "::error::$line"; done
 
       - name: Restore stable debug keystore
         run: |
@@ -110,6 +111,7 @@ jobs:
         if: failure()
         working-directory: desktop
         run: |
+          if [ ! -f build.log ]; then echo "::error::build.log 缺失（失败发生在 Build 前的步骤，见该步骤日志）"; exit 0; fi
           (grep -iE "error\[|error:|failed to" build.log | tail -40; echo "---- tail ----"; tail -10 build.log) | sed 's/::/: :/g' | while IFS= read -r line; do echo "::error::$line"; done
 
       - uses: actions/upload-artifact@v4
