@@ -78,55 +78,29 @@ jobs:
       - name: Build app
         working-directory: desktop
         shell: bash
-        env:
-          # macOS 签名+公证接入点：在仓库 Secrets 配置以下项即自动启用（全部可选）。
-          # APPLE_CERTIFICATE: base64 编码的 .p12 开发者证书
-          # APPLE_CERTIFICATE_PASSWORD: .p12 密码
-          # APPLE_SIGNING_IDENTITY: "Developer ID Application: ..."
-          # APPLE_ID / APPLE_PASSWORD(app-specific) / APPLE_TEAM_ID: 公证账号
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        # 刻意不传 APPLE_* secrets：macOS 交付走本地打包（tools/package-app.sh mac，
+        # 用本地钥匙串签名/公证），CI 只验证「代码能在 macOS 上构建」。此前 secrets
+        # 里的 p12 在 CI 上 security import 失败（"failed to import keychain
+        # certificate"）导致打包中断。将来若要恢复 CI 签名：先确保 APPLE_CERTIFICATE
+        # 的 p12 能被 security import（Keychain 原生导出或 openssl -legacy 格式），
+        # 再在此处加回 env（APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD /
+        # APPLE_SIGNING_IDENTITY / APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID）。
         run: |
           set -o pipefail
           pnpm tauri build --target ${{ matrix.target }} 2>&1 | tee build.log
 
-      # 签名/公证校验：配了证书就必须真签上；配了公证账号就必须过 Gatekeeper + 已装订票据。
-      # 未配 Secrets 时只告警（产物可用但用户首次打开需右键「打开」绕过 Gatekeeper）。
-      - name: Verify macOS signing & notarization
+      # CI 产物未签名/未公证（签名走本地打包），这里只确认 .app 真的产出。
+      - name: Verify macOS artifact
         if: runner.os == 'macOS'
         working-directory: desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos
         shell: bash
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           app="$(ls -d *.app 2>/dev/null | head -1)"
           if [ -z "$app" ]; then
             echo "::error::未找到 macOS .app 产物"
             exit 1
           fi
-          if [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
-            echo "::warning::未配置 APPLE_SIGNING_IDENTITY：产物未签名/未公证，用户首次打开会被 Gatekeeper 拦截"
-            exit 0
-          fi
-          echo "[verify] codesign $app"
-          codesign --verify --deep --strict --verbose=2 "$app"
-          codesign -dv --verbose=4 "$app" 2>&1 | grep -E "Authority|TeamIdentifier" || true
-          if [ -z "${APPLE_ID:-}" ] || [ -z "${APPLE_PASSWORD:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ]; then
-            echo "::warning::已签名但未配置公证账号（APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID），Gatekeeper 仍会拦截"
-            exit 0
-          fi
-          echo "[verify] Gatekeeper assessment"
-          spctl -a -t exec -vv "$app" || { echo "::error::Gatekeeper 校验失败（未公证或签名无效）"; exit 1; }
-          echo "[verify] notarization staple"
-          xcrun stapler validate "$app" || { echo "::error::未装订公证票据（stapler validate 失败）"; exit 1; }
-          echo "[OK] 已签名、通过 Gatekeeper 且已装订公证票据"
+          echo "[OK] $app 构建成功（CI 不签名；发布包在本地用 tools/package-app.sh mac 构建）"
 
       - name: Emit error summary
         if: failure()
